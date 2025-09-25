@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>AI Agent Builder</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body{font:14px/1.4 system-ui,Segoe UI,Roboto,Helvetica,Arial;margin:24px}
+    h1{margin:0 0 12px} .row{display:flex;gap:12px}
+    textarea{width:100%;height:320px}
+    button{padding:10px 16px;border:1px solid #ddd;border-radius:8px;background:#111;color:#fff;cursor:pointer}
+    .hint{color:#666;margin:10px 0 0}
+  </style>
+</head>
+<body>
+  <h1>AI Agent Builder</h1>
+  <p>Paste your <strong>blueprint YAML</strong> or JSON, then click Build to download a ZIP.</p>
+  <div class="row">
+    <textarea id="bp"></textarea>
+  </div>
+  <div style="margin-top:12px">
+    <button id="btn">Build ZIP</button>
+    <span id="status" class="hint"></span>
+  </div>
+
+  <script>
+  const sample = `version: 0.1
+scenario_id: tier1_dso_SCHEDULING_NO_SHOWS
+name: Scheduling – Reduce No-Shows
+agent_name: Scheduling Agent
+tags: [dso, scheduling, reminders, no-shows]
+triggers: >
+  Regional dental groups operate 5–15 clinics…
+best_reply_shapes: [email]
+risk_notes: >
+  HIPAA/PHI; TCPA consent logging; quiet hours 21:00–08:00.
+how_it_works: >
+  Connect PMS; monitor schedule; reminders; waitlist backfill.
+tool_stack_dev: >
+  PMS API + n8n; Email for demo; Google Sheets waitlist.
+roi_hypothesis: >
+  Reduce no-shows from ~18% → ~10% within 6 weeks.
+connectors: { pms: [dentrix,eaglesoft,opendental], comms: [email, slack, gcal] }
+entities: [patient, appointment, waitlist_entry]
+intents: [confirm, cancel, reschedule, late, human]`;
+  bp.value = sample;
+
+  btn.onclick = async () => {
+    status.textContent = "building…";
+    const res = await fetch("/api/compile", {
+      method: "POST",
+      headers: { "Content-Type":"application/json" },
+      body: JSON.stringify({ blueprint: bp.value })
+    });
+    if (!res.ok) {
+      const j = await res.json().catch(()=>({}));
+      status.textContent = "error: " + (j.error || res.statusText);
+      return;
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "agent.zip";
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    status.textContent = "done ✔";
+  };
+  </script>
+</body>
+</html>

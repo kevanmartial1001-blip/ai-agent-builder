@@ -1,0 +1,23 @@
+{
+  "name": "<%= name %> – No-Show Control",
+  "nodes": [
+    { "id": "pms_poll",   "type": "HTTP Request", "parameters": {}, "notes": "Poll PMS for upcoming appts <48h (mock/demo)" },
+    { "id": "filter",     "type": "IF",           "parameters": {}, "notes": "Not confirmed + eligible for reminder" },
+    { "id": "compose",    "type": "Function",     "parameters": {}, "notes": "Build email body from template + variables" },
+    { "id": "send_email", "type": "EmailSend",    "parameters": {}, "notes": "Send reminder via Email (free demo)" },
+    { "id": "wait_reply", "type": "Wait",         "parameters": {}, "notes": "Manual resume or webhook in demo" },
+    { "id": "parse_intent","type":"Code",         "parameters": {}, "notes": "Mock intent parser (LLM later)" },
+    { "id": "update_pms", "type": "HTTP Request", "parameters": {}, "notes": "Write-back confirm/cancel (mock)" },
+    { "id": "fill_slot",  "type": "GoogleSheets", "parameters": {}, "notes": "Pick from waitlist and notify" },
+    { "id": "slack_digest","type":"Slack",        "parameters": {}, "notes": "Daily summary (optional)" }
+  ],
+  "connections": {
+    "pms_poll":   { "main": [[{ "node": "filter" }]] },
+    "filter":     { "main": [[{ "node": "compose" }]] },
+    "compose":    { "main": [[{ "node": "send_email" }]] },
+    "send_email": { "main": [[{ "node": "wait_reply" }]] },
+    "wait_reply": { "main": [[{ "node": "parse_intent" }]] },
+    "parse_intent": { "main": [[{ "node": "update_pms" }, { "node": "fill_slot" }]] },
+    "fill_slot":  { "main": [[{ "node": "slack_digest" }]] }
+  }
+}

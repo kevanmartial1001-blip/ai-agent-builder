@@ -1,34 +1,47 @@
 <!doctype html>
-<html lang="en">
+<html lang="fr">
 <head>
   <meta charset="utf-8" />
   <title>AI Agent Builder</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
     :root{--bg:#0b1220;--card:#0f172a;--line:#1f2937;--text:#e5e7eb;--muted:#94a3b8;--brand:#0ea5e9}
-    body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 Inter,system-ui,Segoe UI,Roboto,Arial}
-    .wrap{max-width:900px;margin:24px auto;padding:16px}
-    .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
-    h1{margin:0 0 8px} .hint{color:var(--muted)}
-    textarea{width:100%;height:360px;background:#0b1324;color:var(--text);border:1px solid var(--line);border-radius:10px;padding:12px}
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,Segoe UI,Roboto,Helvetica,Arial}
+    .wrap{max-width:980px;margin:24px auto;padding:16px}
+    .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px}
+    h1{margin:0 0 8px}
+    .hint{color:var(--muted)}
+    textarea{width:100%;height:380px;background:#0b1324;color:var(--text);border:1px solid var(--line);border-radius:10px;padding:12px}
+    .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+    .controls{margin-top:10px}
     button{margin-top:12px;padding:10px 16px;border-radius:10px;border:1px solid var(--brand);background:var(--brand);color:#00111a;cursor:pointer;font-weight:600}
-    .row{display:flex;gap:12px;align-items:center}
+    label{cursor:pointer}
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="card">
       <h1>AI Agent Builder</h1>
-      <p class="hint">Paste your <b>blueprint YAML or JSON</b>, click Build, and a ZIP downloads.</p>
+      <p class="hint">Collez votre <b>blueprint YAML</b> ou JSON, choisissez le format, puis cliquez sur <i>Build</i> pour télécharger.</p>
+
       <textarea id="bp"></textarea>
-      <div class="row">
-        <button id="btn">Build ZIP</button>
-        <span id="status" class="hint"></span>
+
+      <div class="controls">
+        <div class="row">
+          <label><input type="radio" name="fmt" value="zip" checked> ZIP (bundle complet)</label>
+          <label style="margin-left:12px;"><input type="radio" name="fmt" value="workflow"> n8n workflow JSON</label>
+        </div>
+        <div class="row">
+          <button id="btn">Build</button>
+          <span id="status" class="hint"></span>
+        </div>
       </div>
     </div>
   </div>
 
   <script>
+  // Exemple pré-rempli
   const SAMPLE = `version: 0.1
 scenario_id: tier1_dso_SCHEDULING_NO_SHOWS
 name: Scheduling – Reduce No-Shows
@@ -48,29 +61,42 @@ roi_hypothesis: >
 connectors: { pms: [dentrix,eaglesoft,opendental], comms: [email, slack, gcal] }
 entities: [patient, appointment, waitlist_entry]
 intents: [confirm, cancel, reschedule, late, human]`;
-  const bp = document.getElementById("bp"); bp.value = SAMPLE;
+
+  const bp = document.getElementById("bp");
   const status = document.getElementById("status");
-  document.getElementById("btn").onclick = async () => {
+  const btn = document.getElementById("btn");
+  bp.value = SAMPLE;
+
+  function selectedFmt(){
+    const el = [...document.querySelectorAll('input[name="fmt"]')].find(x=>x.checked);
+    return el ? el.value : "zip";
+  }
+
+  btn.onclick = async () => {
     try {
-      status.textContent = "Building…";
+      status.textContent = "Build en cours…";
+      const fmt = selectedFmt();
       const res = await fetch("/api/compile", {
         method: "POST",
         headers: { "Content-Type":"application/json" },
-        body: JSON.stringify({ blueprint: bp.value })
+        body: JSON.stringify({ blueprint: bp.value, format: fmt })
       });
       if (!res.ok) {
         let msg = res.statusText;
         try { const j = await res.json(); if (j.error) msg = j.error; } catch {}
-        status.textContent = "Error: " + msg;
+        status.textContent = "Erreur: " + msg;
         return;
       }
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
-      const a = Object.assign(document.createElement("a"), { href:url, download:"agent.zip" });
-      document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
-      status.textContent = "Done ✔ ZIP downloaded.";
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = fmt === "workflow" ? "n8n-workflow.json" : "agent.zip";
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+      status.textContent = "OK ✔";
     } catch (e) {
-      status.textContent = "Error: " + e.message;
+      status.textContent = "Erreur: " + e.message;
     }
   };
   </script>

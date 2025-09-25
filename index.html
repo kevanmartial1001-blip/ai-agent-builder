@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>AI Agent Builder</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root{--bg:#0b1220;--card:#0f172a;--line:#1f2937;--text:#e5e7eb;--muted:#94a3b8;--brand:#0ea5e9}
+    body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 Inter,system-ui,Segoe UI,Roboto,Arial}
+    .wrap{max-width:900px;margin:24px auto;padding:16px}
+    .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
+    h1{margin:0 0 8px} .hint{color:var(--muted)}
+    textarea{width:100%;height:360px;background:#0b1324;color:var(--text);border:1px solid var(--line);border-radius:10px;padding:12px}
+    button{margin-top:12px;padding:10px 16px;border-radius:10px;border:1px solid var(--brand);background:var(--brand);color:#00111a;cursor:pointer;font-weight:600}
+    .row{display:flex;gap:12px;align-items:center}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>AI Agent Builder</h1>
+      <p class="hint">Paste your <b>blueprint YAML or JSON</b>, click Build, and a ZIP downloads.</p>
+      <textarea id="bp"></textarea>
+      <div class="row">
+        <button id="btn">Build ZIP</button>
+        <span id="status" class="hint"></span>
+      </div>
+    </div>
+  </div>
+
+  <script>
+  const SAMPLE = `version: 0.1
+scenario_id: tier1_dso_SCHEDULING_NO_SHOWS
+name: Scheduling – Reduce No-Shows
+agent_name: Scheduling Agent
+tags: [dso, scheduling, reminders, no-shows]
+triggers: >
+  Regional dental groups operate 5–15 clinics… High no-show rates (15–20%).
+best_reply_shapes: [email]
+risk_notes: >
+  HIPAA/PHI; TCPA consent; quiet hours 21:00–08:00.
+how_it_works: >
+  Connect PMS; monitor schedule; reminders; confirmations; waitlist backfill.
+tool_stack_dev: >
+  PMS API + n8n; Email (demo); Google Sheets waitlist.
+roi_hypothesis: >
+  Reduce no-shows ~18% → ~10% in 6 weeks.
+connectors: { pms: [dentrix,eaglesoft,opendental], comms: [email, slack, gcal] }
+entities: [patient, appointment, waitlist_entry]
+intents: [confirm, cancel, reschedule, late, human]`;
+  const bp = document.getElementById("bp"); bp.value = SAMPLE;
+  const status = document.getElementById("status");
+  document.getElementById("btn").onclick = async () => {
+    try {
+      status.textContent = "Building…";
+      const res = await fetch("/api/compile", {
+        method: "POST",
+        headers: { "Content-Type":"application/json" },
+        body: JSON.stringify({ blueprint: bp.value })
+      });
+      if (!res.ok) {
+        let msg = res.statusText;
+        try { const j = await res.json(); if (j.error) msg = j.error; } catch {}
+        status.textContent = "Error: " + msg;
+        return;
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = Object.assign(document.createElement("a"), { href:url, download:"agent.zip" });
+      document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+      status.textContent = "Done ✔ ZIP downloaded.";
+    } catch (e) {
+      status.textContent = "Error: " + e.message;
+    }
+  };
+  </script>
+</body>
+</html>

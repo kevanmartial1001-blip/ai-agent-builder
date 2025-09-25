@@ -11,68 +11,6 @@ function parseBlueprint(str) {
   return yaml.load(str);
 }
 
-function renderN8n(bp, tplStr) { return ejs.render(tplStr, bp); }
-
-function defaultFiles(bp, n8nJson) {
-  const files = {};
-  const base = `${bp.scenario_id}/`;
-
-  files[base + "workflows/n8n.json"] = n8nJson;
-
-  files[base + "prompts/intent_classifier.md"] =
-`Return one of: CONFIRM | CANCEL | RESCHEDULE | LATE | HUMAN.
-Examples:
-- "Yes I'll be there" -> CONFIRM
-- "I need to cancel" -> CANCEL
-- "Can we do next week?" -> RESCHEDULE
-- "Running 20 min late" -> LATE
-`;
-
-  files[base + "prompts/channel_email.md"] =
-`Subject: Appointment reminder
-
-Hi {first_name},
-Your appointment is on {date_short} at {time_short} with {doctor}.
-Reply:
-- "1" to CONFIRM
-- "2" to RESCHEDULE
-- "3" to CANCEL
-`;
-
-  files[base + "policies/hipaa_gdpr.md"] =
-`- PHI minimization: first name + last initial only in messages.
-- TCPA: store consent source+timestamp; honor STOP keyword.
-- Quiet hours: 21:00–08:00 local.
-- Retention: logs 365 days; message bodies redacted after 30 days.
-`;
-
-  files[base + "data/synthetic/appointments.csv"] =
-"appointment_id,patient_first,patient_last,email,appt_time,doctor,confirmed\nA1001,Sara,L.,sara@example.com,2025-10-02T10:00,Dr. Lee,false\nA1002,Marco,T.,marco@example.com,2025-10-02T11:30,Dr. Chen,false\n";
-
-  files[base + "tests/uat.json"] = JSON.stringify([
-    { case:"confirm", in:"Yes I'll be there", out:"CONFIRM" },
-    { case:"cancel", in:"I need to cancel", out:"CANCEL" },
-    { case:"reschedule", in:"Can we do next week?", out:"RESCHEDULE" },
-    { case:"late", in:"Running 20 min late", out:"LATE" }
-  ], null, 2);
-
-  files[base + "README.md"] =
-`# ${bp.name}
-
-**Agent:** ${bp.agent_name}
-
-## Triggers
-${bp.triggers}
-
-## How it works
-${bp.how_it_works}
-
-## ROI
-${bp.roi_hypothesis}
-`;
-  return files;
-}
-
 module.exports = async (req, res) => {
   // CORS for browser usage
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -83,11 +21,11 @@ module.exports = async (req, res) => {
   try {
     if (req.method !== "POST") {
       res.setHeader("Content-Type", "text/plain");
-      res.status(200).send('POST JSON { blueprint: "<yaml or json>" } to get a ZIP.');
+      res.status(200).send('POST JSON { blueprint: "<yaml or json>", format?: "zip" | "workflow" } to get artifacts.');
       return;
     }
 
-    // read body
+    // read body JSON
     const body = await new Promise(resolve => {
       const chunks = [];
       req.on("data", c => chunks.push(c));
@@ -102,10 +40,78 @@ module.exports = async (req, res) => {
       if (!bp[k]) throw new Error(`Blueprint missing '${k}'`);
     });
 
+    // load importable n8n workflow template
     const tplStr = fs.readFileSync(path.join(process.cwd(), "templates", "n8n.json.ejs"), "utf8");
-    const n8nJson = renderN8n(bp, tplStr);
-    const files = defaultFiles(bp, n8nJson);
+    const workflowJson = ejs.render(tplStr, bp);
 
+    // If user asked for workflow only, return JSON directly
+    const fmt = (body.format || (req.query && req.query.format) || "").toString().toLowerCase();
+    if (fmt === "workflow") {
+      res.status(200);
+      res.setHeader("Content-Type", "application/json");
+      res.setHeader("Content-Disposition", `attachment; filename="${bp.scenario_id}.workflow.json"`);
+      res.end(workflowJson);
+      return;
+    }
+
+    // Otherwise, build the ZIP (default)
+    const files = {};
+    const base = `${bp.scenario_id}/`;
+    files[base + "workflows/n8n.json"] = workflowJson;
+
+    files[base + "prompts/intent_classifier.md"] =
+`Return one of: CONFIRM | CANCEL | RESCHEDULE | LATE | HUMAN.
+Examples:
+- "Yes I'll be there" -> CONFIRM
+- "I need to cancel" -> CANCEL
+- "Can we do next week?" -> RESCHEDULE
+- "Running 20 min late" -> LATE
+`;
+
+    files[base + "prompts/channel_email.md"] =
+`Subject: Appointment reminder
+
+Hi {first_name},
+Your appointment is on {date_short} at {time_short} with {doctor}.
+Reply:
+- "1" to CONFIRM
+- "2" to RESCHEDULE
+- "3" to CANCEL
+`;
+
+    files[base + "policies/hipaa_gdpr.md"] =
+`- PHI minimization: first name + last initial only in messages.
+- TCPA: store consent source+timestamp; honor STOP keyword.
+- Quiet hours: 21:00–08:00 local.
+- Retention: logs 365 days; message bodies redacted after 30 days.
+`;
+
+    files[base + "data/synthetic/appointments.csv"] =
+"appointment_id,patient_first,patient_last,email,appt_time,doctor,confirmed\nA1001,Sara,L.,sara@example.com,2025-10-02T10:00,Dr. Lee,false\nA1002,Marco,T.,marco@example.com,2025-10-02T11:30,Dr. Chen,false\n";
+
+    files[base + "tests/uat.json"] = JSON.stringify([
+      { case:"confirm", in:"Yes I'll be there", out:"CONFIRM" },
+      { case:"cancel", in:"I need to cancel", out:"CANCEL" },
+      { case:"reschedule", in:"Can we do next week?", out:"RESCHEDULE" },
+      { case:"late", in:"Running 20 min late", out:"LATE" }
+    ], null, 2);
+
+    files[base + "README.md"] =
+`# ${bp.name}
+
+**Agent:** ${bp.agent_name}
+
+## Triggers
+${bp.triggers}
+
+## How it works
+${bp.how_it_works}
+
+## ROI
+${bp.roi_hypothesis}
+`;
+
+    // stream zip
     res.statusCode = 200;
     res.setHeader("Content-Type", "application/zip");
     res.setHeader("Content-Disposition", `attachment; filename="${bp.scenario_id}.zip"`);

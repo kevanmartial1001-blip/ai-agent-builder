@@ -1,23 +1,90 @@
 {
-  "name": "<%= name %> – No-Show Control",
+  "name": "<%= name %> – No-Show Control (Demo)",
   "nodes": [
-    { "id": "pms_poll",   "type": "HTTP Request", "parameters": {}, "notes": "Poll PMS for upcoming appts <48h (mock/demo)" },
-    { "id": "filter",     "type": "IF",           "parameters": {}, "notes": "Not confirmed + eligible for reminder" },
-    { "id": "compose",    "type": "Function",     "parameters": {}, "notes": "Build email body from template + variables" },
-    { "id": "send_email", "type": "EmailSend",    "parameters": {}, "notes": "Send reminder via Email (free demo)" },
-    { "id": "wait_reply", "type": "Wait",         "parameters": {}, "notes": "Manual resume or webhook in demo" },
-    { "id": "parse_intent","type":"Code",         "parameters": {}, "notes": "Mock intent parser (LLM later)" },
-    { "id": "update_pms", "type": "HTTP Request", "parameters": {}, "notes": "Write-back confirm/cancel (mock)" },
-    { "id": "fill_slot",  "type": "GoogleSheets", "parameters": {}, "notes": "Pick from waitlist and notify" },
-    { "id": "slack_digest","type":"Slack",        "parameters": {}, "notes": "Daily summary (optional)" }
+    {
+      "parameters": {
+        "functionCode": "// Emits two upcoming appointments for the demo\nreturn [{\n  json: {\n    appointments: [\n      { id:\"A1001\", first:\"Sara\",  last:\"L.\", email:\"sara@example.com\",  time:\"2025-10-02T10:00\", doctor:\"Dr. Lee\", confirmed:false },\n      { id:\"A1002\", first:\"Marco\", last:\"T.\", email:\"marco@example.com\", time:\"2025-10-02T11:30\", doctor:\"Dr. Chen\", confirmed:false }\n    ]\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [-600, -20],
+      "name": "Load Appointments",
+      "id": "LoadAppointments"
+    },
+    {
+      "parameters": {
+        "functionCode": "// Take the first appointment and build email fields\nconst appt = items[0].json.appointments[0];\nconst d = new Date(appt.time);\nconst dateStr = d.toLocaleDateString();\nconst timeStr = d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});\nreturn [{ json: {\n  to: appt.email,\n  subject: \"Appointment reminder\",\n  text: `Hi ${appt.first}, your appointment is on ${dateStr} at ${timeStr} with ${appt.doctor}.\\nReply 1 to CONFIRM, 2 to RESCHEDULE, 3 to CANCEL.`\n}}];"
+      },
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [-300, -20],
+      "name": "Compose Email",
+      "id": "ComposeEmail"
+    },
+    {
+      "parameters": {
+        "fromEmail": "",
+        "toEmail": "={{$json[\"to\"]}}",
+        "subject": "={{$json[\"subject\"]}}",
+        "text": "={{$json[\"text\"]}}"
+      },
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2,
+      "position": [0, -20],
+      "name": "Email Send",
+      "id": "EmailSend",
+      "notes": "Select your SMTP credentials after import."
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [300, -20],
+      "name": "Wait for Reply",
+      "id": "WaitReply",
+      "notes": "Click Resume to simulate a reply."
+    },
+    {
+      "parameters": {
+        "functionCode": "// Simulate reading a reply; change replyText to test flows\nconst replyText = \"1\"; // 1=CONFIRM, 2=RESCHEDULE, 3=CANCEL, or any sentence\nlet intent = \"HUMAN\";\nconst t = replyText.toLowerCase();\nif (t === \"1\" || t.includes(\"yes\") || t.includes(\"confirm\")) intent = \"CONFIRM\";\nelse if (t === \"3\" || t.includes(\"cancel\")) intent = \"CANCEL\";\nelse if (t === \"2\" || t.includes(\"reschedule\") || t.includes(\"another\") || t.includes(\"next week\")) intent = \"RESCHEDULE\";\nelse if (t.includes(\"late\")) intent = \"LATE\";\nreturn [{ json: { intent } }];"
+      },
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [600, -20],
+      "name": "Parse Intent (Demo)",
+      "id": "ParseIntent"
+    },
+    {
+      "parameters": {
+        "functionCode": "const intent = items[0].json.intent;console.log('PMS update:', intent);return [{ json: { updated: true, intent } }];"
+      },
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [900, -20],
+      "name": "Update PMS (Mock)",
+      "id": "UpdatePMS"
+    },
+    {
+      "parameters": {
+        "functionCode": "const intent = items[0].json.intent; if (intent === 'CANCEL' || intent === 'RESCHEDULE') { const next = { first:'Lena', last:'K.', email:'lena@example.com', priority:9 }; console.log('Waitlist backfill ->', next); return [{ json: { filledWith: next, intent } }]; } return [{ json: { skipped:true, intent } }];"
+      },
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [1200, -20],
+      "name": "Fill Slot (Mock)",
+      "id": "FillSlot"
+    }
   ],
   "connections": {
-    "pms_poll":   { "main": [[{ "node": "filter" }]] },
-    "filter":     { "main": [[{ "node": "compose" }]] },
-    "compose":    { "main": [[{ "node": "send_email" }]] },
-    "send_email": { "main": [[{ "node": "wait_reply" }]] },
-    "wait_reply": { "main": [[{ "node": "parse_intent" }]] },
-    "parse_intent": { "main": [[{ "node": "update_pms" }, { "node": "fill_slot" }]] },
-    "fill_slot":  { "main": [[{ "node": "slack_digest" }]] }
-  }
+    "Load Appointments": { "main": [[{ "node": "Compose Email", "type": "main", "index": 0 }]] },
+    "Compose Email":     { "main": [[{ "node": "Email Send",   "type": "main", "index": 0 }]] },
+    "Email Send":        { "main": [[{ "node": "Wait for Reply","type": "main", "index": 0 }]] },
+    "Wait for Reply":    { "main": [[{ "node": "Parse Intent (Demo)", "type": "main", "index": 0 }]] },
+    "Parse Intent (Demo)": { "main": [[{ "node": "Update PMS (Mock)", "type": "main", "index": 0 }]] },
+    "Update PMS (Mock)":   { "main": [[{ "node": "Fill Slot (Mock)",   "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": {},
+  "staticData": null,
+  "pinData": {}
 }

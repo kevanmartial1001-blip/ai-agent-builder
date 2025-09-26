@@ -3,14 +3,12 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>AI Agent Builder — Multi-Template</title>
+<title>AI Agent Builder</title>
 <style>
-  :root{--bg:#0b0c10;--card:#141824;--ink:#e9edf1;--muted:#9aa6b2;--accent:#5eead4;--line:#232735;--err:#ff9aa8;--ok:#66ffb7}
+  :root{--bg:#0b0c10;--card:#141824;--ink:#e9edf1;--muted:#9aa6b2;--accent:#5eead4;--line:#232735}
   html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial,sans-serif}
   .wrap{max-width:980px;margin:32px auto;padding:0 20px}
-  h1{margin:0 0 6px;font-size:26px}
-  .status{margin:12px 0 20px;padding:10px 12px;border-radius:10px;background:#0f1218;border:1px solid var(--line);display:flex;justify-content:space-between;gap:12px;align-items:center}
-  .status .ok{color:var(--ok)} .status .err{color:var(--err)} .status small{color:var(--muted)}
+  h1{margin:0 0 16px;font-size:26px}
   .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin-top:12px}
   .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
   label{display:block;font-weight:600;margin:12px 0 6px}
@@ -30,10 +28,6 @@
 <body>
 <div class="wrap">
   <h1>AI Agent Builder <small id="counts" class="hint"></small></h1>
-  <div class="status" id="statusBar">
-    <span id="statusText">Loading…</span>
-    <small id="statusSub"></small>
-  </div>
 
   <div class="card">
     <div class="row">
@@ -52,8 +46,8 @@
       </div>
     </div>
 
-    <label for="search">Search by <code>scenario_id</code></label>
-    <input id="search" placeholder="e.g. tier1_dso_SCHEDULING_NO_SHOWS" autocomplete="off" />
+    <label for="search">Search the full catalog (8k+)</label>
+    <input id="search" placeholder="Type scenario_id or name…  e.g. tier1_dso_SCHEDULING_NO_SHOWS" autocomplete="off" />
     <div id="suggestions"></div>
 
     <label for="bp">Preview</label>
@@ -61,33 +55,30 @@
 
     <div class="row" style="margin-top:10px">
       <button id="build" class="primary">Download n8n JSON</button>
-      <div class="hint" id="buildHint">Imports directly in n8n</div>
+      <div class="hint">Imports directly in n8n</div>
     </div>
     <div id="dbg" class="dbg"></div>
   </div>
 </div>
 
 <script>
-/* ================== tiny helpers ================== */
+/* ---------- small utils ---------- */
 const $ = id => document.getElementById(id);
-const statusText = $('statusText'), statusSub = $('statusSub'), countsEl = $('counts');
-const scenarioSel = $('scenario'), channelSel = $('channel'), searchEl = $('search'), suggestWrap = $('suggestions'), bpTA = $('bp'), dbg = $('dbg');
+const countsEl = $('counts'), scenarioSel = $('scenario'), channelSel = $('channel'),
+      searchEl = $('search'), suggestWrap = $('suggestions'), bpTA = $('bp'), dbg = $('dbg');
 
 let ALL = [], MAP = {};
 let INDUSTRIES = [], IND_MAP = {};
 
 const listify = v => Array.isArray(v) ? v : String(v ?? '')
-  .replace(/^\[|\]$/g,'')  // tolerate "['a','b']" or "[a,b]"
+  .replace(/^\[|\]$/g,'')
   .split(/[;,|\n|\|,]+/)
   .map(x=>x.replace(/^['"]|['"]$/g,'').trim())
   .filter(Boolean);
 
 const norm = t => (t||'').toLowerCase();
-const ok = (t,sub='') => { statusText.textContent=t; statusSub.textContent=sub; statusText.className='ok'; };
-const err= (t,sub='') => { statusText.textContent=t; statusSub.textContent=sub; statusText.className='err'; };
-function logDbg(...a){ dbg.textContent = a.map(x=> typeof x==='string'?x:JSON.stringify(x)).join(' | '); }
 
-/* ================== fetch with no-store ================== */
+/* ---------- fetch helpers ---------- */
 async function getJSON(url){
   const r = await fetch(url, { cache: 'no-store' });
   const raw = await r.text();
@@ -95,7 +86,7 @@ async function getJSON(url){
   catch { return { ok:r.ok, status:r.status, json:null, raw }; }
 }
 
-/* ================== channel recommendation ================== */
+/* ---------- channel recommendation ---------- */
 function recommendedChannel(row) {
   const shapes = listify(row.best_reply_shapes).map(x=>x.toLowerCase());
   const set = new Set(shapes.map(s =>
@@ -110,14 +101,17 @@ function recommendedChannel(row) {
   return 'email';
 }
 
-/* ================== industry + preview ================== */
-function matchIndustryForScenario(s) { const key = norm(s.name || ''); return IND_MAP[key] || null; }
+/* ---------- industry matching & preview ---------- */
+function matchIndustryForScenario(s) {
+  const key = norm(s.name || '');
+  return IND_MAP[key] || null;
+}
 function previewYaml(s, industry) {
   const br = v => (v==null || String(v).trim()==='' ? '' : String(v));
   const brList = arr => `[${listify(arr).join(', ')}]`;
   const ind = industry ? `
 industry_id: ${industry.industry_id}
-industry_painpoints: ${(industry.core_pains||industry.painpoints||'').toString().slice(0,220)}...` : '';
+industry_painpoints: ${(industry.painpoints||'').toString().slice(0,220)}...` : '';
   return `scenario_id: ${s.scenario_id}
 name: ${br(s.name)}
 agent_name: ${br(s.agent_name || 'Agent')}
@@ -131,7 +125,7 @@ roi_hypothesis: >
 tags: [${listify(s.tags).join(', ')}]${ind}`;
 }
 
-/* ================== UI wiring ================== */
+/* ---------- UI ---------- */
 function populateUI(list) {
   scenarioSel.innerHTML = '';
   const frag = document.createDocumentFragment();
@@ -146,7 +140,6 @@ function populateUI(list) {
   countsEl.textContent = `Loaded ${ALL.length} scenarios • ${INDUSTRIES.length} industries`;
   if (list.length) applyScenario(list[0].scenario_id);
 }
-
 function applyScenario(id) {
   const s = MAP[id] || ALL.find(x => x.scenario_id === id);
   if (!s) return;
@@ -156,60 +149,80 @@ function applyScenario(id) {
   bpTA.value = previewYaml(s, industry);
 }
 
-function renderSuggestions(q=''){
-  if (!ALL.length) { suggestWrap.innerHTML=''; return; }
-  const needle = q.trim().toLowerCase();
-  let matches = ALL;
-  if (needle) matches = ALL.filter(s =>
-    (s.scenario_id||'').toLowerCase().includes(needle) ||
-    (s.name||'').toLowerCase().includes(needle));
-  matches = matches.slice(0, 50);
-  if (!matches.length){ suggestWrap.innerHTML=''; return; }
+/* ---------- remote search (full 8k) ---------- */
+let searchTimer = null;
+async function remoteSearch(q) {
+  if (!q || q.trim().length < 2) { suggestWrap.innerHTML = ''; return; }
+  const url = `/api/scenarios?q=${encodeURIComponent(q)}&limit=50`;
+  const res = await getJSON(url);
+  const items = (res.ok && res.json && Array.isArray(res.json.items)) ? res.json.items : [];
+  renderSuggestions(items);
+}
+function renderSuggestions(matches){
+  if (!matches || !matches.length) { suggestWrap.innerHTML=''; return; }
   const box = document.createElement('div'); box.className = 'suggest-box';
-  box.innerHTML = matches.map(m => `<div class="suggest-item" data-id="${m.scenario_id}">
-    <span class="suggest-id">${m.scenario_id}</span>
-    <span class="suggest-name">${(m.name||'').replace(/</g,'&lt;')}</span>
-  </div>`).join('');
+  box.innerHTML = matches.map(m => {
+    const id = (m.scenario_id||'').replace(/</g,'&lt;');
+    const nm = (m.name||'').replace(/</g,'&lt;');
+    return `<div class="suggest-item" data-id="${id}">
+      <span class="suggest-id">${id}</span>
+      <span class="suggest-name">${nm}</span>
+    </div>`;
+  }).join('');
   box.addEventListener('click', (e)=>{
     const el=e.target.closest('.suggest-item'); if(!el)return;
-    const id=el.getAttribute('data-id'); if(MAP[id]){ $('search').value=id; applyScenario(id); suggestWrap.innerHTML=''; }
+    const id=el.getAttribute('data-id');
+    // if unknown, stash minimal object so applyScenario can show preview
+    if (!MAP[id]) {
+      const m = matches.find(x=>x.scenario_id===id);
+      if (m) { MAP[id] = {
+        scenario_id: m.scenario_id||'',
+        name: m.name||'',
+        triggers: m.triggers||'',
+        best_reply_shapes: listify(m.best_reply_shapes),
+        risk_notes: m.risk_notes||'',
+        agent_name: m.agent_name||'',
+        how_it_works: m.how_it_works||'',
+        tool_stack_dev: m.tool_stack_dev||'',
+        tool_stack_autonomous: m.tool_stack_autonomous||'',
+        tags: listify(m.tags||m['tags (;)']||'')
+      }; }
+    }
+    $('search').value = id;
+    applyScenario(id);
+    suggestWrap.innerHTML='';
   });
-  suggestWrap.innerHTML = ''; suggestWrap.appendChild(box);
+  suggestWrap.innerHTML=''; suggestWrap.appendChild(box);
 }
-$('search').addEventListener('focus', e => renderSuggestions(e.target.value));
-$('search').addEventListener('input', e => renderSuggestions(e.target.value));
-$('search').addEventListener('blur', () => setTimeout(()=> suggestWrap.innerHTML='', 150));
+
+$('search').addEventListener('input', (e)=>{
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(()=> remoteSearch(e.target.value), 180);
+});
+$('search').addEventListener('focus', ()=> {
+  if (ALL.length) renderSuggestions(ALL.slice(0,20)); // light suggestion on focus
+});
+$('search').addEventListener('blur', ()=> setTimeout(()=> suggestWrap.innerHTML='', 150));
 $('search').addEventListener('keydown', (e)=>{
   if (e.key === 'Enter'){
     const v = e.target.value.trim();
     if (MAP[v]) { applyScenario(v); suggestWrap.innerHTML=''; return; }
-    const first = ALL.find(s =>
-      (s.scenario_id||'').toLowerCase().includes(v.toLowerCase()) ||
-      (s.name||'').toLowerCase().includes(v.toLowerCase()));
-    if (first){ e.target.value = first.scenario_id; applyScenario(first.scenario_id); suggestWrap.innerHTML=''; }
+    // try a remote search once
+    remoteSearch(v);
   }
 });
 scenarioSel.addEventListener('change', () => applyScenario(scenarioSel.value));
 
-/* ================== bootstrap (defensive) ================== */
+/* ---------- bootstrap (load only 400) ---------- */
 async function bootstrap(){
   try{
     const [sc, ind] = await Promise.all([
-      getJSON('/api/scenarios'),
+      getJSON('/api/scenarios?cursor=0&limit=400'),
       getJSON('/api/industries'),
     ]);
+    const sitems = (sc.ok && sc.json && Array.isArray(sc.json.items)) ? sc.json.items : [];
+    const iitems = (ind.ok && ind.json && Array.isArray(ind.json.items)) ? ind.json.items : [];
 
-    if (!sc.ok || !sc.json || sc.json.ok === false) {
-      throw new Error(sc.json?.error || `scenarios api ${sc.status}`);
-    }
-    if (!ind.ok || !ind.json || ind.json.ok === false) {
-      throw new Error(ind.json?.error || `industries api ${ind.status}`);
-    }
-
-    const sitems = Array.isArray(sc.json.items) ? sc.json.items : [];
-    const iitems = Array.isArray(ind.json.items) ? ind.json.items : [];
-
-    // Normalize scenarios
     ALL = sitems.map(x => ({
       scenario_id: x.scenario_id || '',
       name: x.name || '',
@@ -222,10 +235,8 @@ async function bootstrap(){
       tool_stack_autonomous: x.tool_stack_autonomous || '',
       tags: listify(x.tags || x['tags (;)'] || '')
     })).filter(s => s.scenario_id);
-
     MAP = Object.fromEntries(ALL.map(x => [x.scenario_id, x]));
 
-    // Normalize industries
     INDUSTRIES = iitems.map(it => ({
       industry_id: it.industry_id || it.name || '',
       painpoints: it.core_pains || it.painpoints || '',
@@ -233,16 +244,12 @@ async function bootstrap(){
       channels: it.channels || it.core_channels || '',
       vocabulary: it.agent_language_prompt || ''
     })).filter(i => i.industry_id);
+    IND_MAP = Object.fromEntries(INDUSTRIES.map(it => [ (it.industry_id||'').toLowerCase(), it ]));
 
-    IND_MAP = Object.fromEntries(INDUSTRIES.map(it => [norm(it.industry_id), it]));
-
-    ok('Loaded', `${ALL.length} scenarios • ${INDUSTRIES.length} industries`);
-    logDbg(`/api/scenarios -> ${ALL.length}`, `/api/industries -> ${INDUSTRIES.length}`);
     populateUI(ALL);
   } catch (e){
-    err('Data load failed', e.message || String(e));
-    logDbg('ERROR', e && (e.stack || e.message || String(e)));
-    // Minimal fallback so UI still works
+    dbg.textContent = 'Bootstrap error: ' + (e.message||String(e));
+    // minimal fallback
     const fallbackS = {
       scenario_id:'tier1_dso_SCHEDULING_NO_SHOWS',
       name:'tier1_dso',
@@ -254,26 +261,24 @@ async function bootstrap(){
     const fallbackI = {
       industry_id:'tier1_dso',
       painpoints:'no-shows; front-desk overload',
-      kpis:'no-show rate; utilization',
-      channels:'sms; whatsapp',
-      vocabulary:'patient, chair time'
+      kpis:'no-show rate; utilization'
     };
-    ALL = [fallbackS]; MAP = { [fallbackS.scenario_id]: fallbackS };
-    INDUSTRIES = [fallbackI]; IND_MAP = { [norm(fallbackI.industry_id)]: fallbackI };
+    ALL=[fallbackS]; MAP={ [fallbackS.scenario_id]: fallbackS };
+    INDUSTRIES=[fallbackI]; IND_MAP={ [fallbackI.industry_id]: fallbackI };
     populateUI(ALL);
   }
 }
 
-/* ================== builder (same as earlier) ================== */
+/* ---------- template selection + builder (same as before) ---------- */
 function pickTemplate(s, industry){
-  const text = [s.scenario_id, s.name, s.triggers, s.how_it_works, s.roi_hypothesis, ...(s.tags||[]), industry?.painpoints, industry?.kpis]
+  const text = [s.scenario_id,s.name,s.triggers,s.how_it_works,s.roi_hypothesis,(s.tags||[]).join(' '),industry?.painpoints,industry?.kpis]
     .filter(Boolean).join(' ').toLowerCase();
   if (/(bill|invoice|payment|overdue|collection|ar)/.test(text)) return 'billing';
   if (/(lead|qualification|prospect|inbound|demo|trial|signup)/.test(text)) return 'lead';
   return 'scheduling';
 }
 function deriveModulesFromNarrative(s, industry){
-  const txt = [s.how_it_works,s.roi_hypothesis,s.triggers,(s.tags||[]).join(' '), industry?.painpoints, industry?.kpis, industry?.channels].map(x=>x||'').join(' ').toLowerCase();
+  const txt = [s.how_it_works,s.roi_hypothesis,s.triggers,(s.tags||[]).join(' '),industry?.painpoints,industry?.kpis,industry?.channels].map(x=>x||'').join(' ').toLowerCase();
   const mods = new Set();
   if (/\b(schedule|appointment|no-?show|calendar)\b/.test(txt)) mods.add('ReminderFlow');
   if (/\b(waitlist|backfill|cancell)\b/.test(txt)) mods.add('Waitlist');
@@ -322,14 +327,14 @@ function cfgNode(channel){
 }}];` } };
 }
 function branchChannels(wf, s){
-  node(wf.nodes, "Channel = Email?","n8n-nodes-base.if",[-520,-160],{conditions:{string:[{value1:"={{$items('Set Config',0,0).json.channel}}",operation:"equal",value2:"email"}]} );
-  node(wf.nodes, "Channel = SMS?","n8n-nodes-base.if",[-520,-40], {conditions:{string:[{value1:"={{$items('Set Config',0,0).json.channel}}",operation:"equal",value2:"sms"}]} );
-  node(wf.nodes, "Channel = WhatsApp?","n8n-nodes-base.if",[-520,80], {conditions:{string:[{value1:"={{$items('Set Config',0,0).json.channel}}",operation:"equal",value2:"whatsapp"}]} );
-  node(wf.nodes, "Channel = Call?","n8n-nodes-base.if",[-520,200], {conditions:{string:[{value1:"={{$items('Set Config',0,0).json.channel}}",operation:"equal",value2:"call"}]} );
-  link(wf.connections, "Compose Message","Channel = Email?");
-  link(wf.connections, "Compose Message","Channel = SMS?");
-  link(wf.connections, "Compose Message","Channel = WhatsApp?");
-  link(wf.connections, "Compose Message","Channel = Call?");
+  node(wf.nodes,"Channel = Email?","n8n-nodes-base.if",[-520,-160],{conditions:{string:[{value1:"={{$items('Set Config',0,0).json.channel}}",operation:"equal",value2:"email"}]} );
+  node(wf.nodes,"Channel = SMS?","n8n-nodes-base.if",[-520,-40], {conditions:{string:[{value1:"={{$items('Set Config',0,0).json.channel}}",operation:"equal",value2:"sms"}]} );
+  node(wf.nodes,"Channel = WhatsApp?","n8n-nodes-base.if",[-520,80], {conditions:{string:[{value1:"={{$items('Set Config',0,0).json.channel}}",operation:"equal",value2:"whatsapp"}]} );
+  node(wf.nodes,"Channel = Call?","n8n-nodes-base.if",[-520,200], {conditions:{string:[{value1:"={{$items('Set Config',0,0).json.channel}}",operation:"equal",value2:"call"}]} );
+  link(wf.connections,"Compose Message","Channel = Email?");
+  link(wf.connections,"Compose Message","Channel = SMS?");
+  link(wf.connections,"Compose Message","Channel = WhatsApp?");
+  link(wf.connections,"Compose Message","Channel = Call?");
   // Email
   node(wf.nodes,"Email Allowlist","n8n-nodes-base.function",[-340,-240],{functionCode:"const cfg=$items('Set Config',0,0).json;const to=$json.to||'';const ok=(cfg.allowedRecipients||[]).includes(to);return [{json:{ok}}];"});
   node(wf.nodes,"Email Allowed?","n8n-nodes-base.if",[-180,-240],{conditions:{boolean:[{value1:"={{$item(0).$node['Email Allowlist'].json.ok}}"}]} );
@@ -475,7 +480,7 @@ function buildWorkflowJSON(s) {
   return wfScheduling(s, industry);
 }
 
-/* ================== download ================== */
+/* ---------- download ---------- */
 function downloadJSON(obj, filename){
   const txt=JSON.stringify(obj,null,2);
   const blob=new Blob([txt],{type:'application/json'});
@@ -484,13 +489,12 @@ function downloadJSON(obj, filename){
 }
 $('build').addEventListener('click', () => {
   const sid = (scenarioSel.value || '').trim(); const s = MAP[sid];
-  if (!s) { err('No scenario selected'); return; }
+  if (!s) { dbg.textContent='No scenario selected'; return; }
   const wf = buildWorkflowJSON(s);
   downloadJSON(wf, `${sid}-workflow.json`);
-  ok('✓ Downloaded workflow', `${sid}-workflow.json`);
 });
 
-/* ================== go ================== */
+/* ---------- go ---------- */
 bootstrap();
 </script>
 </body>

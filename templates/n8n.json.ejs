@@ -5,35 +5,104 @@
       "parameters": {},
       "type": "n8n-nodes-base.manualTrigger",
       "typeVersion": 1,
-      "position": [-1280, -20],
+      "position": [-1480, -20],
       "name": "Manual Trigger"
     },
     {
       "parameters": {
-        "functionCode": "// Global config for the workflow. Flip demoMode to false to use real SMTP.\nreturn [{ json: {\n  demoMode: true,                // << set to false to use Email Send\n  overrideTo: \"you@example.com\"  // optional hardcoded recipient for testing\n}}];"
+        "downloadFormat": "simple",
+        "mailbox": "INBOX",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.emailImap",
+      "typeVersion": 2,
+      "position": [-1480, -240],
+      "name": "IMAP Email (Trigger)",
+      "disabled": true,
+      "credentials": {
+        "imap": { "name": "IMAP account" }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "// Global runtime config. Adjust safely after import.\n// Only recipients listed in allowedRecipients will actually send; others are simulated.\nreturn [{ json: {\n  demoMode: false,                                 // true = never send (simulate only)\n  channel: \"email\",                                // \"email\" | \"sms\" | \"whatsapp\" | \"call\"\n  // Safe-guard: only send to these recipients in real mode\n  allowedRecipients: [\"kevanm.spain@gmail.com\"],\n  // Default destinations for demo/testing\n  overrideTo: \"kevanm.spain@gmail.com\",            // used when composing email\n  overrideToPhone: \"+0000000000\",                  // E.164 (e.g. +15551234567) for SMS/WhatsApp/Call\n  // Twilio FROMs (set if you switch channel)\n  twilioFromSms: \"+15550000000\",\n  twilioFromWhatsApp: \"whatsapp:+15550000000\",\n  twilioFromVoice: \"+15550000000\"\n}}];"
       },
       "type": "n8n-nodes-base.function",
       "typeVersion": 2,
-      "position": [-1060, -20],
+      "position": [-1240, -20],
       "name": "Set Demo Config"
     },
     {
       "parameters": {
-        "functionCode": "// Emits a couple of upcoming appointments for the selected scenario\nreturn [{\n  json: {\n    scenario_id: \"<%= scenario_id %>\",\n    name: \"<%= name %>\",\n    appointments: [\n      { id: \"A1001\", first: \"Sara\",  last: \"L.\", email: \"sara@example.com\",  time: \"2025-10-02T10:00\", doctor: \"Dr. Lee\",  confirmed: false },\n      { id: \"A1002\", first: \"Marco\", last: \"T.\", email: \"marco@example.com\", time: \"2025-10-02T11:30\", doctor: \"Dr. Chen\", confirmed: false }\n    ]\n  }\n}];"
+        "functionCode": "// Demo appointment payload derived from scenario\nreturn [{\n  json: {\n    scenario_id: \"<%= scenario_id %>\",\n    scenario_name: \"<%= name %>\",\n    agent_name: \"<%= agent_name %>\",\n    best_reply_shapes: <%- JSON.stringify(best_reply_shapes || []) %>,\n    appointments: [\n      { id: \"A1001\", first: \"Sara\",  last: \"L.\", email: \"sara@example.com\",  phone: \"+15551234567\", time: \"2025-10-02T10:00\", doctor: \"Dr. Lee\",  confirmed: false },\n      { id: \"A1002\", first: \"Marco\", last: \"T.\", email: \"marco@example.com\", phone: \"+15557654321\", time: \"2025-10-02T11:30\", doctor: \"Dr. Chen\", confirmed: false }\n    ]\n  }\n}];"
       },
       "type": "n8n-nodes-base.function",
       "typeVersion": 2,
-      "position": [-800, -20],
+      "position": [-980, -20],
       "name": "Load Appointments"
     },
     {
       "parameters": {
-        "functionCode": "// Build an outbound message from the first appointment.\n// If overrideTo is set in config, force the recipient.\nconst appt = items[0].json.appointments[0];\nconst d = new Date(appt.time);\nconst dateStr = d.toLocaleDateString();\nconst timeStr = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });\n\nconst cfg = $items(\"Set Demo Config\", 0, 0)?.json || {};\nconst to = cfg.overrideTo || appt.email;\n\nreturn [{ json: {\n  to,\n  subject: \"Appointment reminder\",\n  text: `Hi ${appt.first}, your appointment is on ${dateStr} at ${timeStr} with ${appt.doctor}.\\nReply 1 to CONFIRM, 2 to RESCHEDULE, 3 to CANCEL.`,\n  meta: { scenario_id: $json.scenario_id, name: $json.name }\n}}];"
+        "functionCode": "// Build a message from the first appointment.\n// Email uses overrideTo; SMS/WhatsApp/Call will use overrideToPhone for now.\nconst appt = items[0].json.appointments[0];\nconst d = new Date(appt.time);\nconst dateStr = d.toLocaleDateString();\nconst timeStr = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });\nconst cfg = $items(\"Set Demo Config\", 0, 0)?.json || {};\n\nreturn [{ json: {\n  to: cfg.overrideTo || appt.email,\n  toPhone: cfg.overrideToPhone || appt.phone,\n  subject: `Appointment reminder – ${appt.doctor}`,\n  text: `Hi ${appt.first}, your appointment is on ${dateStr} at ${timeStr} with ${appt.doctor}.\\nReply 1 to CONFIRM, 2 to RESCHEDULE, 3 to CANCEL.`,\n  tts: `Hello ${appt.first}. This is a reminder for your appointment on ${dateStr} at ${timeStr} with ${appt.doctor}. Press one to confirm, two to reschedule, or three to cancel.`,\n  meta: { scenario_id: $json.scenario_id, scenario_name: $json.scenario_name }\n}}];"
       },
       "type": "n8n-nodes-base.function",
       "typeVersion": 2,
-      "position": [-520, -20],
+      "position": [-740, -20],
       "name": "Compose Message"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            { "value1": "={{$json[\"to\"]}}", "operation": "contains", "value2": "@" }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-520, -20],
+      "name": "Has Email?"
+    },
+    {
+      "parameters": {
+        "functionCode": "// Safety guard: allow only recipients whitelisted in cfg.allowedRecipients. Otherwise simulate.\nconst cfg = $items(\"Set Demo Config\", 0, 0)?.json || {};\nconst to = $json.to || \"\";\nconst allowed = Array.isArray(cfg.allowedRecipients) ? cfg.allowedRecipients : [];\nreturn [{ json: { allowed: allowed.includes(to) } }];"
+      },
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [-520, -160],
+      "name": "Allowlist Check"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            { "value1": "={{$item(0).$node[\"Allowlist Check\"].json[\"allowed\"]}}" }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-300, -160],
+      "name": "Allowed Recipient?"
+    },
+    {
+      "parameters": {
+        "functionCode": "// Select channel based on cfg.channel (email|sms|whatsapp|call)\nconst cfg = $items(\"Set Demo Config\", 0, 0)?.json || {};\nreturn [{ json: { channel: (cfg.channel || \"email\").toLowerCase() } }];"
+      },
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [-80, -160],
+      "name": "Channel Resolver"
+    },
+    {
+      "parameters": {
+        "field": "channel",
+        "rules": {\n          "rules": [\n            { \"value\": \"email\" },\n            { \"value\": \"sms\" },\n            { \"value\": \"whatsapp\" },\n            { \"value\": \"call\" }\n          ]\n        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 2,
+      "position": [140, -160],
+      "name": "Switch Channel"
     },
     {
       "parameters": {
@@ -45,16 +114,16 @@
       },
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [-280, -20],
+      "position": [380, -260],
       "name": "Demo Mode?"
     },
     {
       "parameters": {
-        "functionCode": "// Simulate sending (no SMTP). Keeps the flow runnable out-of-the-box.\nconsole.log(\"[SIMULATED SEND] To:\", $json.to, \"Subject:\", $json.subject);\nreturn items;"
+        "functionCode": "// Simulate sending to avoid real deliveries.\nconsole.log(\"[SIMULATED SEND]\", { to: $json.to, toPhone: $json.toPhone, subject: $json.subject });\nreturn items;"
       },
       "type": "n8n-nodes-base.function",
       "typeVersion": 2,
-      "position": [-40, -120],
+      "position": [600, -360],
       "name": "Simulate Send"
     },
     {
@@ -62,47 +131,103 @@
         "fromEmail": "",
         "toEmail": "={{$json[\"to\"]}}",
         "subject": "={{$json[\"subject\"]}}",
-        "text": "={{$json[\"text\"]}}"
+        "text": "={{$json[\"text\"]}}",
+        "options": { "senderName": "<%= agent_name %>" }
       },
       "type": "n8n-nodes-base.emailSend",
       "typeVersion": 2,
-      "position": [-40, 100],
+      "position": [600, -160],
       "name": "Email Send",
-      "notes": "Select SMTP credentials when demoMode=false."
+      "notes": "Uses shared SMTP credential.",
+      "credentials": {
+        "smtp": { "name": "SMTP account" }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "from": "={{$items(\"Set Demo Config\", 0, 0).json.twilioFromSms}}",
+        "to": "={{$json[\"toPhone\"]}}",
+        "message": "={{$json[\"text\"]}}"
+      },
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 2,
+      "position": [600, -60],
+      "name": "Twilio SMS",
+      "disabled": true,
+      "credentials": {
+        "twilioApi": { "name": "twilio-default" }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "from": "={{$items(\"Set Demo Config\", 0, 0).json.twilioFromWhatsApp}}",
+        "to": "={{'whatsapp:' + $json['toPhone']}}",
+        "message": "={{$json[\"text\"]}}"
+      },
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 2,
+      "position": [600, 40],
+      "name": "Twilio WhatsApp",
+      "disabled": true,
+      "credentials": {
+        "twilioApi": { "name": "twilio-default" }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "call",
+        "operation": "create",
+        "from": "={{$items(\"Set Demo Config\", 0, 0).json.twilioFromVoice}}",
+        "to": "={{$json[\"toPhone\"]}}",
+        "text": "={{$json[\"tts\"]}}",
+        "sayOrPlay": "say"
+      },
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 2,
+      "position": [600, 140],
+      "name": "Twilio Call (TTS)",
+      "disabled": true,
+      "credentials": {
+        "twilioApi": { "name": "twilio-default" }
+      }
     },
     {
       "parameters": {},
       "type": "n8n-nodes-base.wait",
       "typeVersion": 1,
-      "position": [220, -20],
+      "position": [880, -160],
       "name": "Wait for Reply",
-      "notes": "Click Resume to simulate a reply."
+      "notes": "Click Resume to simulate a reply if you don't use the IMAP/Webhook lane."
     },
     {
       "parameters": {
-        "functionCode": "// Parse (simulated) reply. Change replyText to test.\nconst replyText = \"1\"; // 1=CONFIRM, 2=RESCHEDULE, 3=CANCEL, 'late' → LATE\nlet intent = \"HUMAN\";\nconst t = replyText.toLowerCase();\nif (t === \"1\" || t.includes(\"yes\") || t.includes(\"confirm\")) intent = \"CONFIRM\";\nelse if (t === \"3\" || t.includes(\"cancel\")) intent = \"CANCEL\";\nelse if (t === \"2\" || t.includes(\"reschedule\") || t.includes(\"another\") || t.includes(\"next week\")) intent = \"RESCHEDULE\";\nelse if (t.includes(\"late\")) intent = \"LATE\";\nreturn [{ json: { intent } }];"
+        "functionCode": "// Parse reply (simulated if from Wait->Resume). Replace with real inbox/webhook parser if needed.\nconst replyText = \"1\"; // used only when simulating\nlet t = (item.json.text || replyText || \"\").toLowerCase();\nlet intent = \"HUMAN\";\nif (t === \"1\" || /(^|\\b)yes\\b|confirm/.test(t)) intent = \"CONFIRM\";\nelse if (t === \"3\" || /cancel|annuler/.test(t)) intent = \"CANCEL\";\nelse if (t === \"2\" || /reschedule|another|next week|reporter|déplacer|changer/.test(t)) intent = \"RESCHEDULE\";\nelse if (/late|retard|en retard|mins? late|minutes? de retard/.test(t)) intent = \"LATE\";\nreturn [{ json: { intent } }];"
       },
       "type": "n8n-nodes-base.function",
       "typeVersion": 2,
-      "position": [480, -20],
-      "name": "Parse Intent (Demo)"
+      "position": [1120, -160],
+      "name": "Parse Intent"
     },
     {
       "parameters": {
-        "functionCode": "// Mock PMS write-back per intent\nconst intent = $json.intent;\nconsole.log(\"[PMS] Update →\", intent);\nreturn [{ json: { updated: true, intent } }];"
+        "functionCode": "// Mock PMS write-back\nconsole.log('[PMS] Update →', $json.intent);\nreturn [{ json: { updated: true, intent: $json.intent } }];"
       },
       "type": "n8n-nodes-base.function",
       "typeVersion": 2,
-      "position": [760, -20],
+      "position": [1360, -160],
       "name": "Update PMS (Mock)"
     },
     {
       "parameters": {
-        "functionCode": "// If slot freed, pick top of waitlist (demo)\nconst intent = $json.intent;\nif (intent === 'CANCEL' || intent === 'RESCHEDULE') {\n  const next = { first:'Lena', last:'K.', email:'lena@example.com', priority:9 };\n  console.log('[WAITLIST] Backfill →', next);\n  return [{ json: { filledWith: next, intent } }];\n}\nreturn [{ json: { skipped:true, intent } }];"
+        "functionCode": "// Demo waitlist fill: only on CANCEL/RESCHEDULE\nif ($json.intent === 'CANCEL' || $json.intent === 'RESCHEDULE') {\n  const next = { first:'Lena', last:'K.', email:'lena@example.com', phone:'+15550001111', priority:9 };\n  console.log('[WAITLIST] Backfill →', next);\n  return [{ json: { filledWith: next, intent: $json.intent } }];\n}\nreturn [{ json: { skipped:true, intent: $json.intent } }];"
       },
       "type": "n8n-nodes-base.function",
       "typeVersion": 2,
-      "position": [1040, -20],
+      "position": [1600, -160],
       "name": "Fill Slot (Mock)"
     }
   ],
@@ -117,12 +242,43 @@
       "main": [[{ "node": "Compose Message", "type": "main", "index": 0 }]]
     },
     "Compose Message": {
-      "main": [[{ "node": "Demo Mode?", "type": "main", "index": 0 }]]
+      "main": [
+        [{ "node": "Has Email?", "type": "main", "index": 0 }],
+        [{ "node": "Allowlist Check", "type": "main", "index": 0 }]
+      ]
+    },
+    "Has Email?": {
+      "main": [
+        [{ "node": "Allowlist Check", "type": "main", "index": 0 }],
+        [{ "node": "Allowlist Check", "type": "main", "index": 0 }]
+      ]
+    },
+    "Allowlist Check": {
+      "main": [
+        [{ "node": "Allowed Recipient?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Allowed Recipient?": {
+      "main": [
+        [{ "node": "Channel Resolver", "type": "main", "index": 0 }],
+        [{ "node": "Simulate Send", "type": "main", "index": 0 }]
+      ]
+    },
+    "Channel Resolver": {
+      "main": [[{ "node": "Switch Channel", "type": "main", "index": 0 }]]
+    },
+    "Switch Channel": {
+      "main": [
+        [{ "node": "Demo Mode?", "type": "main", "index": 0 }],
+        [{ "node": "Twilio SMS", "type": "main", "index": 0 }],
+        [{ "node": "Twilio WhatsApp", "type": "main", "index": 0 }],
+        [{ "node": "Twilio Call (TTS)", "type": "main", "index": 0 }]
+      ]
     },
     "Demo Mode?": {
       "main": [
         [{ "node": "Simulate Send", "type": "main", "index": 0 }],
-        [{ "node": "Email Send",   "type": "main", "index": 0 }]
+        [{ "node": "Email Send", "type": "main", "index": 0 }]
       ]
     },
     "Simulate Send": {
@@ -131,10 +287,19 @@
     "Email Send": {
       "main": [[{ "node": "Wait for Reply", "type": "main", "index": 0 }]]
     },
-    "Wait for Reply": {
-      "main": [[{ "node": "Parse Intent (Demo)", "type": "main", "index": 0 }]]
+    "Twilio SMS": {
+      "main": [[{ "node": "Wait for Reply", "type": "main", "index": 0 }]]
     },
-    "Parse Intent (Demo)": {
+    "Twilio WhatsApp": {
+      "main": [[{ "node": "Wait for Reply", "type": "main", "index": 0 }]]
+    },
+    "Twilio Call (TTS)": {
+      "main": [[{ "node": "Wait for Reply", "type": "main", "index": 0 }]]
+    },
+    "Wait for Reply": {
+      "main": [[{ "node": "Parse Intent", "type": "main", "index": 0 }]]
+    },
+    "Parse Intent": {
       "main": [[{ "node": "Update PMS (Mock)", "type": "main", "index": 0 }]]
     },
     "Update PMS (Mock)": {

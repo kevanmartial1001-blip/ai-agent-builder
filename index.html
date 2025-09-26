@@ -62,11 +62,11 @@
   </div>
 </div>
 
-<!-- votre builder externe (doit exposer window.Builder.buildWorkflowJSON) -->
-<script src="/builder.js"></script>
+<!-- IMPORTANT : builder en statique, servi depuis /public/builder.js -->
+<script src="/builder.js?v=1"></script>
 
 <script>
-/* ========== Small helpers ========== */
+/* ========== helpers & state ========== */
 const $ = id => document.getElementById(id);
 const scenarioSel = $('scenario'), channelSel = $('channel'),
       searchEl = $('search'), suggestWrap = $('suggestions'), bpTA = $('bp'),
@@ -75,7 +75,6 @@ const scenarioSel = $('scenario'), channelSel = $('channel'),
 let ALL = [], MAP = {};
 let INDUSTRIES = [], IND_MAP = {};
 
-/* robust string → array */
 function listify(v){ return Array.isArray(v) ? v : String(v ?? '')
   .replace(/^\[|\]$/g,'')
   .split(/[;,|\n|\|,]+/)
@@ -106,8 +105,6 @@ function matchIndustryForScenario(s){
   const key = (s.name||'').toLowerCase();
   return IND_MAP[key] || null;
 }
-
-/* petite fiche YAML utile en fallback */
 function previewYaml(s, industry){
   const br = v => (v==null || String(v).trim()==='' ? '' : String(v));
   const brList = arr => `[${listify(arr).join(', ')}]`;
@@ -140,7 +137,7 @@ function populateUI(list){
   if (list.length) applyScenario(list[0].scenario_id);
 }
 
-/* écrire un message d’erreur dans la zone Preview */
+/* afficher message d’erreur dans Preview */
 function showPreviewError(msg) {
   bpTA.value = `/* Preview error */\n${msg}`;
 }
@@ -153,13 +150,12 @@ function applyScenario(id){
   scenarioSel.value = s.scenario_id;
   channelSel.value  = recommendedChannel(s);
 
-  // 1) Montrer un résumé YAML immédiatement
-  const yaml = previewYaml(s, industry);
-
-  // 2) Essayer de construire le workflow n8n via le builder externe
+  // 1) Essayer le builder
   try {
     if (!window.Builder || typeof window.Builder.buildWorkflowJSON !== 'function') {
-      bpTA.value = `${yaml}\n\n/* Builder not loaded. Check /builder.js (cache/404). */`;
+      // fallback YAML si builder pas chargé
+      const yaml = previewYaml(s, industry);
+      bpTA.value = `${yaml}\n\n/* Builder not loaded. Check /public/builder.js and cache. */`;
       console.warn('Builder not loaded. window.Builder =', window.Builder);
       return;
     }
@@ -167,11 +163,12 @@ function applyScenario(id){
     bpTA.value = JSON.stringify(wf, null, 2);
   } catch (err) {
     console.error('buildWorkflowJSON() error:', err);
+    const yaml = previewYaml(s, industry);
     bpTA.value = `${yaml}\n\n/* buildWorkflowJSON error */\n${(err && err.message) ? err.message : String(err)}`;
   }
 }
 
-/* ========== Remote search across 8k+ ========== */
+/* ========== Remote search (8k+) ========== */
 let searchTimer = null;
 async function remoteSearch(q){
   if (!q || q.trim().length < 2){ suggestWrap.innerHTML=''; return; }
@@ -194,7 +191,6 @@ function renderSuggestions(matches){
   box.addEventListener('click', (e)=>{
     const el = e.target.closest('.suggest-item'); if(!el) return;
     const id = el.getAttribute('data-id');
-    // si non présent dans les 25 préchargés, on stocke un minimum
     if (!MAP[id]){
       const m = matches.find(x=>x.scenario_id===id);
       if (m){
@@ -248,7 +244,7 @@ $('build').addEventListener('click', ()=>{
 
   try{
     if (!window.Builder || typeof window.Builder.buildWorkflowJSON !== 'function') {
-      dbg.innerHTML = '<span class="err">Builder not loaded (using YAML in preview only). Check /builder.js.</span>';
+      dbg.innerHTML = '<span class="err">Builder not loaded (using YAML in preview only). Check /public/builder.js.</span>';
       return;
     }
     const wf = window.Builder.buildWorkflowJSON(s);
@@ -258,7 +254,7 @@ $('build').addEventListener('click', ()=>{
   }
 });
 
-/* ========== Bootstrap (ONLY 25 for fast UI) ========== */
+/* ========== Bootstrap (25 rapides) ========== */
 async function bootstrap(){
   try{
     const [sc, ind] = await Promise.all([

@@ -13,33 +13,32 @@
   .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
   .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
   label{display:block;font-weight:600;margin:12px 0 6px}
-  select,textarea{width:100%;background:#0f1218;color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+  select,textarea,input{width:100%;background:#0f1218;color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
   textarea{min-height:200px;font-family:ui-monospace,Consolas,Menlo,monospace;font-size:13px}
-  input{width:100%;background:#0f1218;color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
   .btnbar{display:flex;gap:12px;align-items:center;margin-top:14px}
   button{background:#1f2937;border:1px solid var(--line);color:var(--ink);padding:10px 14px;border-radius:10px;cursor:pointer}
   button.primary{background:var(--accent);color:#0b0c10;border:none;font-weight:700}
   .hint{color:var(--muted);font-size:13px;margin-left:6px}
   .ok{color:#66ffb7}.err{color:#ff9aa8}
   .kbd{background:#0f1218;border:1px solid var(--line);padding:2px 6px;border-radius:6px}
+  small.badge{background:#0f1218;border:1px solid var(--line);border-radius:8px;padding:2px 6px;margin-left:6px;color:var(--muted)}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>AI Agent Builder</h1>
-  <p class="muted">Pick a scenario (full list), optionally choose a channel, then click <span class="kbd">Build</span> to download an import-ready n8n workflow.</p>
+  <h1>AI Agent Builder <small class="badge" id="loadedCount"></small></h1>
+  <p class="muted">Search by <strong>scenario_id</strong>, or pick from the list. We’ll auto-select the most effective <em>Channel</em> for this agent; you can change it if you like.</p>
 
   <div class="card">
     <div class="row">
       <div>
         <label for="scenario">Scenario</label>
         <select id="scenario"></select>
-        <div class="hint" id="count"></div>
       </div>
       <div>
-        <label for="channel">Channel</label>
+        <label for="channel">Channel (auto-recommended)</label>
         <select id="channel">
-          <option value="email" selected>Email</option>
+          <option value="email">Email</option>
           <option value="sms">SMS (Twilio)</option>
           <option value="whatsapp">WhatsApp (Twilio)</option>
           <option value="call">Voice Call (Twilio TTS)</option>
@@ -47,10 +46,11 @@
       </div>
     </div>
 
-    <label for="search">Filter scenarios</label>
-    <input id="search" placeholder="Type to filter by name or scenario_id…" />
+    <label for="search">Search by <code>scenario_id</code></label>
+    <input id="search" list="scenarioIds" placeholder="e.g. tier1_dso_SCHEDULING_NO_SHOWS" />
+    <datalist id="scenarioIds"></datalist>
 
-    <label for="bp">Blueprint (auto-filled from your selection — editable)</label>
+    <label for="bp">Blueprint (auto-filled; editable)</label>
     <textarea id="bp" spellcheck="false"></textarea>
 
     <div class="btnbar">
@@ -62,73 +62,123 @@
 
 <script>
   const $ = (id) => document.getElementById(id);
-  const statusEl = $('status'), scenarioSel = $('scenario'), searchEl = $('search'), bpTA = $('bp'), countEl = $('count');
+  const statusEl = $('status');
+  const scenarioSel = $('scenario');
+  const channelSel = $('channel');
+  const searchEl = $('search');
+  const bpTA = $('bp');
+  const datalist = $('scenarioIds');
+  const loadedCount = $('loadedCount');
 
-  let ALL = []; // full list from /api/scenarios
-  let VIEW = []; // filtered
+  let ALL = [];           // full list from /api/scenarios
+  let MAP_BY_ID = {};     // scenario_id -> row
+
+  // --- utilities ----------------------------------------------------------
+  const listify = (v) => Array.isArray(v) ? v : String(v || '').split(/[;,|\s]+/).map(x=>x.trim()).filter(Boolean);
+
+  function recommendedChannel(row) {
+    // Use best_reply_shapes if present; otherwise some safe heuristics.
+    const shapes = listify(row.best_reply_shapes || row.channel);
+    const norm = shapes.map(s => s.toLowerCase());
+
+    // synonym map
+    const set = new Set(norm.map(s => (
+      s.includes('whatsapp') ? 'whatsapp' :
+      s.includes('sms') || s.includes('text') ? 'sms' :
+      s.includes('voice') || s.includes('call') || s.includes('phone') ? 'call' :
+      s.includes('email') || s.includes('mail') ? 'email' : s
+    )));
+
+    // priority: SMS > WhatsApp > Email > Call  (fastest confirm first)
+    if (set.has('sms')) return 'sms';
+    if (set.has('whatsapp')) return 'whatsapp';
+    if (set.has('email')) return 'email';
+    if (set.has('call')) return 'call';
+    // fallback heuristic: for "scheduling" use sms; else email
+    const hay = ((row.name || '') + ' ' + (row.tags || []).join(' ')).toLowerCase();
+    if (hay.includes('schedule') || hay.includes('appointment') || hay.includes('no-show')) return 'sms';
+    return 'email';
+  }
+
+  function makeYaml(s) {
+    const br = (v) => (v==null || String(v).trim()==='' ? '' : String(v));
+    const brList = (arr) => `[${listify(arr).join(', ')}]`;
+    return `version: 0.1
+scenario_id: ${s.scenario_id}
+name: ${br(s.name)}
+agent_name: ${br(s.agent_name || 'Agent')}
+best_reply_shapes: ${brList(s.best_reply_shapes)}
+triggers: >${br('\\n  ' + (s.triggers || ''))}
+how_it_works: >${br('\\n  ' + (s.how_it_works || ''))}
+tool_stack_dev: >${br('\\n  ' + (s.tool_stack_dev || 'n8n; SMTP; Twilio'))}
+roi_hypothesis: >${br('\\n  ' + (s.roi_hypothesis || ''))}
+tags: [${listify(s.tags).join(', ')}]`;
+  }
+
+  function populateUI(list) {
+    // dropdown
+    scenarioSel.innerHTML = '';
+    list.forEach(s => {
+      const opt = document.createElement('option');
+      opt.value = s.scenario_id;
+      opt.textContent = s.name ? `${s.name}` : s.scenario_id;
+      scenarioSel.appendChild(opt);
+    });
+    // datalist for search (scenario_id first)
+    datalist.innerHTML = '';
+    ALL.forEach(s => {
+      const o = document.createElement('option');
+      o.value = s.scenario_id;
+      o.label = s.name || s.scenario_id;
+      datalist.appendChild(o);
+    });
+    loadedCount.textContent = `Loaded ${ALL.length}`;
+    if (list.length) applyScenario(list[0].scenario_id);
+  }
+
+  function applyScenario(id) {
+    const s = MAP_BY_ID[id] || ALL.find(x => x.scenario_id === id);
+    if (!s) return;
+    scenarioSel.value = s.scenario_id;
+    bpTA.value = makeYaml(s);
+    // auto-pick channel
+    const rec = recommendedChannel(s);
+    channelSel.value = rec;
+  }
 
   async function fetchScenarios() {
     try {
       const res = await fetch('/api/scenarios');
       if (!res.ok) throw new Error('Failed to load scenarios');
       const data = await res.json();
-      ALL = data.items || [];
-      VIEW = ALL.slice();
-      populateSelect(VIEW);
-      countEl.textContent = `Loaded ${ALL.length} scenarios`;
+      ALL = (data.items || []).map(x => ({
+        ...x,
+        best_reply_shapes: listify(x.best_reply_shapes),
+        tags: listify(x.tags),
+      }));
+      MAP_BY_ID = Object.fromEntries(ALL.map(x => [x.scenario_id, x]));
+      populateUI(ALL);
     } catch (e) {
       console.error(e);
       statusEl.textContent = '✗ Error: Failed to load scenarios'; statusEl.className = 'hint err';
-      // minimal fallback to keep UI usable
-      ALL = [{ scenario_id:'tier1_dso_SCHEDULING_NO_SHOWS', name:'DSO – Scheduling (reduce no-shows)', agent_name:'Scheduling Agent', best_reply_shapes:'email' }];
-      VIEW = ALL.slice(); populateSelect(VIEW);
+      // minimal fallback so the page still works
+      const fallback = {
+        scenario_id: 'tier1_dso_SCHEDULING_NO_SHOWS',
+        name: 'DSO – Scheduling (reduce no-shows)',
+        agent_name: 'Scheduling Agent',
+        best_reply_shapes: ['sms','email'],
+        triggers: 'Regional dental groups operate 5–15 clinics. High no-show rates.',
+      };
+      ALL = [fallback]; MAP_BY_ID = { [fallback.scenario_id]: fallback };
+      populateUI(ALL);
     }
   }
 
-  function makeYaml(s) {
-    // auto-generate a compact YAML from row fields
-    const br = (v) => (v==null || String(v).trim()==='' ? '' : String(v));
-    return `version: 0.1
-scenario_id: ${s.scenario_id}
-name: ${br(s.name)}
-agent_name: ${br(s.agent_name || 'Agent')}
-best_reply_shapes: [${(s.best_reply_shapes||'email').toString().split(/[;, ]+/).filter(Boolean)[0]}]
-triggers: >${br('\\n  ' + (s.triggers || ''))}
-how_it_works: >${br('\\n  ' + (s.how_it_works || ''))}
-tool_stack_dev: >${br('\\n  ' + (s.tool_stack_dev || 'n8n; SMTP; Twilio'))}
-roi_hypothesis: >${br('\\n  ' + (s.roi_hypothesis || ''))}
-tags: [${(s.tags||'').toString().split(/[;,\s]+/).filter(Boolean).join(', ')}]`;
-  }
-
-  function populateSelect(list) {
-    // keep current selection if possible
-    const prev = scenarioSel.value;
-    scenarioSel.innerHTML = '';
-    list.forEach((s, idx) => {
-      const opt = document.createElement('option');
-      opt.value = s.scenario_id;
-      opt.textContent = `${s.name || s.scenario_id}`;
-      scenarioSel.appendChild(opt);
-    });
-    const chosen = list.find(x => x.scenario_id === prev) ? prev : (list[0]?.scenario_id || '');
-    scenarioSel.value = chosen;
-    if (chosen) {
-      const s = list.find(x => x.scenario_id === chosen);
-      bpTA.value = makeYaml(s);
-    }
-  }
-
-  scenarioSel.addEventListener('change', () => {
-    const s = VIEW.find(x => x.scenario_id === scenarioSel.value);
-    if (s) bpTA.value = makeYaml(s);
-  });
-
-  searchEl.addEventListener('input', () => {
-    const q = searchEl.value.toLowerCase().trim();
-    VIEW = !q ? ALL.slice() :
-      ALL.filter(x => (x.name||'').toLowerCase().includes(q) || (x.scenario_id||'').toLowerCase().includes(q));
-    populateSelect(VIEW);
-    countEl.textContent = `Showing ${VIEW.length} / ${ALL.length}`;
+  // events
+  scenarioSel.addEventListener('change', () => applyScenario(scenarioSel.value));
+  searchEl.addEventListener('change', () => {
+    const id = searchEl.value.trim();
+    if (MAP_BY_ID[id]) applyScenario(id);
   });
 
   async function postBuild(body) {
@@ -146,7 +196,6 @@ tags: [${(s.tags||'').toString().split(/[;,\s]+/).filter(Boolean).join(', ')}]`;
     }
     throw new Error('No build endpoint found.');
   }
-
   function downloadBlob(blob, filename) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a'); a.href = url; a.download = filename;
@@ -158,7 +207,7 @@ tags: [${(s.tags||'').toString().split(/[;,\s]+/).filter(Boolean).join(', ')}]`;
     const body = {
       blueprint: bpTA.value,
       options: {
-        channel: $('channel').value,       // email | sms | whatsapp | call
+        channel: channelSel.value,     // auto-recommended but user-overridable
         reply_mode: 'none',
         demoMode: false,
         overrideTo: 'kevanm.spain@gmail.com',

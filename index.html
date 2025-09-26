@@ -213,17 +213,49 @@ $('search').addEventListener('keydown', (e)=>{
 });
 scenarioSel.addEventListener('change', () => applyScenario(scenarioSel.value));
 
-/* ---------- bootstrap (load only 400) ---------- */
+/* ---------- bootstrap (load only 50) ---------- */
+
+async function getJSON(url){
+  const r = await fetch(url, { cache: 'no-store' });
+  const raw = await r.text();
+  try { return { ok:r.ok, status:r.status, json: JSON.parse(raw), raw }; }
+  catch { return { ok:r.ok, status:r.status, json:null, raw }; }
+}
+
+function listify(v){ return Array.isArray(v) ? v : String(v ?? '')
+  .replace(/^\[|\]$/g,'')
+  .split(/[;,|\n|\|,]+/)
+  .map(x=>x.replace(/^['"]|['"]$/g,'').trim())
+  .filter(Boolean); }
+
+function populateUI(list){
+  const sel = document.getElementById('scenario');
+  sel.innerHTML = '';
+  const frag = document.createDocumentFragment();
+  list.forEach(s=>{
+    const o=document.createElement('option');
+    o.value=s.scenario_id; o.textContent=s.scenario_id; o.title=s.name||s.scenario_id;
+    frag.appendChild(o);
+  });
+  sel.appendChild(frag);
+  document.getElementById('counts')?.remove(); // optional if you had a counter
+  if (list.length) applyScenario(list[0].scenario_id);
+}
+
+// ↓↓↓ REPLACE YOUR OLD bootstrap() WITH THIS ↓↓↓
 async function bootstrap(){
   try{
+    // Hard limit 50 for fast render
     const [sc, ind] = await Promise.all([
-      getJSON('/api/scenarios?cursor=0&limit=400'),
+      getJSON('/api/scenarios?cursor=0&limit=50'),
       getJSON('/api/industries'),
     ]);
+
     const sitems = (sc.ok && sc.json && Array.isArray(sc.json.items)) ? sc.json.items : [];
     const iitems = (ind.ok && ind.json && Array.isArray(ind.json.items)) ? ind.json.items : [];
 
-    ALL = sitems.map(x => ({
+    // Build globals expected by the rest of the page
+    window.ALL = sitems.map(x => ({
       scenario_id: x.scenario_id || '',
       name: x.name || '',
       triggers: x.triggers || '',
@@ -235,21 +267,37 @@ async function bootstrap(){
       tool_stack_autonomous: x.tool_stack_autonomous || '',
       tags: listify(x.tags || x['tags (;)'] || '')
     })).filter(s => s.scenario_id);
-    MAP = Object.fromEntries(ALL.map(x => [x.scenario_id, x]));
 
-    INDUSTRIES = iitems.map(it => ({
+    window.MAP = Object.fromEntries(window.ALL.map(x => [x.scenario_id, x]));
+
+    window.INDUSTRIES = iitems.map(it => ({
       industry_id: it.industry_id || it.name || '',
       painpoints: it.core_pains || it.painpoints || '',
       kpis: it.success_metrics || it.kpi_examples || '',
       channels: it.channels || it.core_channels || '',
       vocabulary: it.agent_language_prompt || ''
     })).filter(i => i.industry_id);
-    IND_MAP = Object.fromEntries(INDUSTRIES.map(it => [ (it.industry_id||'').toLowerCase(), it ]));
 
-    populateUI(ALL);
+    window.IND_MAP = Object.fromEntries(window.INDUSTRIES.map(it => [ (it.industry_id||'').toLowerCase(), it ]));
+
+    // If nothing came back, show a tiny fallback so the page stays usable
+    if (!window.ALL.length) {
+      const fallbackS = {
+        scenario_id:'tier1_dso_SCHEDULING_NO_SHOWS',
+        name:'tier1_dso',
+        agent_name:'Scheduling Agent',
+        best_reply_shapes:['sms','email'],
+        how_it_works:'Remind, confirm, backfill.',
+        roi_hypothesis:'Reduce no-shows 30%+'
+      };
+      const fallbackI = { industry_id:'tier1_dso', painpoints:'no-shows; front-desk overload', kpis:'no-show rate; utilization' };
+      window.ALL=[fallbackS]; window.MAP={ [fallbackS.scenario_id]: fallbackS };
+      window.INDUSTRIES=[fallbackI]; window.IND_MAP={ [fallbackI.industry_id]: fallbackI };
+    }
+
+    populateUI(window.ALL);
   } catch (e){
-    dbg.textContent = 'Bootstrap error: ' + (e.message||String(e));
-    // minimal fallback
+    // Last-resort fallback
     const fallbackS = {
       scenario_id:'tier1_dso_SCHEDULING_NO_SHOWS',
       name:'tier1_dso',
@@ -258,16 +306,13 @@ async function bootstrap(){
       how_it_works:'Remind, confirm, backfill.',
       roi_hypothesis:'Reduce no-shows 30%+'
     };
-    const fallbackI = {
-      industry_id:'tier1_dso',
-      painpoints:'no-shows; front-desk overload',
-      kpis:'no-show rate; utilization'
-    };
-    ALL=[fallbackS]; MAP={ [fallbackS.scenario_id]: fallbackS };
-    INDUSTRIES=[fallbackI]; IND_MAP={ [fallbackI.industry_id]: fallbackI };
-    populateUI(ALL);
+    const fallbackI = { industry_id:'tier1_dso', painpoints:'no-shows; front-desk overload', kpis:'no-show rate; utilization' };
+    window.ALL=[fallbackS]; window.MAP={ [fallbackS.scenario_id]: fallbackS };
+    window.INDUSTRIES=[fallbackI]; window.IND_MAP={ [fallbackI.industry_id]: fallbackI };
+    populateUI(window.ALL);
   }
 }
+bootstrap();
 
 /* ---------- template selection + builder (same as before) ---------- */
 function pickTemplate(s, industry){

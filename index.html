@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>AI Agent Builder — Safe Mode</title>
+<title>AI Agent Builder — Multi-Template</title>
 <style>
   :root{--bg:#0b0c10;--card:#141824;--ink:#e9edf1;--muted:#9aa6b2;--accent:#5eead4;--line:#232735;--err:#ff9aa8;--ok:#66ffb7}
   html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial,sans-serif}
@@ -18,21 +18,17 @@
   textarea{min-height:160px;font-family:ui-monospace,Consolas,Menlo,monospace;font-size:13px}
   button{cursor:pointer} .primary{background:var(--accent);color:#0b0c10;border:none;font-weight:700}
   .hint{color:var(--muted);font-size:13px}
-  /* suggestions */
   #suggestions{position:relative}
   .suggest-box{position:absolute;left:0;right:0;background:#0f1218;border:1px solid var(--line);border-radius:10px;margin-top:6px;max-height:260px;overflow:auto;z-index:10}
   .suggest-item{padding:8px 10px;cursor:pointer;display:flex;gap:8px;align-items:baseline}
   .suggest-item:hover{background:#121826}
   .suggest-id{font-family:ui-monospace,Consolas,Menlo,monospace;font-size:12px}
   .suggest-name{color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  /* debug */
-  pre{white-space:pre-wrap;word-break:break-word;background:#0f1218;border:1px solid var(--line);border-radius:10px;padding:10px 12px;max-height:200px;overflow:auto}
 </style>
 </head>
 <body>
 <div class="wrap">
   <h1>AI Agent Builder <small id="counts" class="hint"></small></h1>
-
   <div class="status" id="statusBar">
     <span id="statusText">Loading…</span>
     <small id="statusSub"></small>
@@ -59,22 +55,13 @@
     <input id="search" placeholder="e.g. tier1_dso_SCHEDULING_NO_SHOWS" autocomplete="off" />
     <div id="suggestions"></div>
 
-    <label for="bp">Preview (sheet + industry)</label>
-    <textarea id="bp" spellcheck="false" readonly></textarea>
+    <label for="bp">Preview</label>
+    <textarea id="bp" readonly></textarea>
 
     <div class="row" style="margin-top:10px">
       <button id="build" class="primary">Download n8n JSON</button>
       <div class="hint" id="buildHint">Imports directly in n8n</div>
     </div>
-  </div>
-
-  <div class="card">
-    <strong>Debug</strong>
-    <div class="row" style="margin-top:8px">
-      <button id="pingScenarios">Ping /api/scenarios</button>
-      <button id="pingIndustries">Ping /api/industries</button>
-    </div>
-    <pre id="debugOut" style="margin-top:10px"></pre>
   </div>
 </div>
 
@@ -82,39 +69,23 @@
 /* ===== State & helpers ===== */
 const $ = id => document.getElementById(id);
 const statusBar = $('statusBar'), statusText = $('statusText'), statusSub = $('statusSub'), countsEl = $('counts');
-const scenarioSel = $('scenario'), channelSel = $('channel'), searchEl = $('search'), suggestWrap = $('suggestions'), bpTA = $('bp'), debugOut = $('debugOut');
+const scenarioSel = $('scenario'), channelSel = $('channel'), searchEl = $('search'), suggestWrap = $('suggestions'), bpTA = $('bp');
 
 let ALL = [], MAP = {};
 let INDUSTRIES = [], IND_MAP = {};
-
 const listify = v => Array.isArray(v) ? v : String(v || '').split(/[;,|\n|\|]+/).map(x=>x.trim()).filter(Boolean);
 const norm = t => (t || '').toLowerCase();
 const wants = (t, ...words) => { t = norm(t); return words.some(w => t.includes(w)); };
-
-function setStatus(text, sub='', ok=false, err=false){
-  statusText.textContent = text;
-  statusSub.textContent = sub;
-  statusText.className = ok ? 'ok' : err ? 'err' : '';
-}
+const ok = (t,sub='') => { statusText.textContent=t; statusSub.textContent=sub; statusText.className='ok'; };
+const err= (t,sub='') => { statusText.textContent=t; statusSub.textContent=sub; statusText.className='err'; };
 
 /* ===== API ===== */
-async function getJSON(url){
-  const r = await fetch(url);
-  const text = await r.text();
-  try { return { ok:r.ok, status:r.status, json: JSON.parse(text), raw:text }; }
-  catch { return { ok:r.ok, status:r.status, json:null, raw:text }; }
-}
+async function getJSON(url){ const r = await fetch(url); const text = await r.text(); try{ return { ok:r.ok, status:r.status, json: JSON.parse(text), raw:text }; } catch{ return { ok:r.ok, status:r.status, json:null, raw:text }; } }
 
 /* ===== Channel recommendation ===== */
 function recommendedChannel(row) {
-  const shapes = listify(row.best_reply_shapes);
-  const normed = shapes.map(s => s.toLowerCase());
-  const set = new Set(normed.map(s =>
-    s.includes('whatsapp') ? 'whatsapp' :
-    s.includes('sms') || s.includes('text') ? 'sms' :
-    s.includes('voice') || s.includes('call') || s.includes('phone') ? 'call' :
-    s.includes('email') || s.includes('mail') ? 'email' : s
-  ));
+  const shapes = listify(row.best_reply_shapes).map(x=>x.toLowerCase());
+  const set = new Set(shapes.map(s => s.includes('whatsapp')?'whatsapp': s.includes('sms')||s.includes('text')?'sms': s.includes('voice')||s.includes('call')?'call': s.includes('email')?'email':s));
   if (set.has('sms')) return 'sms';
   if (set.has('whatsapp')) return 'whatsapp';
   if (set.has('email')) return 'email';
@@ -125,10 +96,7 @@ function recommendedChannel(row) {
 }
 
 /* ===== Industry match & preview ===== */
-function matchIndustryForScenario(s) {
-  const key = norm(s.name || '');
-  return IND_MAP[key] || null;
-}
+function matchIndustryForScenario(s) { const key = norm(s.name || ''); return IND_MAP[key] || null; }
 function previewYaml(s, industry) {
   const br = v => (v==null || String(v).trim()==='' ? '' : String(v));
   const brList = arr => `[${listify(arr).join(', ')}]`;
@@ -152,17 +120,10 @@ tags: [${listify(s.tags).join(', ')}]${ind}`;
 /* ===== UI wiring ===== */
 function populateUI(list) {
   scenarioSel.innerHTML = '';
-  list.forEach(s => {
-    const opt = document.createElement('option');
-    opt.value = s.scenario_id;
-    opt.textContent = s.scenario_id;
-    opt.title = s.name || s.scenario_id;
-    scenarioSel.appendChild(opt);
-  });
+  list.forEach(s => { const opt=document.createElement('option'); opt.value=s.scenario_id; opt.textContent=s.scenario_id; opt.title=s.name||s.scenario_id; scenarioSel.appendChild(opt); });
   countsEl.textContent = `Loaded ${ALL.length} scenarios • ${INDUSTRIES.length} industries`;
   if (list.length) applyScenario(list[0].scenario_id);
 }
-
 function applyScenario(id) {
   const s = MAP[id] || ALL.find(x => x.scenario_id === id);
   if (!s) return;
@@ -172,38 +133,20 @@ function applyScenario(id) {
   bpTA.value = previewYaml(s, industry);
 }
 
-/* ===== Suggestions (no datalist) ===== */
+/* ===== suggestions (no datalist) ===== */
 function renderSuggestions(q=''){
-  if (!Array.isArray(ALL) || !ALL.length) { suggestWrap.innerHTML=''; return; }
+  if (!ALL.length) { suggestWrap.innerHTML=''; return; }
   const needle = q.trim().toLowerCase();
   let matches = ALL;
-  if (needle) {
-    matches = ALL.filter(s =>
-      s.scenario_id.toLowerCase().includes(needle) ||
-      (s.name||'').toLowerCase().includes(needle)
-    );
-  }
+  if (needle) matches = ALL.filter(s => s.scenario_id.toLowerCase().includes(needle) || (s.name||'').toLowerCase().includes(needle));
   matches = matches.slice(0, 50);
   if (!matches.length){ suggestWrap.innerHTML=''; return; }
-  const box = document.createElement('div');
-  box.className = 'suggest-box';
-  box.innerHTML = matches.map(m => `
-    <div class="suggest-item" data-id="${m.scenario_id}">
-      <span class="suggest-id">${m.scenario_id}</span>
-      <span class="suggest-name">${(m.name||'').replace(/</g,'&lt;')}</span>
-    </div>`).join('');
-  box.addEventListener('click', (e)=>{
-    const el = e.target.closest('.suggest-item');
-    if (!el) return;
-    const id = el.getAttribute('data-id');
-    if (MAP[id]) {
-      $('search').value = id;
-      applyScenario(id);
-      suggestWrap.innerHTML='';
-    }
-  });
-  suggestWrap.innerHTML = '';
-  suggestWrap.appendChild(box);
+  const box = document.createElement('div'); box.className = 'suggest-box';
+  box.innerHTML = matches.map(m => `<div class="suggest-item" data-id="${m.scenario_id}">
+    <span class="suggest-id">${m.scenario_id}</span><span class="suggest-name">${(m.name||'').replace(/</g,'&lt;')}</span>
+  </div>`).join('');
+  box.addEventListener('click', (e)=>{ const el=e.target.closest('.suggest-item'); if(!el)return; const id=el.getAttribute('data-id'); if(MAP[id]){ $('search').value=id; applyScenario(id); suggestWrap.innerHTML=''; }});
+  suggestWrap.innerHTML = ''; suggestWrap.appendChild(box);
 }
 $('search').addEventListener('focus', e => renderSuggestions(e.target.value));
 $('search').addEventListener('input', e => renderSuggestions(e.target.value));
@@ -212,161 +155,281 @@ $('search').addEventListener('keydown', (e)=>{
   if (e.key === 'Enter'){
     const v = e.target.value.trim();
     if (MAP[v]) { applyScenario(v); suggestWrap.innerHTML=''; return; }
-    const first = ALL.find(s =>
-      s.scenario_id.toLowerCase().includes(v.toLowerCase()) ||
-      (s.name||'').toLowerCase().includes(v.toLowerCase())
-    );
+    const first = ALL.find(s => s.scenario_id.toLowerCase().includes(v.toLowerCase()) || (s.name||'').toLowerCase().includes(v.toLowerCase()));
     if (first){ e.target.value = first.scenario_id; applyScenario(first.scenario_id); suggestWrap.innerHTML=''; }
   }
 });
 
-/* ===== Derive modules (short) ===== */
-function deriveModulesFromNarrative(s, industry){
-  const txt = [s.how_it_works,s.roi_hypothesis,s.name,(s.tags||[]).join(' '), industry?.painpoints, industry?.kpis, industry?.channels].map(x=>x||'').join(' ').toLowerCase();
-  const mods = new Set();
-  if (/\b(schedule|appointment|no-?show|calendar)\b/.test(txt)) mods.add('ReminderFlow');
-  if (/\b(waitlist|backfill|cancell)/.test(txt)) mods.add('Waitlist');
-  if (/\b(gcal|google calendar|dentrix|opendental|eaglesoft)\b/.test(txt)) mods.add('CalendarSync');
-  if (/\b(invoice|payment|overdue|billing|collection)\b/.test(txt)) mods.add('BillingChase');
-  if (/\b(lead|qualification|prospect|inbound)\b/.test(txt)) mods.add('LeadScoring');
-  if (!mods.size) mods.add('ReminderFlow');
-  return [...mods];
-}
-
-/* ===== LLM prompt (short) ===== */
-function buildLLMPrompt(s, industry, modules){
-  const role = (s.agent_name || 'Agent').trim();
-  const sector = industry?.industry_id || (s.name || 'industry');
-  return `You are a ${role} for ${sector}. Modules: ${modules.join(', ')}. Keep replies concise and action-oriented. Respect consent/opt-out.`;
-}
-
-/* ===== Workflow generator (scheduling demo, safe) ===== */
-function buildWorkflowJSON(s, channel) {
-  const industry = matchIndustryForScenario(s);
-  const modules = deriveModulesFromNarrative(s, industry);
-
-  const wf = { name: `${s.scenario_id} – ${s.agent_name || 'Agent'} (Demo)`, nodes: [], connections:{}, active:false, settings:{}, staticData:null, pinData:{} };
-  const add = (name,type,x,y,parameters={},extra={}) => wf.nodes.push({ name, type, typeVersion:(type==="n8n-nodes-base.manualTrigger"||type==="n8n-nodes-base.wait")?1:2, position:[x,y], parameters, ...extra });
-  const connect = (a,b) => { wf.connections[a] ||= { main:[[]] }; wf.connections[a].main[0].push({ node:b, type:"main", index:0 }); };
-
-  add("Manual Trigger","n8n-nodes-base.manualTrigger",-1400,-20);
-  add("Design / Reasoning","n8n-nodes-base.function",-1260,-160,{ functionCode:`return [{ json: { scenario_id:"${s.scenario_id}", name:"${(s.name||'').replace(/"/g,'\\"')}", modules:${JSON.stringify(modules)} } }];`});
-  add("Set Config","n8n-nodes-base.function",-1180,-20,{ functionCode:`return [{ json: { demoMode:true, channel:"${channel||'email'}", allowedRecipients:["kevanm.spain@gmail.com"], allowedPhones:["+"], twilioFromSms:"+13412184164", twilioFromWhatsApp:"whatsapp:+14155238886", twilioFromVoice:"+13412184164" } }];`});
-  connect("Manual Trigger","Design / Reasoning"); connect("Design / Reasoning","Set Config");
-
-  add("Load Data","n8n-nodes-base.function",-940,-20,{ functionCode:`return [{ json: { appointments:[{ first:"Sara", email:"sara@example.com", phone:"+15551234567", doctor:"Dr. Lee", time:"2025-10-02T10:00"}] } }];`});
-  connect("Set Config","Load Data");
-
-  add("Compose Message","n8n-nodes-base.function",-720,-20,{ functionCode:`const a=items[0].json.appointments[0]; const d=new Date(a.time); const ds=d.toLocaleDateString(); const ts=d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}); return [{ json:{ to:"kevanm.spain@gmail.com", toPhone:"+34XXXXXXXXX", subject:"Reminder – "+a.doctor, text:\`Hi \${a.first}, appt on \${ds} at \${ts}. Reply 1 confirm, 2 reschedule, 3 cancel.\`, tts:"Appointment reminder." } }];`});
-  connect("Load Data","Compose Message");
-
-  // Simple email path only (safe). You can re-enable Twilio once credentials are set.
-  add("Email Send","n8n-nodes-base.emailSend",-480,-20,{ fromEmail:"", toEmail:"={{$json['to']}}", subject:"={{$json['subject']}}", text:"={{$json['text']}}" },{ notes:"Select SMTP in n8n if demoMode=false" });
-  connect("Compose Message","Email Send");
-
-  add("Wait for Reply","n8n-nodes-base.wait",-200,-20,{});
-  connect("Email Send","Wait for Reply");
-
-  add("Parse Intent","n8n-nodes-base.function",20,-20,{ functionCode:`const t="1"; let intent='CONFIRM'; if(t==="2")intent='RESCHEDULE'; if(t==="3")intent='CANCEL'; return [{ json:{ intent } }];`});
-  connect("Wait for Reply","Parse Intent");
-
-  add("Update System (Mock)","n8n-nodes-base.function",260,-20,{ functionCode:`console.log("Intent:", $json.intent); return items;`});
-  connect("Parse Intent","Update System (Mock)");
-
-  // LLM prompt node (disabled OpenAI for safety)
-  const prompt = buildLLMPrompt(s, industry, modules).replace(/`/g,'\\`');
-  add("LLM Prompt","n8n-nodes-base.function",-720,-200,{ functionCode:`return [{ json: { prompt:\`${prompt}\` } }];`});
-  add("OpenAI Chat (disabled)","n8n-nodes-base.openAi",-480,-200,{ operation:"chat", model:"gpt-4o-mini", additionalFields:{ systemMessage:"={{$json.prompt}}" } },{ disabled:true, credentials:{ openAiApi:{ name:"openai-default" } }});
-  connect("LLM Prompt","OpenAI Chat (disabled)");
-
-  return wf;
-}
-
-/* ===== Download ===== */
-function downloadJSON(obj, filename) {
-  const txt = JSON.stringify(obj, null, 2);
-  const blob = new Blob([txt], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a'); a.href = url; a.download = filename;
-  document.body.appendChild(a); a.click(); URL.revokeObjectURL(url); a.remove();
-}
-
-/* ===== Bootstrap ===== */
+/* ===== data fetch ===== */
 async function bootstrap(){
-  // show runtime JS errors on screen
-  window.addEventListener('error', (e)=>{
-    setStatus('Client error', e.message, false, true);
-    debugOut.textContent += `\n[client-error] ${e.message}\n${(e.error && e.error.stack) || ''}`;
-  });
-
-  try {
+  try{
     const [sc, ind] = await Promise.all([getJSON('/api/scenarios'), getJSON('/api/industries')]);
-    debugOut.textContent = `GET /api/scenarios → ${sc.status}\n${sc.raw.slice(0,500)}\n\nGET /api/industries → ${ind.status}\n${ind.raw.slice(0,500)}\n`;
-
-    if (!sc.ok || !sc.json?.ok) throw new Error(`/api/scenarios failed (${sc.status}) ${sc.json?.error || ''}`);
-    if (!ind.ok || !ind.json?.ok) throw new Error(`/api/industries failed (${ind.status}) ${ind.json?.error || ''}`);
-
+    if (!sc.ok || !sc.json?.ok) throw new Error(sc.json?.error || 'scenarios api');
+    if (!ind.ok || !ind.json?.ok) throw new Error(ind.json?.error || 'industries api');
     ALL = (sc.json.items || []).map(x => ({ ...x, best_reply_shapes: listify(x.best_reply_shapes), tags: listify(x.tags) }));
     MAP = Object.fromEntries(ALL.map(x => [x.scenario_id, x]));
     INDUSTRIES = (ind.json.items || []);
     IND_MAP = Object.fromEntries(INDUSTRIES.map(it => [norm(it.industry_id || ''), it]));
-
-    if (!ALL.length){
-      // hard fallback demo if sheet is empty
-      ALL = [{ scenario_id:'tier1_dso_SCHEDULING_NO_SHOWS', name:'dental', agent_name:'Scheduling Agent', best_reply_shapes:['sms','email'] }];
-      MAP = { [ALL[0].scenario_id]: ALL[0] };
-      setStatus('No scenarios found — using demo fallback', '', false, true);
-    } else {
-      setStatus('Loaded', `${ALL.length} scenarios • ${INDUSTRIES.length} industries`, true, false);
-    }
-
+    ok('Loaded', `${ALL.length} scenarios • ${INDUSTRIES.length} industries`);
     populateUI(ALL);
-  } catch (e) {
-    // full fallback
-    setStatus('Data load failed — using demo fallback', e.message || '', false, true);
-    debugOut.textContent += `\n[bootstrap-error] ${e.message || e}`;
-    const fallbackS = { scenario_id:'tier1_dso_SCHEDULING_NO_SHOWS', name:'dental', agent_name:'Scheduling Agent', best_reply_shapes:['sms','email'] };
-    const fallbackI = { industry_id:'dental', painpoints:'no-shows; front-desk overload', kpis:'no-show rate; utilization' };
+  }catch(e){
+    err('Data load failed — demo fallback', e.message || '');
+    const fallbackS = { scenario_id:'tier1_dso_SCHEDULING_NO_SHOWS', name:'dental', agent_name:'Scheduling Agent', best_reply_shapes:['sms','email'], how_it_works:'Remind, confirm, backfill.', roi_hypothesis:'Reduce no-shows 30%+' };
+    const fallbackI = { industry_id:'dental', painpoints:'no-shows; front-desk overload', kpis:'no-show rate; utilization', channels:'sms; whatsapp', vocabulary:'patient, chair time' };
     ALL = [fallbackS]; MAP = { [fallbackS.scenario_id]: fallbackS };
     INDUSTRIES = [fallbackI]; IND_MAP = { [norm(fallbackI.industry_id)]: fallbackI };
     populateUI(ALL);
   }
 }
-
-/* ===== Buttons ===== */
-$('build').addEventListener('click', () => {
-  const sid = (scenarioSel.value || '').trim();
-  const s = MAP[sid];
-  if (!s) { setStatus('✗ No scenario selected', '', false, true); return; }
-  const wf = buildWorkflowJSON(s, channelSel.value);
-  downloadJSON(wf, `${sid}-workflow.json`);
-  setStatus('✓ Downloaded workflow', `${sid}-workflow.json`, true, false);
-});
-
-$('pingScenarios').addEventListener('click', async ()=>{
-  const r = await getJSON('/api/scenarios'); debugOut.textContent += `\n\n[ping scenarios] ${r.status}\n${r.raw.slice(0,800)}\n`;
-});
-$('pingIndustries').addEventListener('click', async ()=>{
-  const r = await getJSON('/api/industries'); debugOut.textContent += `\n\n[ping industries] ${r.status}\n${r.raw.slice(0,800)}\n`;
-});
-
 scenarioSel.addEventListener('change', () => applyScenario(scenarioSel.value));
-searchEl.addEventListener('focus', e => renderSuggestions(e.target.value));
-searchEl.addEventListener('input', e => renderSuggestions(e.target.value));
-searchEl.addEventListener('blur', () => setTimeout(()=> suggestWrap.innerHTML='', 150));
-searchEl.addEventListener('keydown', (e)=>{
-  if (e.key === 'Enter'){
-    const v = e.target.value.trim();
-    if (MAP[v]) { applyScenario(v); suggestWrap.innerHTML=''; return; }
-    const first = ALL.find(s =>
-      s.scenario_id.toLowerCase().includes(v.toLowerCase()) ||
-      (s.name||'').toLowerCase().includes(v.toLowerCase())
-    );
-    if (first){ e.target.value = first.scenario_id; applyScenario(first.scenario_id); suggestWrap.innerHTML=''; }
-  }
-});
 
-/* go */
+/* ===== inference ===== */
+function pickTemplate(s, industry){
+  const text = [s.scenario_id, s.name, s.triggers, s.how_it_works, s.roi_hypothesis, ...(s.tags||[]), industry?.painpoints, industry?.kpis]
+    .filter(Boolean).join(' ').toLowerCase();
+  if (/(bill|invoice|payment|overdue|collection|ar)/.test(text)) return 'billing';
+  if (/(lead|qualification|prospect|inbound|demo|trial|signup)/.test(text)) return 'lead';
+  return 'scheduling';
+}
+function deriveModulesFromNarrative(s, industry){
+  const txt = [s.how_it_works,s.roi_hypothesis,s.triggers,(s.tags||[]).join(' '), industry?.painpoints, industry?.kpis, industry?.channels].map(x=>x||'').join(' ').toLowerCase();
+  const mods = new Set();
+  if (/\b(schedule|appointment|no-?show|calendar)\b/.test(txt)) mods.add('ReminderFlow');
+  if (/\b(waitlist|backfill|cancell)\b/.test(txt)) mods.add('Waitlist');
+  if (/\b(gcal|google calendar|dentrix|opendental|eaglesoft)\b/.test(txt)) mods.add('CalendarSync');
+  if (/\b(invoice|payment|overdue|billing|collection)\b/.test(txt)) mods.add('BillingChase');
+  if (/\b(lead|qualification|prospect|inbound)\b/.test(txt)) mods.add('LeadScoring');
+  if (/\b(slack|daily summary|handoff|alert)\b/.test(txt)) mods.add('SlackSummary');
+  if (!mods.size) mods.add('ReminderFlow');
+  return [...mods];
+}
+function parseTools(s){
+  const t = norm(s.tool_stack_dev || '');
+  return { hasTwilio:/twilio/.test(t), hasSlack:/slack/.test(t), hasGCal:/google calendar|gcal/.test(t), hasAirtable:/airtable/.test(t), hasNotion:/notion/.test(t) };
+}
+
+/* ===== LLM prompt ===== */
+function buildLLMPrompt(s, industry, modules, templateKey){
+  const role = (s.agent_name || 'Agent').trim();
+  const sector = industry?.industry_id || (s.name || 'industry');
+  const how = (s.how_it_works || '').trim();
+  const roi = (s.roi_hypothesis || '').trim();
+  const pains = industry?.painpoints || '';
+  const kpis = industry?.kpis || '';
+  const vocab = (industry?.vocabulary || '').trim();
+  const goalsByT = {
+    scheduling: ['reduce no-shows','maximize utilization','minimize manual follow-ups'],
+    billing: ['collect payment quickly','reduce DSO/aging','keep tone friendly & compliant'],
+    lead: ['qualify fast','book discovery/screening','capture contact & intent']
+  };
+  const goals = goalsByT[templateKey] || ['assist user outcome'];
+  return [
+`You are a ${role} for the ${sector} sector.`,
+`How it works: ${how || 'N/A'}`,
+`ROI hypothesis: ${roi || 'N/A'}`,
+industry ? `Industry painpoints: ${pains || 'N/A'}` : null,
+industry ? `Industry KPIs: ${kpis || 'N/A'}` : null,
+industry && vocab ? `Vocabulary/style: ${vocab}` : null,
+`Enabled modules: ${modules.join(', ')}`,
+`Objectives: ${goals.join('; ')}`,
+`Rules: be concise, warm, action-oriented; respect consent/opt-out; for SMS/WA, keep <=320 chars; for voice, short TTS.`,
+`Output one message string for the selected channel.`
+  ].filter(Boolean).join('\n');
+}
+
+/* ===== workflow helpers ===== */
+function wfSkeleton(name){ return { name, nodes:[], connections:{}, active:false, settings:{}, staticData:null, pinData:{} }; }
+function node(nodes, name, type, pos, params={}, extra={}){ nodes.push({ name, type, typeVersion:(/manualTrigger|wait$/.test(type)?1:2), position:pos, parameters:params, ...extra }); }
+function link(conns, a,b){ conns[a] ||= { main:[[]] }; conns[a].main[0].push({ node:b, type:"main", index:0 }); }
+function cfgNode(channel){
+  return { name:"Set Config", type:"n8n-nodes-base.function", typeVersion:2, position:[-1180,-20], parameters:{ functionCode:
+`return [{ json: {
+  demoMode: true,
+  channel: "${channel}",
+  allowedRecipients: ["kevanm.spain@gmail.com"],
+  allowedPhones: ["+34XXXXXXXXX"],
+  overrideTo: "kevanm.spain@gmail.com",
+  overrideToPhone: "+34XXXXXXXXX",
+  twilioFromSms: "+13412184164",
+  twilioFromWhatsApp: "whatsapp:+14155238886",
+  twilioFromVoice: "+13412184164"
+}}];` } };
+}
+function branchChannels(wf, s){
+  node(wf.nodes, "Channel = Email?","n8n-nodes-base.if",[-520,-160],{conditions:{string:[{value1:"={{$items('Set Config',0,0).json.channel}}",operation:"equal",value2:"email"}]} );
+  node(wf.nodes, "Channel = SMS?","n8n-nodes-base.if",[-520,-40], {conditions:{string:[{value1:"={{$items('Set Config',0,0).json.channel}}",operation:"equal",value2:"sms"}]} );
+  node(wf.nodes, "Channel = WhatsApp?","n8n-nodes-base.if",[-520,80], {conditions:{string:[{value1:"={{$items('Set Config',0,0).json.channel}}",operation:"equal",value2:"whatsapp"}]} );
+  node(wf.nodes, "Channel = Call?","n8n-nodes-base.if",[-520,200], {conditions:{string:[{value1:"={{$items('Set Config',0,0).json.channel}}",operation:"equal",value2:"call"}]} );
+  link(wf.connections, "Compose Message","Channel = Email?");
+  link(wf.connections, "Compose Message","Channel = SMS?");
+  link(wf.connections, "Compose Message","Channel = WhatsApp?");
+  link(wf.connections, "Compose Message","Channel = Call?");
+  // Email path
+  node(wf.nodes,"Email Allowlist","n8n-nodes-base.function",[-340,-240],{functionCode:"const cfg=$items('Set Config',0,0).json;const to=$json.to||'';const ok=(cfg.allowedRecipients||[]).includes(to);return [{json:{ok}}];"});
+  node(wf.nodes,"Email Allowed?","n8n-nodes-base.if",[-180,-240],{conditions:{boolean:[{value1:"={{$item(0).$node['Email Allowlist'].json.ok}}"}]} );
+  node(wf.nodes,"Email Send","n8n-nodes-base.emailSend",[0,-240],{fromEmail:"",toEmail:"={{$json['to']}}",subject:"={{$json['subject']}}",text:"={{$json['text']}}",options:{ senderName:"Agent" }},{notes:"Pick SMTP credential when demoMode=false"});
+  link(wf.connections,"Channel = Email?","Email Allowlist"); wf.connections["Channel = Email?"].main[1]=[];
+  link(wf.connections,"Email Allowlist","Email Allowed?"); link(wf.connections,"Email Allowed?","Email Send"); wf.connections["Email Allowed?"].main[1]=[{node:"Wait for Reply",type:"main",index:0}];
+  // SMS
+  node(wf.nodes,"Phone Allowlist","n8n-nodes-base.function",[-340,-40],{functionCode:"const cfg=$items('Set Config',0,0).json;const p=$json.toPhone||'';const ok=(cfg.allowedPhones||[]).includes(p);return [{json:{ok}}];"});
+  node(wf.nodes,"Phone Allowed?","n8n-nodes-base.if",[-180,-40],{conditions:{boolean:[{value1:"={{$item(0).$node['Phone Allowlist'].json.ok}}"}]} );
+  node(wf.nodes,"Twilio SMS","n8n-nodes-base.twilio",[0,-40],{resource:"message",operation:"send",from:"={{$items('Set Config',0,0).json.twilioFromSms}}",to:"={{$json['toPhone']}}",message:"={{$json['text']}}"}, {disabled:true,credentials:{ twilioApi:{ name:"twilio-default" } }});
+  link(wf.connections,"Channel = SMS?","Phone Allowlist"); wf.connections["Channel = SMS?"].main[1]=[];
+  link(wf.connections,"Phone Allowlist","Phone Allowed?"); link(wf.connections,"Phone Allowed?","Twilio SMS"); wf.connections["Phone Allowed?"].main[1]=[{node:"Wait for Reply",type:"main",index:0}];
+  // WA
+  node(wf.nodes,"WA Allowlist","n8n-nodes-base.function",[-340,80],{functionCode:"const cfg=$items('Set Config',0,0).json;const p=$json.toPhone||'';const ok=(cfg.allowedPhones||[]).includes(p);return [{json:{ok}}];"});
+  node(wf.nodes,"WA Allowed?","n8n-nodes-base.if",[-180,80],{conditions:{boolean:[{value1:"={{$item(0).$node['WA Allowlist'].json.ok}}"}]} );
+  node(wf.nodes,"Twilio WhatsApp","n8n-nodes-base.twilio",[0,80],{resource:"message",operation:"send",from:"={{$items('Set Config',0,0).json.twilioFromWhatsApp}}",to:"={{'whatsapp:' + $json['toPhone']}}",message:"={{$json['text']}}"}, {disabled:true,credentials:{ twilioApi:{ name:"twilio-default" } }});
+  link(wf.connections,"Channel = WhatsApp?","WA Allowlist"); wf.connections["Channel = WhatsApp?"].main[1]=[];
+  link(wf.connections,"WA Allowlist","WA Allowed?"); link(wf.connections,"WA Allowed?","Twilio WhatsApp"); wf.connections["WA Allowed?"].main[1]=[{node:"Wait for Reply",type:"main",index:0}];
+  // Call
+  node(wf.nodes,"Call Allowlist","n8n-nodes-base.function",[-340,200],{functionCode:"const cfg=$items('Set Config',0,0).json;const p=$json.toPhone||'';const ok=(cfg.allowedPhones||[]).includes(p);return [{json:{ok}}];"});
+  node(wf.nodes,"Call Allowed?","n8n-nodes-base.if",[-180,200],{conditions:{boolean:[{value1:"={{$item(0).$node['Call Allowlist'].json.ok}}"}]} );
+  node(wf.nodes,"Twilio Call (TTS)","n8n-nodes-base.twilio",[0,200],{resource:"call",operation:"create",from:"={{$items('Set Config',0,0).json.twilioFromVoice}}",to:"={{$json['toPhone']}}",text:"={{$json['tts']}}",sayOrPlay:"say"}, {disabled:true,credentials:{ twilioApi:{ name:"twilio-default" } }});
+  link(wf.connections,"Channel = Call?","Call Allowlist"); wf.connections["Channel = Call?"].main[1]=[];
+  link(wf.connections,"Call Allowlist","Call Allowed?"); link(wf.connections,"Call Allowed?","Twilio Call (TTS)"); wf.connections["Call Allowed?"].main[1]=[{node:"Wait for Reply",type:"main",index:0}];
+}
+function llmNodes(wf, prompt){
+  node(wf.nodes,"LLM Prompt","n8n-nodes-base.function",[-720,-200],{functionCode:`return [{ json: { prompt:\`${prompt.replace(/`/g,'\\`')}\` } }];`});
+  node(wf.nodes,"OpenAI Chat (disabled)","n8n-nodes-base.openAi",[-480,-200],{operation:"chat",model:"gpt-4o-mini",additionalFields:{systemMessage:"={{$json.prompt}}"}},{disabled:true,credentials:{openAiApi:{name:"openai-default"}}});
+  link(wf.connections,"LLM Prompt","OpenAI Chat (disabled)");
+}
+
+/* ===== Templates ===== */
+// 1) Scheduling
+function wfScheduling(s, industry){
+  const modules = deriveModulesFromNarrative(s, industry);
+  const wf = wfSkeleton(`${s.scenario_id} – ${s.agent_name || 'Scheduling Agent'} (Demo)`);
+  node(wf.nodes,"Manual Trigger","n8n-nodes-base.manualTrigger",[-1460,-20],{});
+  node(wf.nodes,"Design / Reasoning","n8n-nodes-base.function",[-1320,-160],{functionCode:`return [{ json:{ scenario_id:"${s.scenario_id}", modules:${JSON.stringify(modules)}, industry:${JSON.stringify(industry||null)} } }];`});
+  wf.nodes.push(cfgNode(recommendedChannel(s)));
+  link(wf.connections,"Manual Trigger","Design / Reasoning"); link(wf.connections,"Design / Reasoning","Set Config");
+  node(wf.nodes,"Load Data","n8n-nodes-base.function",[-940,-20],{functionCode:`return [{ json:{ appointments:[{ first:"Sara", email:"sara@example.com", phone:"+15551234567", doctor:"Dr. Lee", time:"2025-10-02T10:00"}] } }];`});
+  link(wf.connections,"Set Config","Load Data");
+  const HOW=(s.how_it_works||'').replace(/`/g,'\\`'), ROI=(s.roi_hypothesis||'').replace(/`/g,'\\`'), PAI=(industry?.painpoints||'').replace(/`/g,'\\`');
+  node(wf.nodes,"Compose Message","n8n-nodes-base.function",[-720,-20],{functionCode:
+`const a=items[0].json.appointments[0];
+const d=new Date(a.time), ds=d.toLocaleDateString(), ts=d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+const ctx=[\`${HOW}\`,\`${ROI}\`,\`${PAI}\`].filter(Boolean).join(' ');
+return [{ json:{
+  to:"kevanm.spain@gmail.com", toPhone:"+34XXXXXXXXX",
+  subject:"Appointment reminder – "+a.doctor,
+  text:\`Hi \${a.first}, your appointment is on \${ds} at \${ts}.\${ctx?' '+ctx:''} Reply 1 CONFIRM, 2 RESCHEDULE, 3 CANCEL.\`,
+  tts:"Appointment reminder."
+}}];`});
+  link(wf.connections,"Load Data","Compose Message");
+  llmNodes(wf, buildLLMPrompt(s, industry, modules, 'scheduling'));
+  branchChannels(wf, s);
+  node(wf.nodes,"Wait for Reply","n8n-nodes-base.wait",[260,-20],{}); ["Email Send","Twilio SMS","Twilio WhatsApp","Twilio Call (TTS)"].forEach(n=>link(wf.connections,n,"Wait for Reply"));
+  node(wf.nodes,"Parse Intent","n8n-nodes-base.function",[520,-20],{functionCode:
+`const t=($json.Body||$json.text||"1").toLowerCase(); let intent='HUMAN';
+if (t==='1'||/\\bconfirm|yes\\b/.test(t)) intent='CONFIRM';
+else if (t==='2'||/resched|move|change/.test(t)) intent='RESCHEDULE';
+else if (t==='3'||/cancel/.test(t)) intent='CANCEL';
+else if (/late|minutes? late/.test(t)) intent='LATE';
+return [{ json:{ intent } }];`});
+  link(wf.connections,"Wait for Reply","Parse Intent");
+  node(wf.nodes,"Update PMS (Mock)","n8n-nodes-base.function",[760,-20],{functionCode:`console.log('[PMS] schedule →', $json.intent); return items;`});
+  link(wf.connections,"Parse Intent","Update PMS (Mock)");
+  if (modules.includes('Waitlist')){
+    node(wf.nodes,"Fill Slot (Mock)","n8n-nodes-base.function",[1000,-20],{functionCode:
+`if ($json.intent==='CANCEL'||$json.intent==='RESCHEDULE'){ console.log('[WAITLIST] backfill'); return [{json:{filled:true}}]; } return [{json:{skipped:true}}];`});
+    link(wf.connections,"Update PMS (Mock)","Fill Slot (Mock)");
+  }
+  return wf;
+}
+// 2) Billing
+function wfBilling(s, industry){
+  const modules = deriveModulesFromNarrative(s, industry);
+  const wf = wfSkeleton(`${s.scenario_id} – ${s.agent_name || 'Billing Agent'} (Demo)`);
+  node(wf.nodes,"Manual Trigger","n8n-nodes-base.manualTrigger",[-1460,-20],{});
+  node(wf.nodes,"Design / Reasoning","n8n-nodes-base.function",[-1320,-160],{functionCode:`return [{ json:{ scenario_id:"${s.scenario_id}", modules:${JSON.stringify(modules)}, industry:${JSON.stringify(industry||null)} } }];`});
+  wf.nodes.push(cfgNode(recommendedChannel(s)));
+  link(wf.connections,"Manual Trigger","Design / Reasoning"); link(wf.connections,"Design / Reasoning","Set Config");
+  node(wf.nodes,"Load Invoice","n8n-nodes-base.function",[-940,-20],{functionCode:`return [{ json:{ invoice:{ id:"INV-1047", amount:120.00, currency:"USD", due:"2025-10-03"}, debtor:{ name:"Alex", email:"alex@example.com", phone:"+15551230000"} } }];`});
+  link(wf.connections,"Set Config","Load Invoice");
+  const HOW=(s.how_it_works||'').replace(/`/g,'\\`'), ROI=(s.roi_hypothesis||'').replace(/`/g,'\\`'), PAI=(industry?.painpoints||'').replace(/`/g,'\\`');
+  node(wf.nodes,"Compose Message","n8n-nodes-base.function",[-720,-20],{functionCode:
+`const inv=$json.invoice, d=$json.debtor; const ctx=[\`${HOW}\`,\`${ROI}\`,\`${PAI}\`].filter(Boolean).join(' ');
+return [{ json:{
+  to:"kevanm.spain@gmail.com", toPhone:"+34XXXXXXXXX",
+  subject:\`Invoice \${inv.id} due \${inv.due}\`,
+  text:\`Hi \${d.name}, friendly reminder: invoice \${inv.id} for \${inv.amount} \${inv.currency} is due \${inv.due}.\${ctx?' '+ctx:''} Reply 1 PAID, 2 PLAN, 3 DISPUTE.\`,
+  tts:"Invoice reminder."
+}}];`});
+  link(wf.connections,"Load Invoice","Compose Message");
+  llmNodes(wf, buildLLMPrompt(s, industry, modules, 'billing'));
+  branchChannels(wf, s);
+  node(wf.nodes,"Wait for Reply","n8n-nodes-base.wait",[260,-20],{}); ["Email Send","Twilio SMS","Twilio WhatsApp","Twilio Call (TTS)"].forEach(n=>link(wf.connections,n,"Wait for Reply"));
+  node(wf.nodes,"Parse Intent","n8n-nodes-base.function",[520,-20],{functionCode:
+`const t=($json.Body||$json.text||"1").toLowerCase(); let intent='HUMAN';
+if (t==='1'||/\\bpaid|settled|done\\b/.test(t)) intent='PAID';
+else if (t==='2'||/plan|installment|payment plan/.test(t)) intent='PLAN';
+else if (t==='3'||/dispute|error|wrong/.test(t)) intent='DISPUTE';
+return [{ json:{ intent } }];`});
+  link(wf.connections,"Wait for Reply","Parse Intent");
+  node(wf.nodes,"Update AR (Mock)","n8n-nodes-base.function",[760,-20],{functionCode:`console.log('[AR] update →', $json.intent); return items;`});
+  link(wf.connections,"Parse Intent","Update AR (Mock)");
+  // Follow-up cadence (mock)
+  node(wf.nodes,"Follow-up (Mock)","n8n-nodes-base.function",[1000,-20],{functionCode:
+`if ($json.intent==='PLAN') console.log('send plan options'); if ($json.intent==='DISPUTE') console.log('create ticket'); return items;`});
+  link(wf.connections,"Update AR (Mock)","Follow-up (Mock)");
+  return wf;
+}
+// 3) Lead Qualification
+function wfLead(s, industry){
+  const modules = deriveModulesFromNarrative(s, industry);
+  const wf = wfSkeleton(`${s.scenario_id} – ${s.agent_name || 'Lead Agent'} (Demo)`);
+  node(wf.nodes,"Manual Trigger","n8n-nodes-base.manualTrigger",[-1460,-20],{});
+  node(wf.nodes,"Design / Reasoning","n8n-nodes-base.function",[-1320,-160],{functionCode:`return [{ json:{ scenario_id:"${s.scenario_id}", modules:${JSON.stringify(modules)}, industry:${JSON.stringify(industry||null)} } }];`});
+  wf.nodes.push(cfgNode(recommendedChannel(s)));
+  link(wf.connections,"Manual Trigger","Design / Reasoning"); link(wf.connections,"Design / Reasoning","Set Config");
+  node(wf.nodes,"Load Lead","n8n-nodes-base.function",[-940,-20],{functionCode:`return [{ json:{ lead:{ name:"Jamie", email:"jamie@example.com", phone:"+15551234567", interest:"Implant consult"} } }];`});
+  link(wf.connections,"Set Config","Load Lead");
+  const HOW=(s.how_it_works||'').replace(/`/g,'\\`'), ROI=(s.roi_hypothesis||'').replace(/`/g,'\\`'), PAI=(industry?.painpoints||'').replace(/`/g,'\\`');
+  node(wf.nodes,"Compose Message","n8n-nodes-base.function",[-720,-20],{functionCode:
+`const L=$json.lead; const ctx=[\`${HOW}\`,\`${ROI}\`,\`${PAI}\`].filter(Boolean).join(' ');
+return [{ json:{
+  to:"kevanm.spain@gmail.com", toPhone:"+34XXXXXXXXX",
+  subject:\`Thanks \${L.name} — quick questions\`,
+  text:\`Hi \${L.name},\${ctx?' '+ctx:''} Are you available this week? Reply 1 THIS WEEK, 2 NEXT WEEK, 3 HUMAN.\`,
+  tts:"Lead follow-up."
+}}];`});
+  link(wf.connections,"Load Lead","Compose Message");
+  llmNodes(wf, buildLLMPrompt(s, industry, modules, 'lead'));
+  branchChannels(wf, s);
+  node(wf.nodes,"Wait for Reply","n8n-nodes-base.wait",[260,-20],{}); ["Email Send","Twilio SMS","Twilio WhatsApp","Twilio Call (TTS)"].forEach(n=>link(wf.connections,n,"Wait for Reply"));
+  node(wf.nodes,"Parse Intent","n8n-nodes-base.function",[520,-20],{functionCode:
+`const t=($json.Body||$json.text||"1").toLowerCase(); let intent='THIS_WEEK';
+if (t==='2'||/next/.test(t)) intent='NEXT_WEEK';
+else if (t==='3'||/human|agent|call me/.test(t)) intent='HUMAN';
+return [{ json:{ intent } }];`});
+  link(wf.connections,"Wait for Reply","Parse Intent");
+  node(wf.nodes,"Route (Mock)","n8n-nodes-base.function",[760,-20],{functionCode:`console.log('[CRM] route →', $json.intent); return items;`});
+  link(wf.connections,"Parse Intent","Route (Mock)");
+  return wf;
+}
+
+/* ===== Builder ===== */
+function buildWorkflowJSON(s) {
+  const industry = matchIndustryForScenario(s);
+  const key = pickTemplate(s, industry);
+  if (key==='billing') return wfBilling(s, industry);
+  if (key==='lead')    return wfLead(s, industry);
+  return wfScheduling(s, industry); // default
+}
+
+/* ===== Download ===== */
+function downloadJSON(obj, filename){ const txt=JSON.stringify(obj,null,2); const blob=new Blob([txt],{type:'application/json'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=filename; document.body.appendChild(a); a.click(); URL.revokeObjectURL(url); a.remove(); }
+
+/* ===== Boot ===== */
+$('build').addEventListener('click', () => {
+  const sid = (scenarioSel.value || '').trim(); const s = MAP[sid];
+  if (!s) { err('No scenario selected'); return; }
+  const wf = buildWorkflowJSON(s);
+  downloadJSON(wf, `${sid}-workflow.json`);
+  ok('✓ Downloaded workflow', `${sid}-workflow.json`);
+});
 bootstrap();
 </script>
 </body>

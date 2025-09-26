@@ -1,46 +1,31 @@
 {
   "name": "<%= scenario_id %> – <%= agent_name %> (Demo)",
   "nodes": [
-    { "parameters": {}, "type": "n8n-nodes-base.manualTrigger", "typeVersion": 1, "position": [-1600, -40], "name": "Manual Trigger" },
-
-    <% if (reply_mode === 'imap') { %>
     {
-      "parameters": { "downloadFormat": "simple", "mailbox": "INBOX", "options": {} },
-      "type": "n8n-nodes-base.emailImap",
-      "typeVersion": 2,
-      "position": [-1600, -260],
-      "name": "IMAP Email (Trigger)",
-      "credentials": { "imap": { "name": "IMAP account" } }
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [-1400, -20],
+      "name": "Manual Trigger"
     },
-    <% } %>
-
-    <% if (reply_mode === 'webhook') { %>
-    {
-      "parameters": { "httpMethod": "POST", "path": "twilio/inbound", "responseMode": "onReceived", "responseData": "allEntries" },
-      "type": "n8n-nodes-base.webhook",
-      "typeVersion": 2,
-      "position": [-1600, -260],
-      "name": "Twilio Inbound"
-    },
-    <% } %>
 
     {
       "parameters": {
-        "functionCode": "// Runtime config baked at generation time\nreturn [{ json: {\n  demoMode: <%= demoMode %>,\n  channel: \"<%= channel %>\",               // email | sms | whatsapp | call\n  replyMode: \"<%= reply_mode %>\",           // none | imap | webhook\n  // send only to these until you open it up\n  allowedRecipients: [\"kevanm.spain@gmail.com\"],\n  allowedPhones: [\"<%= overrideToPhone %>\"],\n  overrideTo: \"<%= overrideTo %>\",\n  overrideToPhone: \"<%= overrideToPhone %>\",\n  twilioFromSms: \"<%= twilio.fromSms %>\",\n  twilioFromWhatsApp: \"<%= twilio.fromWhatsApp %>\",\n  twilioFromVoice: \"<%= twilio.fromVoice %>\"\n}}];"
+        "functionCode": "// Global config you can edit inside n8n after import\nreturn [{ json: {\n  demoMode: true,                 // true = simulate, false = actually send\n  channel: \"email\",               // \"email\" | \"sms\" | \"whatsapp\" | \"call\"\n  // safety allowlists\n  allowedRecipients: [\"kevanm.spain@gmail.com\"],\n  allowedPhones: [\"+34XXXXXXXXX\"],\n  // default demo destinations\n  overrideTo: \"kevanm.spain@gmail.com\",\n  overrideToPhone: \"+34XXXXXXXXX\",\n  // Twilio FROMs (fill yours and enable nodes you want)\n  twilioFromSms: \"+13412184164\",\n  twilioFromWhatsApp: \"whatsapp:+14155238886\",\n  twilioFromVoice: \"+13412184164\"\n}}];"
       },
       "type": "n8n-nodes-base.function",
       "typeVersion": 2,
-      "position": [-1360, -40],
+      "position": [-1180, -20],
       "name": "Set Config"
     },
 
     {
       "parameters": {
-        "functionCode": "// Minimal demo data from scenario\nreturn [{ json: {\n  scenario_id: \"<%= scenario_id %>\",\n  scenario_name: \"<%= name %>\",\n  agent_name: \"<%= agent_name %>\",\n  best_reply_shapes: <%- JSON.stringify(best_reply_shapes || []) %>,\n  appointments: [\n    { id: \"A1001\", first:\"Sara\", last:\"L.\", email:\"sara@example.com\", phone:\"+15551234567\", time:\"2025-10-02T10:00\", doctor:\"Dr. Lee\" }\n  ]\n}}];"
+        "functionCode": "// Minimal demo data using your scenario\nreturn [{ json: {\n  scenario_id: \"<%= scenario_id %>\",\n  scenario_name: \"<%= name %>\",\n  agent_name: \"<%= agent_name %>\",\n  best_reply_shapes: <%- JSON.stringify(best_reply_shapes || []) %>,\n  appointments: [\n    { id: \"A1001\", first:\"Sara\", last:\"L.\", email:\"sara@example.com\", phone:\"+15551234567\", time:\"2025-10-02T10:00\", doctor:\"Dr. Lee\" }\n  ]\n}}];"
       },
       "type": "n8n-nodes-base.function",
       "typeVersion": 2,
-      "position": [-1120, -40],
+      "position": [-940, -20],
       "name": "Load Appointments"
     },
 
@@ -50,30 +35,77 @@
       },
       "type": "n8n-nodes-base.function",
       "typeVersion": 2,
-      "position": [-880, -40],
+      "position": [-720, -20],
       "name": "Compose Message"
     },
 
     {
       "parameters": {
-        "functionCode": "const cfg = $items('Set Config',0,0).json;\nconst to = $json.to || '';\nconst ok = (cfg.allowedRecipients||[]).includes(to);\nreturn [{ json: { ok } }];"
-      },
-      "type": "n8n-nodes-base.function",
-      "typeVersion": 2,
-      "position": [-660, -140],
-      "name": "Email Allowlist"
-    },
-
-    {
-      "parameters": {
-        "conditions": { "boolean": [ { "value1": "={{$item(0).$node['Email Allowlist'].json.ok}}" } ] }
+        "conditions": {
+          "string": [
+            { "value1": "={{$items('Set Config',0,0).json.channel}}", "operation": "equal", "value2": "email" }
+          ]
+        }
       },
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [-480, -140],
-      "name": "Email Allowed?"
+      "position": [-520, -160],
+      "name": "Channel = Email?"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            { "value1": "={{$items('Set Config',0,0).json.channel}}", "operation": "equal", "value2": "sms" }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-520, -40],
+      "name": "Channel = SMS?"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            { "value1": "={{$items('Set Config',0,0).json.channel}}", "operation": "equal", "value2": "whatsapp" }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-520, 80],
+      "name": "Channel = WhatsApp?"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            { "value1": "={{$items('Set Config',0,0).json.channel}}", "operation": "equal", "value2": "call" }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-520, 200],
+      "name": "Channel = Call?"
     },
 
+    {
+      "parameters": { "functionCode": "const cfg = $items('Set Config',0,0).json; const to = $json.to || ''; const ok = (cfg.allowedRecipients||[]).includes(to); return [{ json: { ok } }];" },
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [-340, -240],
+      "name": "Email Allowlist"
+    },
+    {
+      "parameters": { "conditions": { "boolean": [ { "value1": "={{$item(0).$node['Email Allowlist'].json.ok}}" } ] } },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-180, -240],
+      "name": "Email Allowed?"
+    },
     {
       "parameters": {
         "fromEmail": "",
@@ -84,32 +116,25 @@
       },
       "type": "n8n-nodes-base.emailSend",
       "typeVersion": 2,
-      "position": [-260, -140],
+      "position": [0, -240],
       "name": "Email Send",
-      "disabled": <%= channel !== 'email' %>,
-      "credentials": { "smtp": { "name": "SMTP account" } }
+      "notes": "Pick your SMTP credential when demoMode=false"
     },
 
     {
-      "parameters": {
-        "functionCode": "const cfg = $items('Set Config',0,0).json;\nconst phone = $json.toPhone || '';\nconst ok = (cfg.allowedPhones||[]).includes(phone);\nreturn [{ json: { ok } }];"
-      },
+      "parameters": { "functionCode": "const cfg = $items('Set Config',0,0).json; const phone = $json.toPhone || ''; const ok = (cfg.allowedPhones||[]).includes(phone); return [{ json: { ok } }];" },
       "type": "n8n-nodes-base.function",
       "typeVersion": 2,
-      "position": [-660, 40],
+      "position": [-340, -40],
       "name": "Phone Allowlist"
     },
-
     {
-      "parameters": {
-        "conditions": { "boolean": [ { "value1": "={{$item(0).$node['Phone Allowlist'].json.ok}}" } ] }
-      },
+      "parameters": { "conditions": { "boolean": [ { "value1": "={{$item(0).$node['Phone Allowlist'].json.ok}}" } ] } },
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [-480, 40],
+      "position": [-180, -40],
       "name": "Phone Allowed?"
     },
-
     {
       "parameters": {
         "resource": "message",
@@ -120,12 +145,26 @@
       },
       "type": "n8n-nodes-base.twilio",
       "typeVersion": 2,
-      "position": [-260, 0],
+      "position": [0, -40],
       "name": "Twilio SMS",
-      "disabled": <%= channel !== 'sms' %>,
+      "disabled": true,
       "credentials": { "twilioApi": { "name": "twilio-default" } }
     },
 
+    {
+      "parameters": { "functionCode": "const cfg = $items('Set Config',0,0).json; const phone = $json.toPhone || ''; const ok = (cfg.allowedPhones||[]).includes(phone); return [{ json: { ok } }];" },
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [-340, 80],
+      "name": "WA Allowlist"
+    },
+    {
+      "parameters": { "conditions": { "boolean": [ { "value1": "={{$item(0).$node['WA Allowlist'].json.ok}}" } ] } },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-180, 80],
+      "name": "WA Allowed?"
+    },
     {
       "parameters": {
         "resource": "message",
@@ -136,12 +175,26 @@
       },
       "type": "n8n-nodes-base.twilio",
       "typeVersion": 2,
-      "position": [-260, 100],
+      "position": [0, 80],
       "name": "Twilio WhatsApp",
-      "disabled": <%= channel !== 'whatsapp' %>,
+      "disabled": true,
       "credentials": { "twilioApi": { "name": "twilio-default" } }
     },
 
+    {
+      "parameters": { "functionCode": "const cfg = $items('Set Config',0,0).json; const phone = $json.toPhone || ''; const ok = (cfg.allowedPhones||[]).includes(phone); return [{ json: { ok } }];" },
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [-340, 200],
+      "name": "Call Allowlist"
+    },
+    {
+      "parameters": { "conditions": { "boolean": [ { "value1": "={{$item(0).$node['Call Allowlist'].json.ok}}" } ] } },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-180, 200],
+      "name": "Call Allowed?"
+    },
     {
       "parameters": {
         "resource": "call",
@@ -153,29 +206,38 @@
       },
       "type": "n8n-nodes-base.twilio",
       "typeVersion": 2,
-      "position": [-260, 200],
+      "position": [0, 200],
       "name": "Twilio Call (TTS)",
-      "disabled": <%= channel !== 'call' %>,
+      "disabled": true,
       "credentials": { "twilioApi": { "name": "twilio-default" } }
     },
 
-    { "parameters": {}, "type": "n8n-nodes-base.wait", "typeVersion": 1, "position": [0, -40], "name": "Wait for Reply" },
-
     {
-      "parameters": {
-        "functionCode": "// Parse reply text. Webhook -> Body; IMAP -> text; Wait->Resume uses default.\nconst src = $json.Body || $json.text || \"1\"; // default '1' when simulating resume\nconst t = (src || '').toLowerCase();\nlet intent = 'HUMAN';\nif (t === '1' || /(^|\\b)yes\\b|confirm/.test(t)) intent='CONFIRM';\nelse if (t === '3' || /cancel|annuler/.test(t)) intent='CANCEL';\nelse if (t === '2' || /reschedule|another|next week|reporter|déplacer|changer/.test(t)) intent='RESCHEDULE';\nelse if (/late|retard|en retard|mins? late|minutes? de retard/.test(t)) intent='LATE';\nreturn [{ json:{ intent, raw:$json } }];"
-      },
-      "type": "n8n-nodes-base.function",
-      "typeVersion": 2,
-      "position": [240, -40],
-      "name": "Parse Intent"
+      "parameters": {},
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [260, -20],
+      "name": "Wait for Reply",
+      "notes": "Click Resume to simulate a reply."
     },
 
     {
-      "parameters": { "functionCode": "console.log('[PMS] Update →', $json.intent); return [{ json:{ ok:true, intent:$json.intent } }];" },
+      "parameters": {
+        "functionCode": "// Parse reply (simulated). Change 'replyText' for testing.\nconst replyText = \"1\"; // 1=CONFIRM, 2=RESCHEDULE, 3=CANCEL, 'late' => LATE\nlet intent = 'HUMAN';\nconst t = (replyText||'').toLowerCase();\nif (t === '1' || /(^|\\b)yes\\b|confirm/.test(t)) intent='CONFIRM';\nelse if (t === '3' || /cancel/.test(t)) intent='CANCEL';\nelse if (t === '2' || /reschedule|another|next week/.test(t)) intent='RESCHEDULE';\nelse if (/late|retard|en retard/.test(t)) intent='LATE';\nreturn [{ json:{ intent } }];"
+      },
       "type": "n8n-nodes-base.function",
       "typeVersion": 2,
-      "position": [480, -40],
+      "position": [520, -20],
+      "name": "Parse Intent (Demo)"
+    },
+
+    {
+      "parameters": {
+        "functionCode": "const intent = $json.intent; console.log('[PMS] Update →', intent); return [{ json: { ok:true, intent } }];"
+      },
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [760, -20],
       "name": "Update PMS (Mock)"
     },
 
@@ -185,47 +247,49 @@
       },
       "type": "n8n-nodes-base.function",
       "typeVersion": 2,
-      "position": [720, -40],
+      "position": [1000, -20],
       "name": "Fill Slot (Mock)"
     }
   ],
   "connections": {
     "Manual Trigger": { "main": [[{ "node": "Set Config", "type": "main", "index": 0 }]] },
-    <% if (reply_mode === 'imap') { %>
-    "IMAP Email (Trigger)": { "main": [[{ "node": "Parse Intent", "type": "main", "index": 0 }]] },
-    <% } %>
-    <% if (reply_mode === 'webhook') { %>
-    "Twilio Inbound": { "main": [[{ "node": "Parse Intent", "type": "main", "index": 0 }]] },
-    <% } %>
     "Set Config": { "main": [[{ "node": "Load Appointments", "type": "main", "index": 0 }]] },
     "Load Appointments": { "main": [[{ "node": "Compose Message", "type": "main", "index": 0 }]] },
+
     "Compose Message": {
       "main": [
-        [{ "node": "Email Allowlist", "type": "main", "index": 0 }],
-        [{ "node": "Phone Allowlist", "type": "main", "index": 0 }]
+        [{ "node": "Channel = Email?",   "type": "main", "index": 0 }],
+        [{ "node": "Channel = SMS?",     "type": "main", "index": 0 }],
+        [{ "node": "Channel = WhatsApp?","type": "main", "index": 0 }],
+        [{ "node": "Channel = Call?",    "type": "main", "index": 0 }]
       ]
     },
+
+    "Channel = Email?":   { "main": [[{ "node": "Email Allowlist", "type": "main", "index": 0 }], []] },
+    "Channel = SMS?":     { "main": [[{ "node": "Phone Allowlist", "type": "main", "index": 0 }], []] },
+    "Channel = WhatsApp?":{ "main": [[{ "node": "WA Allowlist",    "type": "main", "index": 0 }], []] },
+    "Channel = Call?":    { "main": [[{ "node": "Call Allowlist",  "type": "main", "index": 0 }], []] },
+
     "Email Allowlist": { "main": [[{ "node": "Email Allowed?", "type": "main", "index": 0 }]] },
-    "Email Allowed?": {
-      "main": [
-        [{ "node": "Email Send", "type": "main", "index": 0 }],
-        [{ "node": "Wait for Reply", "type": "main", "index": 0 }]
-      ]
-    },
+    "Email Allowed?":  { "main": [[{ "node": "Email Send",    "type": "main", "index": 0 }], [{ "node": "Wait for Reply", "type": "main", "index": 0 }]] },
+
     "Phone Allowlist": { "main": [[{ "node": "Phone Allowed?", "type": "main", "index": 0 }]] },
-    "Phone Allowed?": {
-      "main": [
-        [{ "node": "Twilio SMS", "type": "main", "index": 0 }],
-        [{ "node": "Wait for Reply", "type": "main", "index": 0 }]
-      ]
-    },
-    "Email Send": { "main": [[{ "node": "Wait for Reply", "type": "main", "index": 0 }]] },
-    "Twilio SMS": { "main": [[{ "node": "Wait for Reply", "type": "main", "index": 0 }]] },
-    "Twilio WhatsApp": { "main": [[{ "node": "Wait for Reply", "type": "main", "index": 0 }]] },
-    "Twilio Call (TTS)": { "main": [[{ "node": "Wait for Reply", "type": "main", "index": 0 }]] },
-    "Wait for Reply": { "main": [[{ "node": "Parse Intent", "type": "main", "index": 0 }]] },
-    "Parse Intent": { "main": [[{ "node": "Update PMS (Mock)", "type": "main", "index": 0 }]] },
-    "Update PMS (Mock)": { "main": [[{ "node": "Fill Slot (Mock)", "type": "main", "index": 0 }]] }
+    "Phone Allowed?":  { "main": [[{ "node": "Twilio SMS",    "type": "main", "index": 0 }], [{ "node": "Wait for Reply", "type": "main", "index": 0 }]] },
+
+    "WA Allowlist": { "main": [[{ "node": "WA Allowed?", "type": "main", "index": 0 }]] },
+    "WA Allowed?":  { "main": [[{ "node": "Twilio WhatsApp", "type": "main", "index": 0 }], [{ "node": "Wait for Reply", "type": "main", "index": 0 }]] },
+
+    "Call Allowlist": { "main": [[{ "node": "Call Allowed?", "type": "main", "index": 0 }]] },
+    "Call Allowed?":  { "main": [[{ "node": "Twilio Call (TTS)", "type": "main", "index": 0 }], [{ "node": "Wait for Reply", "type": "main", "index": 0 }]] },
+
+    "Email Send":       { "main": [[{ "node": "Wait for Reply", "type": "main", "index": 0 }]] },
+    "Twilio SMS":       { "main": [[{ "node": "Wait for Reply", "type": "main", "index": 0 }]] },
+    "Twilio WhatsApp":  { "main": [[{ "node": "Wait for Reply", "type": "main", "index": 0 }]] },
+    "Twilio Call (TTS)":{"main": [[{ "node": "Wait for Reply", "type": "main", "index": 0 }]] },
+
+    "Wait for Reply":     { "main": [[{ "node": "Parse Intent (Demo)", "type": "main", "index": 0 }]] },
+    "Parse Intent (Demo)":{"main": [[{ "node": "Update PMS (Mock)",    "type": "main", "index": 0 }]] },
+    "Update PMS (Mock)":  { "main": [[{ "node": "Fill Slot (Mock)",    "type": "main", "index": 0 }]] }
   },
   "active": false,
   "settings": {},

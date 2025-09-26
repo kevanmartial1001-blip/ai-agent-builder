@@ -73,6 +73,7 @@
   let ALL = [];
   let MAP_BY_ID = {};
 
+  // ---------- helpers ----------
   const listify = (v) => Array.isArray(v) ? v : String(v || '').split(/[;,|\s]+/).map(x=>x.trim()).filter(Boolean);
 
   function recommendedChannel(row) {
@@ -113,10 +114,8 @@ tags: [${listify(s.tags).join(', ')}]`;
     list.forEach(s => {
       const opt = document.createElement('option');
       opt.value = s.scenario_id;
-      // 🔴 Show scenario_id in the select
-      opt.textContent = s.scenario_id;
-      // show human name on hover
-      opt.title = s.name || s.scenario_id;
+      opt.textContent = s.scenario_id;    // show scenario_id in dropdown
+      opt.title = s.name || s.scenario_id; // human name on hover
       scenarioSel.appendChild(opt);
     });
     datalist.innerHTML = '';
@@ -165,6 +164,7 @@ tags: [${listify(s.tags).join(', ')}]`;
     }
   }
 
+  // events
   scenarioSel.addEventListener('change', () => applyScenario(scenarioSel.value));
   searchEl.addEventListener('change', () => {
     const id = searchEl.value.trim();
@@ -186,16 +186,34 @@ tags: [${listify(s.tags).join(', ')}]`;
     }
     throw new Error('No build endpoint found.');
   }
+
   function downloadBlob(blob, filename) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a'); a.href = url; a.download = filename;
     document.body.appendChild(a); a.click(); URL.revokeObjectURL(url); a.remove();
   }
 
+  // ---------- FIXED click handler (ensures scenario_id in YAML) ----------
   $('build').addEventListener('click', async () => {
     statusEl.textContent = 'Building…'; statusEl.className = 'hint';
+
+    // Ensure a valid scenario selection
+    const sid = (scenarioSel.value || '').trim();
+    const s = MAP_BY_ID[sid];
+    if (!s) {
+      statusEl.textContent = '✗ No scenario selected'; statusEl.className = 'hint err';
+      return;
+    }
+
+    // Ensure YAML contains scenario_id; regenerate if missing
+    let blueprint = (bpTA.value || '').trim();
+    if (!/^\s*scenario_id\s*:/m.test(blueprint)) {
+      blueprint = makeYaml(s);
+      bpTA.value = blueprint;
+    }
+
     const body = {
-      blueprint: bpTA.value,
+      blueprint,
       options: {
         channel: channelSel.value,
         reply_mode: 'none',
@@ -209,12 +227,13 @@ tags: [${listify(s.tags).join(', ')}]`;
         }
       }
     };
+
     try {
       const res = await postBuild(body);
-      const ct = (res.headers.get('content-type') || '').toLowerCase();
+      const ct  = (res.headers.get('content-type') || '').toLowerCase();
       const buf = await res.arrayBuffer();
       const blob = new Blob([buf], { type: ct || 'application/json' });
-      const name = ct.includes('zip') ? 'agent.zip' : `${scenarioSel.value}-workflow.json`;
+      const name = ct.includes('zip') ? 'agent.zip' : `${sid}-workflow.json`;
       downloadBlob(blob, name);
       statusEl.textContent = `✓ Downloaded ${name}`; statusEl.className = 'hint ok';
     } catch (err) {

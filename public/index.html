@@ -62,8 +62,8 @@
   </div>
 </div>
 
-<!-- IMPORTANT : builder en statique, servi depuis /public/builder.js -->
-<script src="/builder.js?v=1"></script>
+<!-- IMPORTANT : builder statique servi depuis /public/builder.js -->
+<script src="/builder.js?v=4"></script>
 
 <script>
 /* ========== helpers & state ========== */
@@ -150,16 +150,14 @@ function applyScenario(id){
   scenarioSel.value = s.scenario_id;
   channelSel.value  = recommendedChannel(s);
 
-  // 1) Essayer le builder
   try {
     if (!window.Builder || typeof window.Builder.buildWorkflowJSON !== 'function') {
-      // fallback YAML si builder pas chargé
       const yaml = previewYaml(s, industry);
       bpTA.value = `${yaml}\n\n/* Builder not loaded. Check /public/builder.js and cache. */`;
       console.warn('Builder not loaded. window.Builder =', window.Builder);
       return;
     }
-    const wf = window.Builder.buildWorkflowJSON(s);
+    const wf = window.Builder.buildWorkflowJSON(s, industry);   // ⬅️ on passe industry
     bpTA.value = JSON.stringify(wf, null, 2);
   } catch (err) {
     console.error('buildWorkflowJSON() error:', err);
@@ -247,7 +245,8 @@ $('build').addEventListener('click', ()=>{
       dbg.innerHTML = '<span class="err">Builder not loaded (using YAML in preview only). Check /public/builder.js.</span>';
       return;
     }
-    const wf = window.Builder.buildWorkflowJSON(s);
+    const industry = matchIndustryForScenario(s);
+    const wf = window.Builder.buildWorkflowJSON(s, industry);   // ⬅️ industry ici aussi
     downloadJSON(wf, `${sid}.n8n.json`);
   } catch (e) {
     dbg.innerHTML = '<span class="err">buildWorkflowJSON error:</span> ' + (e.message||String(e));

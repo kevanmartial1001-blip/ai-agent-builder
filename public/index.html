@@ -62,8 +62,8 @@
   </div>
 </div>
 
-<!-- IMPORTANT : builder statique servi depuis /public/builder.js -->
-<script src="/builder.js?v=4"></script>
+<!-- IMPORTANT : builder statique servi depuis /public (URL racine) -->
+<script defer src="/builder.js?v=7"></script>
 
 <script>
 /* ========== helpers & state ========== */
@@ -153,11 +153,11 @@ function applyScenario(id){
   try {
     if (!window.Builder || typeof window.Builder.buildWorkflowJSON !== 'function') {
       const yaml = previewYaml(s, industry);
-      bpTA.value = `${yaml}\n\n/* Builder not loaded. Check /public/builder.js and cache. */`;
+      bpTA.value = `${yaml}\n\n/* Builder not loaded. Check /builder.js (root) et le cache. */`;
       console.warn('Builder not loaded. window.Builder =', window.Builder);
       return;
     }
-    const wf = window.Builder.buildWorkflowJSON(s, industry);   // ⬅️ on passe industry
+    const wf = window.Builder.buildWorkflowJSON(s, industry);
     bpTA.value = JSON.stringify(wf, null, 2);
   } catch (err) {
     console.error('buildWorkflowJSON() error:', err);
@@ -170,7 +170,7 @@ function applyScenario(id){
 let searchTimer = null;
 async function remoteSearch(q){
   if (!q || q.trim().length < 2){ suggestWrap.innerHTML=''; return; }
-  const url = `/api/scenarios?q=${encodeURIComponent(q)}&limit=50`;
+  const url = `/api/scenarios?q=${encodeURIComponent(q)}&max=50`;
   const res = await getJSON(url);
   const items = (res.ok && res.json && Array.isArray(res.json.items)) ? res.json.items : [];
   renderSuggestions(items);
@@ -242,11 +242,11 @@ $('build').addEventListener('click', ()=>{
 
   try{
     if (!window.Builder || typeof window.Builder.buildWorkflowJSON !== 'function') {
-      dbg.innerHTML = '<span class="err">Builder not loaded (using YAML in preview only). Check /public/builder.js.</span>';
+      dbg.innerHTML = '<span class="err">Builder not loaded (using YAML in preview only). Check /builder.js.</span>';
       return;
     }
     const industry = matchIndustryForScenario(s);
-    const wf = window.Builder.buildWorkflowJSON(s, industry);   // ⬅️ industry ici aussi
+    const wf = window.Builder.buildWorkflowJSON(s, industry);
     downloadJSON(wf, `${sid}.n8n.json`);
   } catch (e) {
     dbg.innerHTML = '<span class="err">buildWorkflowJSON error:</span> ' + (e.message||String(e));
@@ -257,7 +257,7 @@ $('build').addEventListener('click', ()=>{
 async function bootstrap(){
   try{
     const [sc, ind] = await Promise.all([
-      getJSON('/api/scenarios?cursor=0&limit=25'),
+      getJSON('/api/scenarios?cursor=0&max=25'),
       getJSON('/api/industries'),
     ]);
     const sitems = (sc.ok && sc.json && Array.isArray(sc.json.items)) ? sc.json.items : [];

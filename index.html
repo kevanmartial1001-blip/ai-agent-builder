@@ -27,12 +27,12 @@
 <body>
 <div class="wrap">
   <h1>AI Agent Builder <small class="badge" id="loadedCount"></small></h1>
-  <p class="muted">Search by <strong>scenario_id</strong>, or pick from the list. We’ll auto-select the most effective <em>Channel</em> for this agent; you can change it if you like.</p>
+  <p class="muted">Search or pick a scenario by its <strong>scenario_id</strong>. We auto-select a recommended channel (you can change it).</p>
 
   <div class="card">
     <div class="row">
       <div>
-        <label for="scenario">Scenario</label>
+        <label for="scenario">Scenario (shows <code>scenario_id</code>)</label>
         <select id="scenario"></select>
       </div>
       <div>
@@ -70,31 +70,24 @@
   const datalist = $('scenarioIds');
   const loadedCount = $('loadedCount');
 
-  let ALL = [];           // full list from /api/scenarios
-  let MAP_BY_ID = {};     // scenario_id -> row
+  let ALL = [];
+  let MAP_BY_ID = {};
 
-  // --- utilities ----------------------------------------------------------
   const listify = (v) => Array.isArray(v) ? v : String(v || '').split(/[;,|\s]+/).map(x=>x.trim()).filter(Boolean);
 
   function recommendedChannel(row) {
-    // Use best_reply_shapes if present; otherwise some safe heuristics.
     const shapes = listify(row.best_reply_shapes || row.channel);
     const norm = shapes.map(s => s.toLowerCase());
-
-    // synonym map
-    const set = new Set(norm.map(s => (
+    const set = new Set(norm.map(s =>
       s.includes('whatsapp') ? 'whatsapp' :
       s.includes('sms') || s.includes('text') ? 'sms' :
       s.includes('voice') || s.includes('call') || s.includes('phone') ? 'call' :
       s.includes('email') || s.includes('mail') ? 'email' : s
-    )));
-
-    // priority: SMS > WhatsApp > Email > Call  (fastest confirm first)
+    ));
     if (set.has('sms')) return 'sms';
     if (set.has('whatsapp')) return 'whatsapp';
     if (set.has('email')) return 'email';
     if (set.has('call')) return 'call';
-    // fallback heuristic: for "scheduling" use sms; else email
     const hay = ((row.name || '') + ' ' + (row.tags || []).join(' ')).toLowerCase();
     if (hay.includes('schedule') || hay.includes('appointment') || hay.includes('no-show')) return 'sms';
     return 'email';
@@ -116,15 +109,16 @@ tags: [${listify(s.tags).join(', ')}]`;
   }
 
   function populateUI(list) {
-    // dropdown
     scenarioSel.innerHTML = '';
     list.forEach(s => {
       const opt = document.createElement('option');
       opt.value = s.scenario_id;
-      opt.textContent = s.name ? `${s.name}` : s.scenario_id;
+      // 🔴 Show scenario_id in the select
+      opt.textContent = s.scenario_id;
+      // show human name on hover
+      opt.title = s.name || s.scenario_id;
       scenarioSel.appendChild(opt);
     });
-    // datalist for search (scenario_id first)
     datalist.innerHTML = '';
     ALL.forEach(s => {
       const o = document.createElement('option');
@@ -141,9 +135,7 @@ tags: [${listify(s.tags).join(', ')}]`;
     if (!s) return;
     scenarioSel.value = s.scenario_id;
     bpTA.value = makeYaml(s);
-    // auto-pick channel
-    const rec = recommendedChannel(s);
-    channelSel.value = rec;
+    channelSel.value = recommendedChannel(s);
   }
 
   async function fetchScenarios() {
@@ -161,7 +153,6 @@ tags: [${listify(s.tags).join(', ')}]`;
     } catch (e) {
       console.error(e);
       statusEl.textContent = '✗ Error: Failed to load scenarios'; statusEl.className = 'hint err';
-      // minimal fallback so the page still works
       const fallback = {
         scenario_id: 'tier1_dso_SCHEDULING_NO_SHOWS',
         name: 'DSO – Scheduling (reduce no-shows)',
@@ -174,7 +165,6 @@ tags: [${listify(s.tags).join(', ')}]`;
     }
   }
 
-  // events
   scenarioSel.addEventListener('change', () => applyScenario(scenarioSel.value));
   searchEl.addEventListener('change', () => {
     const id = searchEl.value.trim();
@@ -207,7 +197,7 @@ tags: [${listify(s.tags).join(', ')}]`;
     const body = {
       blueprint: bpTA.value,
       options: {
-        channel: channelSel.value,     // auto-recommended but user-overridable
+        channel: channelSel.value,
         reply_mode: 'none',
         demoMode: false,
         overrideTo: 'kevanm.spain@gmail.com',

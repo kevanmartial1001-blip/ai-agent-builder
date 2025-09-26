@@ -27,7 +27,7 @@
 <body>
 <div class="wrap">
   <h1>AI Agent Builder <small class="badge" id="loadedCount"></small></h1>
-  <p class="muted">Search or pick a scenario by its <strong>scenario_id</strong>. We auto-select a recommended channel (you can change it).</p>
+  <p class="muted">Pick a scenario by <strong>scenario_id</strong>. We auto-select a recommended channel (you can change it).</p>
 
   <div class="card">
     <div class="row">
@@ -50,7 +50,7 @@
     <input id="search" list="scenarioIds" placeholder="e.g. tier1_dso_SCHEDULING_NO_SHOWS" />
     <datalist id="scenarioIds"></datalist>
 
-    <label for="bp">Blueprint (auto-filled; editable)</label>
+    <label for="bp">Blueprint (human-readable YAML; request sends JSON)</label>
     <textarea id="bp" spellcheck="false"></textarea>
 
     <div class="btnbar">
@@ -73,7 +73,6 @@
   let ALL = [];
   let MAP_BY_ID = {};
 
-  // ---------- helpers ----------
   const listify = (v) => Array.isArray(v) ? v : String(v || '').split(/[;,|\s]+/).map(x=>x.trim()).filter(Boolean);
 
   function recommendedChannel(row) {
@@ -114,7 +113,7 @@ tags: [${listify(s.tags).join(', ')}]`;
     list.forEach(s => {
       const opt = document.createElement('option');
       opt.value = s.scenario_id;
-      opt.textContent = s.scenario_id;    // show scenario_id in dropdown
+      opt.textContent = s.scenario_id;     // show scenario_id in dropdown
       opt.title = s.name || s.scenario_id; // human name on hover
       scenarioSel.appendChild(opt);
     });
@@ -164,7 +163,6 @@ tags: [${listify(s.tags).join(', ')}]`;
     }
   }
 
-  // events
   scenarioSel.addEventListener('change', () => applyScenario(scenarioSel.value));
   searchEl.addEventListener('change', () => {
     const id = searchEl.value.trim();
@@ -193,11 +191,10 @@ tags: [${listify(s.tags).join(', ')}]`;
     document.body.appendChild(a); a.click(); URL.revokeObjectURL(url); a.remove();
   }
 
-  // ---------- FIXED click handler (ensures scenario_id in YAML) ----------
+  // Build: send JSON blueprint object (robust)
   $('build').addEventListener('click', async () => {
     statusEl.textContent = 'Building…'; statusEl.className = 'hint';
 
-    // Ensure a valid scenario selection
     const sid = (scenarioSel.value || '').trim();
     const s = MAP_BY_ID[sid];
     if (!s) {
@@ -205,15 +202,29 @@ tags: [${listify(s.tags).join(', ')}]`;
       return;
     }
 
-    // Ensure YAML contains scenario_id; regenerate if missing
-    let blueprint = (bpTA.value || '').trim();
-    if (!/^\s*scenario_id\s*:/m.test(blueprint)) {
-      blueprint = makeYaml(s);
-      bpTA.value = blueprint;
+    // Always send a JSON object so the backend reliably sees scenario_id
+    const blueprintObj = {
+      version: '0.1',
+      scenario_id: s.scenario_id,
+      name: s.name || '',
+      agent_name: s.agent_name || 'Agent',
+      triggers: s.triggers || '',
+      best_reply_shapes: listify(s.best_reply_shapes),
+      risk_notes: s.risk_notes || '',
+      how_it_works: s.how_it_works || '',
+      tool_stack_dev: s.tool_stack_dev || '',
+      tool_stack_autonomous: s.tool_stack_autonomous || '',
+      tags: listify(s.tags),
+      roi_hypothesis: s.roi_hypothesis || ''
+    };
+
+    // Keep YAML in textarea for humans (optional refresh)
+    if (!/^\s*scenario_id\s*:/m.test(bpTA.value || '')) {
+      bpTA.value = makeYaml(s);
     }
 
     const body = {
-      blueprint,
+      blueprint: blueprintObj,   // <— JSON, not string
       options: {
         channel: channelSel.value,
         reply_mode: 'none',

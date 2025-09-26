@@ -14,7 +14,7 @@
   .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
   label{display:block;font-weight:600;margin:12px 0 6px}
   select,textarea,input{width:100%;background:#0f1218;color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
-  textarea{min-height:200px;font-family:ui-monospace,Consolas,Menlo,monospace;font-size:13px}
+  textarea{min-height:180px;font-family:ui-monospace,Consolas,Menlo,monospace;font-size:13px}
   .btnbar{display:flex;gap:12px;align-items:center;margin-top:14px}
   button{background:#1f2937;border:1px solid var(--line);color:var(--ink);padding:10px 14px;border-radius:10px;cursor:pointer}
   button.primary{background:var(--accent);color:#0b0c10;border:none;font-weight:700}
@@ -26,7 +26,7 @@
 <body>
 <div class="wrap">
   <h1>AI Agent Builder <small class="badge" id="loadedCount"></small></h1>
-  <p class="muted">Pick a scenario by <strong>scenario_id</strong>. We auto-select a recommended channel (you can change it).</p>
+  <p class="muted">Pick a <strong>scenario_id</strong> and a channel. We’ll generate a ready-to-import n8n workflow JSON locally.</p>
 
   <div class="card">
     <div class="row">
@@ -49,24 +49,24 @@
     <input id="search" list="scenarioIds" placeholder="e.g. tier1_dso_SCHEDULING_NO_SHOWS" />
     <datalist id="scenarioIds"></datalist>
 
-    <label for="bp">Blueprint (readable YAML)</label>
-    <textarea id="bp" spellcheck="false"></textarea>
+    <label for="bp">Blueprint (preview)</label>
+    <textarea id="bp" spellcheck="false" readonly></textarea>
 
     <div class="btnbar">
-      <button id="build" class="primary">Build</button>
+      <button id="build" class="primary">Download n8n JSON</button>
       <span id="status" class="hint"></span>
     </div>
   </div>
 </div>
 
 <script>
-  const $ = (id) => document.getElementById(id);
+  const $ = id => document.getElementById(id);
   const statusEl = $('status'), scenarioSel = $('scenario'), channelSel = $('channel');
   const searchEl = $('search'), bpTA = $('bp'), datalist = $('scenarioIds'), loadedCount = $('loadedCount');
 
-  let ALL = [], MAP_BY_ID = {};
+  let ALL = [], MAP = {};
 
-  const listify = (v) => Array.isArray(v) ? v : String(v || '').split(/[;,|\s]+/).map(x=>x.trim()).filter(Boolean);
+  const listify = v => Array.isArray(v) ? v : String(v || '').split(/[;,|\s]+/).map(x=>x.trim()).filter(Boolean);
 
   function recommendedChannel(row) {
     const shapes = listify(row.best_reply_shapes);
@@ -86,9 +86,9 @@
     return 'email';
   }
 
-  function makeYaml(s) {
-    const br = (v) => (v==null || String(v).trim()==='' ? '' : String(v));
-    const brList = (arr) => `[${listify(arr).join(', ')}]`;
+  function previewYaml(s) {
+    const br = v => (v==null || String(v).trim()==='' ? '' : String(v));
+    const brList = arr => `[${listify(arr).join(', ')}]`;
     return `version: 0.1
 scenario_id: ${s.scenario_id}
 name: ${br(s.name)}
@@ -107,8 +107,8 @@ tags: [${listify(s.tags).join(', ')}]`;
     list.forEach(s => {
       const opt = document.createElement('option');
       opt.value = s.scenario_id;
-      opt.textContent = s.scenario_id;      // show id
-      opt.title = s.name || s.scenario_id;  // human name on hover
+      opt.textContent = s.scenario_id;   // show id
+      opt.title = s.name || s.scenario_id;
       scenarioSel.appendChild(opt);
     });
     datalist.innerHTML = '';
@@ -123,11 +123,12 @@ tags: [${listify(s.tags).join(', ')}]`;
   }
 
   function applyScenario(id) {
-    const s = MAP_BY_ID[id] || ALL.find(x => x.scenario_id === id);
+    const s = MAP[id] || ALL.find(x => x.scenario_id === id);
     if (!s) return;
     scenarioSel.value = s.scenario_id;
-    bpTA.value = makeYaml(s);
-    channelSel.value = recommendedChannel(s);
+    const rec = recommendedChannel(s);
+    channelSel.value = rec;
+    bpTA.value = previewYaml(s);
   }
 
   async function fetchScenarios() {
@@ -140,86 +141,181 @@ tags: [${listify(s.tags).join(', ')}]`;
         best_reply_shapes: listify(x.best_reply_shapes),
         tags: listify(x.tags),
       }));
-      MAP_BY_ID = Object.fromEntries(ALL.map(x => [x.scenario_id, x]));
+      MAP = Object.fromEntries(ALL.map(x => [x.scenario_id, x]));
       populateUI(ALL);
     } catch (e) {
       console.error(e);
       statusEl.textContent = '✗ Error: Failed to load scenarios'; statusEl.className = 'hint err';
-      const fallback = { scenario_id:'tier1_dso_SCHEDULING_NO_SHOWS', name:'DSO – Scheduling (reduce no-shows)', agent_name:'Scheduling Agent', best_reply_shapes:['sms','email'] };
-      ALL = [fallback]; MAP_BY_ID = { [fallback.scenario_id]: fallback };
+      const fallback = { scenario_id:'tier1_dso_SCHEDULING_NO_SHOWS', name:'DSO – Scheduling (reduce no-shows)', agent_name:'Scheduling Agent', best_reply_shapes:['sms','email'], triggers:'' };
+      ALL = [fallback]; MAP = { [fallback.scenario_id]: fallback };
       populateUI(ALL);
     }
   }
 
   scenarioSel.addEventListener('change', () => applyScenario(scenarioSel.value));
-  searchEl.addEventListener('change', () => { const id = searchEl.value.trim(); if (MAP_BY_ID[id]) applyScenario(id); });
+  searchEl.addEventListener('change', () => { const id = searchEl.value.trim(); if (MAP[id]) applyScenario(id); });
 
-  async function postBuild(body) {
-    for (const path of ['/api/build', '/api/compile']) {
-      const res = await fetch(path, { method:'POST', headers:{ 'Content-Type':'application/json', 'Accept':'application/json' }, body: JSON.stringify(body) });
-      if (res.ok) return res;
-      if (res.status !== 404) { const txt = await res.text().catch(()=> ''); throw new Error(`Build failed (${res.status}): ${txt || res.statusText}`); }
-    }
-    throw new Error('No build endpoint found.');
+  // ---------- Local workflow builder (no backend) ----------
+  function buildWorkflowJSON(s, channel) {
+    const wf = {
+      name: `${s.scenario_id} – ${s.agent_name || 'Agent'} (Demo)`,
+      nodes: [
+        { parameters:{}, type:"n8n-nodes-base.manualTrigger", typeVersion:1, position:[-1400,-20], name:"Manual Trigger" },
+        {
+          parameters:{ functionCode:
+`// Global config you can edit inside n8n after import
+return [{ json: {
+  demoMode: true,                 // true = simulate, false = actually send
+  channel: "${channel}",          // "email" | "sms" | "whatsapp" | "call"
+  allowedRecipients: ["kevanm.spain@gmail.com"],
+  allowedPhones: ["+34XXXXXXXXX"],
+  overrideTo: "kevanm.spain@gmail.com",
+  overrideToPhone: "+34XXXXXXXXX",
+  twilioFromSms: "+13412184164",
+  twilioFromWhatsApp: "whatsapp:+14155238886",
+  twilioFromVoice: "+13412184164"
+}}];`
+          },
+          type:"n8n-nodes-base.function", typeVersion:2, position:[-1180,-20], name:"Set Config"
+        },
+        {
+          parameters:{ functionCode:
+`// Minimal demo data from scenario
+return [{ json: {
+  scenario_id: "${s.scenario_id}",
+  scenario_name: "${(s.name||'').replace(/"/g,'\\"')}",
+  agent_name: "${(s.agent_name||'Agent').replace(/"/g,'\\"')}",
+  best_reply_shapes: ${JSON.stringify(s.best_reply_shapes || [])},
+  appointments: [
+    { id: "A1001", first:"Sara", last:"L.", email:"sara@example.com", phone:"+15551234567", time:"2025-10-02T10:00", doctor:"Dr. Lee" }
+  ]
+}}];`
+          },
+          type:"n8n-nodes-base.function", typeVersion:2, position:[-940,-20], name:"Load Appointments"
+        },
+        {
+          parameters:{ functionCode:
+`const appt = items[0].json.appointments[0];
+const d = new Date(appt.time);
+const dateStr = d.toLocaleDateString();
+const timeStr = d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+const cfg = $items('Set Config',0,0).json;
+return [{ json: {
+  to: cfg.overrideTo || appt.email,
+  toPhone: cfg.overrideToPhone || appt.phone,
+  subject: \`Appointment reminder – \${appt.doctor}\`,
+  text: \`Hi \${appt.first}, your appointment is on \${dateStr} at \${timeStr} with \${appt.doctor}.\\nReply 1 to CONFIRM, 2 to RESCHEDULE, 3 to CANCEL.\`,
+  tts: \`Hello \${appt.first}. This is a reminder for your appointment on \${dateStr} at \${timeStr} with \${appt.doctor}. Press one to confirm, two to reschedule, or three to cancel.\`
+}}];`
+          },
+          type:"n8n-nodes-base.function", typeVersion:2, position:[-720,-20], name:"Compose Message"
+        },
+
+        // Channel routers
+        { parameters:{conditions:{string:[{value1:"={{$items('Set Config',0,0).json.channel}}",operation:"equal",value2:"email"}]}}, type:"n8n-nodes-base.if", typeVersion:2, position:[-520,-160], name:"Channel = Email?" },
+        { parameters:{conditions:{string:[{value1:"={{$items('Set Config',0,0).json.channel}}",operation:"equal",value2:"sms"}]}},   type:"n8n-nodes-base.if", typeVersion:2, position:[-520,-40],  name:"Channel = SMS?" },
+        { parameters:{conditions:{string:[{value1:"={{$items('Set Config',0,0).json.channel}}",operation:"equal",value2:"whatsapp"}]}}, type:"n8n-nodes-base.if", typeVersion:2, position:[-520,80],   name:"Channel = WhatsApp?" },
+        { parameters:{conditions:{string:[{value1:"={{$items('Set Config',0,0).json.channel}}",operation:"equal",value2:"call"}]}},  type:"n8n-nodes-base.if", typeVersion:2, position:[-520,200],  name:"Channel = Call?" },
+
+        // Email path
+        { parameters:{functionCode:"const cfg=$items('Set Config',0,0).json;const to=$json.to||'';const ok=(cfg.allowedRecipients||[]).includes(to);return [{json:{ok}}];"}, type:"n8n-nodes-base.function", typeVersion:2, position:[-340,-240], name:"Email Allowlist" },
+        { parameters:{conditions:{boolean:[{value1:"={{$item(0).$node['Email Allowlist'].json.ok}}"}]}}, type:"n8n-nodes-base.if", typeVersion:2, position:[-180,-240], name:"Email Allowed?" },
+        { parameters:{fromEmail:"", toEmail:"={{$json['to']}}", subject:"={{$json['subject']}}", text:"={{$json['text']}}", options:{senderName: s.agent_name || "Agent"}}, type:"n8n-nodes-base.emailSend", typeVersion:2, position:[0,-240], name:"Email Send", notes:"Pick your SMTP credential when demoMode=false" },
+
+        // SMS path
+        { parameters:{functionCode:"const cfg=$items('Set Config',0,0).json;const p=$json.toPhone||'';const ok=(cfg.allowedPhones||[]).includes(p);return [{json:{ok}}];"}, type:"n8n-nodes-base.function", typeVersion:2, position:[-340,-40], name:"Phone Allowlist" },
+        { parameters:{conditions:{boolean:[{value1:"={{$item(0).$node['Phone Allowlist'].json.ok}}"}]}}, type:"n8n-nodes-base.if", typeVersion:2, position:[-180,-40], name:"Phone Allowed?" },
+        { parameters:{resource:"message", operation:"send", from:"={{$items('Set Config',0,0).json.twilioFromSms}}", to:"={{$json['toPhone']}}", message:"={{$json['text']}}"}, type:"n8n-nodes-base.twilio", typeVersion:2, position:[0,-40], name:"Twilio SMS", disabled:true, credentials:{twilioApi:{name:"twilio-default"}} },
+
+        // WhatsApp path
+        { parameters:{functionCode:"const cfg=$items('Set Config',0,0).json;const p=$json.toPhone||'';const ok=(cfg.allowedPhones||[]).includes(p);return [{json:{ok}}];"}, type:"n8n-nodes-base.function", typeVersion:2, position:[-340,80], name:"WA Allowlist" },
+        { parameters:{conditions:{boolean:[{value1:"={{$item(0).$node['WA Allowlist'].json.ok}}"}]}}, type:"n8n-nodes-base.if", typeVersion:2, position:[-180,80], name:"WA Allowed?" },
+        { parameters:{resource:"message", operation:"send", from:"={{$items('Set Config',0,0).json.twilioFromWhatsApp}}", to:"={{'whatsapp:' + $json['toPhone']}}", message:"={{$json['text']}}"}, type:"n8n-nodes-base.twilio", typeVersion:2, position:[0,80], name:"Twilio WhatsApp", disabled:true, credentials:{twilioApi:{name:"twilio-default"}} },
+
+        // Call path
+        { parameters:{functionCode:"const cfg=$items('Set Config',0,0).json;const p=$json.toPhone||'';const ok=(cfg.allowedPhones||[]).includes(p);return [{json:{ok}}];"}, type:"n8n-nodes-base.function", typeVersion:2, position:[-340,200], name:"Call Allowlist" },
+        { parameters:{conditions:{boolean:[{value1:"={{$item(0).$node['Call Allowlist'].json.ok}}"}]}}, type:"n8n-nodes-base.if", typeVersion:2, position:[-180,200], name:"Call Allowed?" },
+        { parameters:{resource:"call", operation:"create", from:"={{$items('Set Config',0,0).json.twilioFromVoice}}", to:"={{$json['toPhone']}}", text:"={{$json['tts']}}", sayOrPlay:"say"}, type:"n8n-nodes-base.twilio", typeVersion:2, position:[0,200], name:"Twilio Call (TTS)", disabled:true, credentials:{twilioApi:{name:"twilio-default"}} },
+
+        // Reply + intent + PMS + waitlist
+        { parameters:{}, type:"n8n-nodes-base.wait", typeVersion:1, position:[260,-20], name:"Wait for Reply", notes:"Click Resume to simulate a reply." },
+        { parameters:{ functionCode:
+`// Parse reply (simulated). Change 'replyText' for testing.
+const replyText = "1"; // 1=CONFIRM, 2=RESCHEDULE, 3=CANCEL, 'late' => LATE
+let intent = 'HUMAN';
+const t = (replyText||'').toLowerCase();
+if (t === '1' || /(^|\\b)yes\\b|confirm/.test(t)) intent = 'CONFIRM';
+else if (t === '3' || /cancel/.test(t)) intent = 'CANCEL';
+else if (t === '2' || /reschedule|another|next week/.test(t)) intent = 'RESCHEDULE';
+else if (/late|retard|en retard/.test(t)) intent = 'LATE';
+return [{ json: { intent } }];`
+          },
+          type:"n8n-nodes-base.function", typeVersion:2, position:[520,-20], name:"Parse Intent (Demo)"
+        },
+        { parameters:{ functionCode:"const intent=$json.intent; console.log('[PMS] Update →', intent); return [{ json:{ ok:true, intent } }];" }, type:"n8n-nodes-base.function", typeVersion:2, position:[760,-20], name:"Update PMS (Mock)" },
+        { parameters:{ functionCode:"if ($json.intent==='CANCEL' || $json.intent==='RESCHEDULE'){const next={first:'Lena',email:'lena@example.com',phone:'+15550001111'}; console.log('[WAITLIST] Fill', next); return [{ json:{ filledWith:next, intent:$json.intent } }]; } return [{ json:{ skipped:true, intent:$json.intent } }];" }, type:"n8n-nodes-base.function", typeVersion:2, position:[1000,-20], name:"Fill Slot (Mock)" }
+      ],
+      connections: {
+        "Manual Trigger": { "main": [[{ node:"Set Config", type:"main", index:0 }]] },
+        "Set Config":     { "main": [[{ node:"Load Appointments", type:"main", index:0 }]] },
+        "Load Appointments": { "main": [[{ node:"Compose Message", type:"main", index:0 }]] },
+
+        "Compose Message": {
+          "main": [
+            [{ node:"Channel = Email?", type:"main", index:0 }],
+            [{ node:"Channel = SMS?", type:"main", index:0 }],
+            [{ node:"Channel = WhatsApp?", type:"main", index:0 }],
+            [{ node:"Channel = Call?", type:"main", index:0 }]
+          ]
+        },
+
+        "Channel = Email?":   { "main": [[{ node:"Email Allowlist", type:"main", index:0 }], []] },
+        "Channel = SMS?":     { "main": [[{ node:"Phone Allowlist", type:"main", index:0 }], []] },
+        "Channel = WhatsApp?":{ "main": [[{ node:"WA Allowlist", type:"main", index:0 }], []] },
+        "Channel = Call?":    { "main": [[{ node:"Call Allowlist", type:"main", index:0 }], []] },
+
+        "Email Allowlist": { "main": [[{ node:"Email Allowed?", type:"main", index:0 }]] },
+        "Email Allowed?":  { "main": [[{ node:"Email Send", type:"main", index:0 }], [{ node:"Wait for Reply", type:"main", index:0 }]] },
+
+        "Phone Allowlist": { "main": [[{ node:"Phone Allowed?", type:"main", index:0 }]] },
+        "Phone Allowed?":  { "main": [[{ node:"Twilio SMS", type:"main", index:0 }], [{ node:"Wait for Reply", type:"main", index:0 }]] },
+
+        "WA Allowlist": { "main": [[{ node:"WA Allowed?", type:"main", index:0 }]] },
+        "WA Allowed?":  { "main": [[{ node:"Twilio WhatsApp", type:"main", index:0 }], [{ node:"Wait for Reply", type:"main", index:0 }]] },
+
+        "Call Allowlist": { "main": [[{ node:"Call Allowed?", type:"main", index:0 }]] },
+        "Call Allowed?":  { "main": [[{ node:"Twilio Call (TTS)", type:"main", index:0 }], [{ node:"Wait for Reply", type:"main", index:0 }]] },
+
+        "Email Send":      { "main": [[{ node:"Wait for Reply", type:"main", index:0 }]] },
+        "Twilio SMS":      { "main": [[{ node:"Wait for Reply", type:"main", index:0 }]] },
+        "Twilio WhatsApp": { "main": [[{ node:"Wait for Reply", type:"main", index:0 }]] },
+        "Twilio Call (TTS)": { "main": [[{ node:"Wait for Reply", type:"main", index:0 }]] },
+
+        "Wait for Reply":     { "main": [[{ node:"Parse Intent (Demo)", type:"main", index:0 }]] },
+        "Parse Intent (Demo)":{"main": [[{ node:"Update PMS (Mock)", type:"main", index:0 }]] },
+        "Update PMS (Mock)":  { "main": [[{ node:"Fill Slot (Mock)", type:"main", index:0 }]] }
+      },
+      active:false, settings:{}, staticData:null, pinData:{}
+    };
+    return wf;
   }
 
-  function downloadBlob(blob, filename) {
+  function downloadJSON(obj, filename) {
+    const txt = JSON.stringify(obj, null, 2);
+    const blob = new Blob([txt], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a'); a.href = url; a.download = filename;
     document.body.appendChild(a); a.click(); URL.revokeObjectURL(url); a.remove();
   }
 
-  // CLICK → send blueprint as a JSON STRING (contains scenario_id)
-  $('build').addEventListener('click', async () => {
+  $('build').addEventListener('click', () => {
     statusEl.textContent = 'Building…'; statusEl.className = 'hint';
-
     const sid = (scenarioSel.value || '').trim();
-    const s = MAP_BY_ID[sid];
+    const s = MAP[sid];
     if (!s) { statusEl.textContent = '✗ No scenario selected'; statusEl.className = 'hint err'; return; }
-
-    const blueprintObj = {
-      version: '0.1',
-      scenario_id: s.scenario_id,
-      name: s.name || '',
-      agent_name: s.agent_name || 'Agent',
-      triggers: s.triggers || '',
-      best_reply_shapes: listify(s.best_reply_shapes),
-      risk_notes: s.risk_notes || '',
-      how_it_works: s.how_it_works || '',
-      tool_stack_dev: s.tool_stack_dev || '',
-      tool_stack_autonomous: s.tool_stack_autonomous || '',
-      tags: listify(s.tags),
-      roi_hypothesis: s.roi_hypothesis || ''
-    };
-
-    // keep YAML for display only
-    bpTA.value = makeYaml(s);
-
-    const body = {
-      blueprint: JSON.stringify(blueprintObj), // << send as STRING so EJS builders can JSON.parse and find scenario_id
-      scenario_id: s.scenario_id,              // << belt & suspenders: top-level too
-      options: {
-        channel: channelSel.value,
-        reply_mode: 'none',
-        demoMode: false,
-        overrideTo: 'kevanm.spain@gmail.com',
-        overrideToPhone: '+34XXXXXXXXX',
-        twilio: { fromSms:'+13412184164', fromWhatsApp:'whatsapp:+14155238886', fromVoice:'+13412184164' }
-      }
-    };
-
-    try {
-      const res = await postBuild(body);
-      const ct  = (res.headers.get('content-type') || '').toLowerCase();
-      const buf = await res.arrayBuffer();
-      const blob = new Blob([buf], { type: ct || 'application/json' });
-      const name = ct.includes('zip') ? 'agent.zip' : `${sid}-workflow.json`;
-      downloadBlob(blob, name);
-      statusEl.textContent = `✓ Downloaded ${name}`; statusEl.className = 'hint ok';
-    } catch (err) {
-      console.error(err);
-      statusEl.textContent = `✗ ${err.message}`; statusEl.className = 'hint err';
-    }
+    const wf = buildWorkflowJSON(s, channelSel.value);
+    downloadJSON(wf, `${sid}-workflow.json`);
+    statusEl.textContent = `✓ Downloaded ${sid}-workflow.json`; statusEl.className = 'hint ok';
   });
 
   fetchScenarios();

@@ -1,40 +1,40 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>AI Agent Builder</title>
-  <style>
-    :root { --bg:#0b0c10; --card:#141824; --ink:#e9edf1; --muted:#9aa6b2; --accent:#5eead4; --line:#232735; }
-    html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial,sans-serif}
-    .wrap{max-width:900px;margin:48px auto;padding:0 20px}
-    h1{margin:0 0 6px;font-size:28px}
-    p.muted{margin:0 0 20px;color:var(--muted)}
-    .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
-    .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-    label{display:block;font-weight:600;margin:12px 0 6px}
-    select,textarea{width:100%;background:#0f1218;color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
-    textarea{min-height:220px;font-family:ui-monospace,Consolas,Menlo,monospace;font-size:13px}
-    .btnbar{display:flex;gap:12px;align-items:center;margin-top:14px}
-    button{background:#1f2937;border:1px solid var(--line);color:var(--ink);padding:10px 14px;border-radius:10px;cursor:pointer}
-    button.primary{background:var(--accent);color:#0b0c10;border:none;font-weight:700}
-    .hint{color:var(--muted);font-size:13px;margin-left:6px}
-    .ok{color:#66ffb7}.err{color:#ff9aa8}
-    details{margin-top:12px}
-    summary{cursor:pointer;color:var(--muted)}
-    .kbd{background:#0f1218;border:1px solid var(--line);padding:2px 6px;border-radius:6px}
-  </style>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>AI Agent Builder</title>
+<style>
+  :root{--bg:#0b0c10;--card:#141824;--ink:#e9edf1;--muted:#9aa6b2;--accent:#5eead4;--line:#232735}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial,sans-serif}
+  .wrap{max-width:900px;margin:48px auto;padding:0 20px}
+  h1{margin:0 0 6px;font-size:28px}
+  p.muted{margin:0 0 20px;color:var(--muted)}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  label{display:block;font-weight:600;margin:12px 0 6px}
+  select,textarea{width:100%;background:#0f1218;color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+  textarea{min-height:200px;font-family:ui-monospace,Consolas,Menlo,monospace;font-size:13px}
+  input{width:100%;background:#0f1218;color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+  .btnbar{display:flex;gap:12px;align-items:center;margin-top:14px}
+  button{background:#1f2937;border:1px solid var(--line);color:var(--ink);padding:10px 14px;border-radius:10px;cursor:pointer}
+  button.primary{background:var(--accent);color:#0b0c10;border:none;font-weight:700}
+  .hint{color:var(--muted);font-size:13px;margin-left:6px}
+  .ok{color:#66ffb7}.err{color:#ff9aa8}
+  .kbd{background:#0f1218;border:1px solid var(--line);padding:2px 6px;border-radius:6px}
+</style>
 </head>
 <body>
 <div class="wrap">
   <h1>AI Agent Builder</h1>
-  <p class="muted">Choose a scenario and (optionally) a channel to test. Click <span class="kbd">Build</span> to download an n8n workflow ready to import.</p>
+  <p class="muted">Pick a scenario (full list), optionally choose a channel, then click <span class="kbd">Build</span> to download an import-ready n8n workflow.</p>
 
   <div class="card">
     <div class="row">
       <div>
         <label for="scenario">Scenario</label>
         <select id="scenario"></select>
+        <div class="hint" id="count"></div>
       </div>
       <div>
         <label for="channel">Channel</label>
@@ -47,11 +47,11 @@
       </div>
     </div>
 
-    <details id="adv">
-      <summary>Advanced (view/edit blueprint YAML)</summary>
-      <label for="bp">Blueprint</label>
-      <textarea id="bp" spellcheck="false"></textarea>
-    </details>
+    <label for="search">Filter scenarios</label>
+    <input id="search" placeholder="Type to filter by name or scenario_id…" />
+
+    <label for="bp">Blueprint (auto-filled from your selection — editable)</label>
+    <textarea id="bp" spellcheck="false"></textarea>
 
     <div class="btnbar">
       <button id="build" class="primary">Build</button>
@@ -61,71 +61,76 @@
 </div>
 
 <script>
-  // --- 1) Scenario catalog (add more later) ------------------------------
-  const scenarios = [
-    {
-      id: 'tier1_dso_SCHEDULING_NO_SHOWS',
-      label: 'DSO – Scheduling (reduce no-shows)',
-      yaml: `version: 0.1
-scenario_id: tier1_dso_SCHEDULING_NO_SHOWS
-name: Scheduling – Reduce No-Shows
-agent_name: Scheduling Agent
-best_reply_shapes: [email]
-triggers: >
-  Regional dental groups operate 5–15 clinics. High no-show rates cause lost chair time.
-risk_notes: >
-  HIPAA/PHI; TCPA consent; quiet hours 21:00–08:00.
-how_it_works: >
-  Connect PMS; monitor schedule; reminders; confirmations; auto backfill cancellations.
-tool_stack_dev: >
-  PMS API + n8n; Email/Twilio; Google Sheets waitlist.
-roi_hypothesis: >
-  Reduce no-shows from ~18% → ~10% within 6 weeks.
-tags: [dso, scheduling, reminders, no-shows]`
-    },
-    // Example placeholder - extend later with your Sheet data if desired
-    {
-      id: 'custom',
-      label: 'Custom (paste your own)',
-      yaml: `version: 0.1
-scenario_id: custom_example
-name: Custom Agent
-agent_name: Agent
-best_reply_shapes: [email]
-triggers: >
-  Describe the operational pain here.
-how_it_works: >
-  Outline workflow steps here.
-tool_stack_dev: >
-  Tools & connectors here.`
-    }
-  ];
-
-  // --- 2) Populate selector & textarea ----------------------------------
   const $ = (id) => document.getElementById(id);
-  const statusEl = $('status');
-  const scenarioSel = $('scenario');
-  const bpTA = $('bp');
+  const statusEl = $('status'), scenarioSel = $('scenario'), searchEl = $('search'), bpTA = $('bp'), countEl = $('count');
 
-  function loadScenario(id) {
-    const s = scenarios.find(x => x.id === id) || scenarios[0];
-    bpTA.value = s.yaml;
-    if (id === 'custom') $('adv').open = true; // auto-open editor for custom
+  let ALL = []; // full list from /api/scenarios
+  let VIEW = []; // filtered
+
+  async function fetchScenarios() {
+    try {
+      const res = await fetch('/api/scenarios');
+      if (!res.ok) throw new Error('Failed to load scenarios');
+      const data = await res.json();
+      ALL = data.items || [];
+      VIEW = ALL.slice();
+      populateSelect(VIEW);
+      countEl.textContent = `Loaded ${ALL.length} scenarios`;
+    } catch (e) {
+      console.error(e);
+      statusEl.textContent = '✗ Error: Failed to load scenarios'; statusEl.className = 'hint err';
+      // minimal fallback to keep UI usable
+      ALL = [{ scenario_id:'tier1_dso_SCHEDULING_NO_SHOWS', name:'DSO – Scheduling (reduce no-shows)', agent_name:'Scheduling Agent', best_reply_shapes:'email' }];
+      VIEW = ALL.slice(); populateSelect(VIEW);
+    }
   }
 
-  function init() {
-    scenarios.forEach(s => {
+  function makeYaml(s) {
+    // auto-generate a compact YAML from row fields
+    const br = (v) => (v==null || String(v).trim()==='' ? '' : String(v));
+    return `version: 0.1
+scenario_id: ${s.scenario_id}
+name: ${br(s.name)}
+agent_name: ${br(s.agent_name || 'Agent')}
+best_reply_shapes: [${(s.best_reply_shapes||'email').toString().split(/[;, ]+/).filter(Boolean)[0]}]
+triggers: >${br('\\n  ' + (s.triggers || ''))}
+how_it_works: >${br('\\n  ' + (s.how_it_works || ''))}
+tool_stack_dev: >${br('\\n  ' + (s.tool_stack_dev || 'n8n; SMTP; Twilio'))}
+roi_hypothesis: >${br('\\n  ' + (s.roi_hypothesis || ''))}
+tags: [${(s.tags||'').toString().split(/[;,\s]+/).filter(Boolean).join(', ')}]`;
+  }
+
+  function populateSelect(list) {
+    // keep current selection if possible
+    const prev = scenarioSel.value;
+    scenarioSel.innerHTML = '';
+    list.forEach((s, idx) => {
       const opt = document.createElement('option');
-      opt.value = s.id; opt.textContent = s.label;
+      opt.value = s.scenario_id;
+      opt.textContent = `${s.name || s.scenario_id}`;
       scenarioSel.appendChild(opt);
     });
-    scenarioSel.value = scenarios[0].id;
-    loadScenario(scenarios[0].id);
-    scenarioSel.addEventListener('change', (e) => loadScenario(e.target.value));
+    const chosen = list.find(x => x.scenario_id === prev) ? prev : (list[0]?.scenario_id || '');
+    scenarioSel.value = chosen;
+    if (chosen) {
+      const s = list.find(x => x.scenario_id === chosen);
+      bpTA.value = makeYaml(s);
+    }
   }
-  init();
 
-  // --- 3) Build handler (calls /api/build or /api/compile) --------------
+  scenarioSel.addEventListener('change', () => {
+    const s = VIEW.find(x => x.scenario_id === scenarioSel.value);
+    if (s) bpTA.value = makeYaml(s);
+  });
+
+  searchEl.addEventListener('input', () => {
+    const q = searchEl.value.toLowerCase().trim();
+    VIEW = !q ? ALL.slice() :
+      ALL.filter(x => (x.name||'').toLowerCase().includes(q) || (x.scenario_id||'').toLowerCase().includes(q));
+    populateSelect(VIEW);
+    countEl.textContent = `Showing ${VIEW.length} / ${ALL.length}`;
+  });
+
   async function postBuild(body) {
     for (const path of ['/api/build', '/api/compile']) {
       const res = await fetch(path, {
@@ -144,21 +149,18 @@ tool_stack_dev: >
 
   function downloadBlob(blob, filename) {
     const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = filename;
-    document.body.appendChild(a); a.click();
-    URL.revokeObjectURL(url); a.remove();
+    const a = document.createElement('a'); a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); URL.revokeObjectURL(url); a.remove();
   }
 
   $('build').addEventListener('click', async () => {
     statusEl.textContent = 'Building…'; statusEl.className = 'hint';
-
     const body = {
       blueprint: bpTA.value,
       options: {
-        channel: $('channel').value,         // email | sms | whatsapp | call
-        reply_mode: 'none',                  // keep simple UI; can extend later
-        demoMode: false,                     // real, but templates still allowlist
+        channel: $('channel').value,       // email | sms | whatsapp | call
+        reply_mode: 'none',
+        demoMode: false,
         overrideTo: 'kevanm.spain@gmail.com',
         overrideToPhone: '+34XXXXXXXXX',
         twilio: {
@@ -168,14 +170,12 @@ tool_stack_dev: >
         }
       }
     };
-
     try {
       const res = await postBuild(body);
       const ct = (res.headers.get('content-type') || '').toLowerCase();
       const buf = await res.arrayBuffer();
       const blob = new Blob([buf], { type: ct || 'application/json' });
-      const isZip = ct.includes('zip');
-      const name = isZip ? 'agent.zip' : `${scenarioSel.value}-workflow.json`;
+      const name = ct.includes('zip') ? 'agent.zip' : `${scenarioSel.value}-workflow.json`;
       downloadBlob(blob, name);
       statusEl.textContent = `✓ Downloaded ${name}`; statusEl.className = 'hint ok';
     } catch (err) {
@@ -183,6 +183,8 @@ tool_stack_dev: >
       statusEl.textContent = `✗ ${err.message}`; statusEl.className = 'hint err';
     }
   });
+
+  fetchScenarios();
 </script>
 </body>
 </html>

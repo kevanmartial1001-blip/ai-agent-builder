@@ -5,176 +5,184 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>AI Agent Builder</title>
   <style>
-    :root { --bg:#0b0c10; --card:#151820; --ink:#e9edf1; --muted:#9aa6b2; --accent:#5eead4; --line:#232734; --btn:#1f2937; }
-    html,body { margin:0; padding:0; background:var(--bg); color:var(--ink); font:16px/1.5 system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial, sans-serif; }
-    .wrap{ max-width:1100px; margin:48px auto; padding:0 20px; }
-    h1{ margin:0 0 8px; font-size:28px; }
-    p.muted{ color:var(--muted); margin:0 0 24px; }
-    .grid{ display:grid; grid-template-columns: 2fr 1fr; gap:24px; align-items:start; }
-    .card{ background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px; }
-    textarea{ width:100%; min-height:480px; background:#0f1218; color:var(--ink); border:1px solid var(--line); border-radius:12px; padding:12px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size:14px; }
-    label{ display:block; font-weight:600; margin:14px 0 6px; }
-    select, input{ width:100%; background:#0f1218; color:var(--ink); border:1px solid var(--line); border-radius:10px; padding:10px 12px; }
-    .row{ display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
-    .btnbar{ display:flex; gap:12px; align-items:center; margin-top:16px; }
-    button{ background:var(--btn); border:1px solid var(--line); color:var(--ink); padding:10px 14px; border-radius:10px; cursor:pointer; }
-    button.primary{ background:var(--accent); color:#0b0c10; border:none; font-weight:700; }
-    .hint{ color:var(--muted); font-size:13px; margin-top:8px; }
-    .ok{ color:#60ffa6; }
-    .err{ color:#ffa6a6; }
-    .kbd{ background:#0f1218; border:1px solid var(--line); padding:2px 6px; border-radius:6px; }
+    :root { --bg:#0b0c10; --card:#141824; --ink:#e9edf1; --muted:#9aa6b2; --accent:#5eead4; --line:#232735; }
+    html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial,sans-serif}
+    .wrap{max-width:900px;margin:48px auto;padding:0 20px}
+    h1{margin:0 0 6px;font-size:28px}
+    p.muted{margin:0 0 20px;color:var(--muted)}
+    .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    label{display:block;font-weight:600;margin:12px 0 6px}
+    select,textarea{width:100%;background:#0f1218;color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+    textarea{min-height:220px;font-family:ui-monospace,Consolas,Menlo,monospace;font-size:13px}
+    .btnbar{display:flex;gap:12px;align-items:center;margin-top:14px}
+    button{background:#1f2937;border:1px solid var(--line);color:var(--ink);padding:10px 14px;border-radius:10px;cursor:pointer}
+    button.primary{background:var(--accent);color:#0b0c10;border:none;font-weight:700}
+    .hint{color:var(--muted);font-size:13px;margin-left:6px}
+    .ok{color:#66ffb7}.err{color:#ff9aa8}
+    details{margin-top:12px}
+    summary{cursor:pointer;color:var(--muted)}
+    .kbd{background:#0f1218;border:1px solid var(--line);padding:2px 6px;border-radius:6px}
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <h1>AI Agent Builder</h1>
-    <p class="muted">Paste your <strong>blueprint YAML</strong> (or JSON), choose a channel, then click <span class="kbd">Build</span> to download an import-ready n8n workflow.</p>
+<div class="wrap">
+  <h1>AI Agent Builder</h1>
+  <p class="muted">Choose a scenario and (optionally) a channel to test. Click <span class="kbd">Build</span> to download an n8n workflow ready to import.</p>
 
-    <div class="grid">
-      <!-- LEFT: Blueprint -->
-      <div class="card">
-        <textarea id="bp" spellcheck="false">version: 0.1
+  <div class="card">
+    <div class="row">
+      <div>
+        <label for="scenario">Scenario</label>
+        <select id="scenario"></select>
+      </div>
+      <div>
+        <label for="channel">Channel</label>
+        <select id="channel">
+          <option value="email" selected>Email</option>
+          <option value="sms">SMS (Twilio)</option>
+          <option value="whatsapp">WhatsApp (Twilio)</option>
+          <option value="call">Voice Call (Twilio TTS)</option>
+        </select>
+      </div>
+    </div>
+
+    <details id="adv">
+      <summary>Advanced (view/edit blueprint YAML)</summary>
+      <label for="bp">Blueprint</label>
+      <textarea id="bp" spellcheck="false"></textarea>
+    </details>
+
+    <div class="btnbar">
+      <button id="build" class="primary">Build</button>
+      <span id="status" class="hint"></span>
+    </div>
+  </div>
+</div>
+
+<script>
+  // --- 1) Scenario catalog (add more later) ------------------------------
+  const scenarios = [
+    {
+      id: 'tier1_dso_SCHEDULING_NO_SHOWS',
+      label: 'DSO – Scheduling (reduce no-shows)',
+      yaml: `version: 0.1
 scenario_id: tier1_dso_SCHEDULING_NO_SHOWS
 name: Scheduling – Reduce No-Shows
 agent_name: Scheduling Agent
 best_reply_shapes: [email]
 triggers: >
-  Regional dental groups operate 5–15 clinics…
+  Regional dental groups operate 5–15 clinics. High no-show rates cause lost chair time.
 risk_notes: >
   HIPAA/PHI; TCPA consent; quiet hours 21:00–08:00.
 how_it_works: >
-  Connect PMS; reminders; confirmations; waitlist backfill.
+  Connect PMS; monitor schedule; reminders; confirmations; auto backfill cancellations.
 tool_stack_dev: >
-  PMS API + n8n; Email (demo).
+  PMS API + n8n; Email/Twilio; Google Sheets waitlist.
 roi_hypothesis: >
-  Reduce no-shows from ~18% → ~10%.
-tags: [dso, scheduling, reminders, no-shows]</textarea>
-        <div class="btnbar">
-          <button id="build" class="primary">Build workflow</button>
-          <span id="status" class="hint"></span>
-        </div>
-      </div>
-
-      <!-- RIGHT: Options -->
-      <div class="card">
-        <label for="channel">Channel</label>
-        <select id="channel">
-          <option value="email" selected>Email</option>
-          <option value="sms">SMS (Twilio)</option>
-          <option value="whatsapp">WhatsApp (Twilio Sandbox)</option>
-          <option value="call">Voice Call (Twilio TTS)</option>
-        </select>
-
-        <label for="reply_mode">Reply mode</label>
-        <select id="reply_mode">
-          <option value="none" selected>None (use Wait/Resume)</option>
-          <option value="imap">Email IMAP (Gmail)</option>
-          <option value="webhook">Webhook (Twilio inbound)</option>
-        </select>
-
-        <label for="overrideTo">Send only to (email)</label>
-        <input id="overrideTo" value="kevanm.spain@gmail.com" />
-
-        <label for="overrideToPhone">Send only to (phone, E.164)</label>
-        <input id="overrideToPhone" value="+34XXXXXXXXX" />
-
-        <div class="row">
-          <div>
-            <label for="twilioSms">Twilio FROM (SMS)</label>
-            <input id="twilioSms" value="+13412184164" />
-          </div>
-          <div>
-            <label for="twilioVoice">Twilio FROM (Voice)</label>
-            <input id="twilioVoice" value="+13412184164" />
-          </div>
-        </div>
-
-        <label for="twilioWa">Twilio FROM (WhatsApp)</label>
-        <input id="twilioWa" value="whatsapp:+14155238886" />
-        <p class="hint">WhatsApp: make sure your phone has joined the sandbox first.</p>
-
-        <label for="demoMode">Demo Mode</label>
-        <select id="demoMode">
-          <option value="false" selected>Off – send for real (respect allowlists)</option>
-          <option value="true">On – simulate only</option>
-        </select>
-      </div>
-    </div>
-  </div>
-
-  <script>
-    const $ = (id) => document.getElementById(id);
-    const statusEl = $('status');
-
-    async function postBuild(body) {
-      // Try /api/build first; if missing, fall back to /api/compile
-      for (const path of ['/api/build', '/api/compile']) {
-        const res = await fetch(path, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body)
-        });
-        if (res.ok) return res;
-        if (res.status !== 404) {
-          const txt = await res.text().catch(()=> '');
-          throw new Error(`Build failed (${res.status}): ${txt || res.statusText}`);
-        }
-      }
-      throw new Error('No build endpoint found (tried /api/build and /api/compile).');
+  Reduce no-shows from ~18% → ~10% within 6 weeks.
+tags: [dso, scheduling, reminders, no-shows]`
+    },
+    // Example placeholder - extend later with your Sheet data if desired
+    {
+      id: 'custom',
+      label: 'Custom (paste your own)',
+      yaml: `version: 0.1
+scenario_id: custom_example
+name: Custom Agent
+agent_name: Agent
+best_reply_shapes: [email]
+triggers: >
+  Describe the operational pain here.
+how_it_works: >
+  Outline workflow steps here.
+tool_stack_dev: >
+  Tools & connectors here.`
     }
+  ];
 
-    function downloadBlob(blob, filename) {
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      URL.revokeObjectURL(url);
-      a.remove();
-    }
+  // --- 2) Populate selector & textarea ----------------------------------
+  const $ = (id) => document.getElementById(id);
+  const statusEl = $('status');
+  const scenarioSel = $('scenario');
+  const bpTA = $('bp');
 
-    $('build').addEventListener('click', async () => {
-      statusEl.textContent = 'Building…';
-      statusEl.className = 'hint';
+  function loadScenario(id) {
+    const s = scenarios.find(x => x.id === id) || scenarios[0];
+    bpTA.value = s.yaml;
+    if (id === 'custom') $('adv').open = true; // auto-open editor for custom
+  }
 
-      const blueprint = $('bp').value;
-      const options = {
-        channel: $('channel').value,
-        reply_mode: $('reply_mode').value,
-        demoMode: $('demoMode').value === 'true',
-        overrideTo: $('overrideTo').value.trim(),
-        overrideToPhone: $('overrideToPhone').value.trim(),
-        twilio: {
-          fromSms: $('twilioSms').value.trim(),
-          fromWhatsApp: $('twilioWa').value.trim(),
-          fromVoice: $('twilioVoice').value.trim(),
-        }
-      };
-
-      const body = { blueprint, options };
-
-      try {
-        const res = await postBuild(body);
-
-        // the API should return application/json (workflow) or application/zip
-        const ct = res.headers.get('content-type') || '';
-        const buf = await res.arrayBuffer();
-        const blob = new Blob([buf], { type: ct });
-
-        // set filename according to content type
-        const isZip = ct.includes('zip');
-        const filename = isZip ? 'agent.zip' : 'agent-workflow.json';
-
-        downloadBlob(blob, filename);
-        statusEl.textContent = `✓ Downloaded ${filename}`;
-        statusEl.className = 'hint ok';
-      } catch (err) {
-        console.error(err);
-        statusEl.textContent = `✗ ${err.message}`;
-        statusEl.className = 'hint err';
-      }
+  function init() {
+    scenarios.forEach(s => {
+      const opt = document.createElement('option');
+      opt.value = s.id; opt.textContent = s.label;
+      scenarioSel.appendChild(opt);
     });
-  </script>
+    scenarioSel.value = scenarios[0].id;
+    loadScenario(scenarios[0].id);
+    scenarioSel.addEventListener('change', (e) => loadScenario(e.target.value));
+  }
+  init();
+
+  // --- 3) Build handler (calls /api/build or /api/compile) --------------
+  async function postBuild(body) {
+    for (const path of ['/api/build', '/api/compile']) {
+      const res = await fetch(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      if (res.ok) return res;
+      if (res.status !== 404) {
+        const txt = await res.text().catch(()=> '');
+        throw new Error(`Build failed (${res.status}): ${txt || res.statusText}`);
+      }
+    }
+    throw new Error('No build endpoint found.');
+  }
+
+  function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click();
+    URL.revokeObjectURL(url); a.remove();
+  }
+
+  $('build').addEventListener('click', async () => {
+    statusEl.textContent = 'Building…'; statusEl.className = 'hint';
+
+    const body = {
+      blueprint: bpTA.value,
+      options: {
+        channel: $('channel').value,         // email | sms | whatsapp | call
+        reply_mode: 'none',                  // keep simple UI; can extend later
+        demoMode: false,                     // real, but templates still allowlist
+        overrideTo: 'kevanm.spain@gmail.com',
+        overrideToPhone: '+34XXXXXXXXX',
+        twilio: {
+          fromSms: '+13412184164',
+          fromWhatsApp: 'whatsapp:+14155238886',
+          fromVoice: '+13412184164'
+        }
+      }
+    };
+
+    try {
+      const res = await postBuild(body);
+      const ct = (res.headers.get('content-type') || '').toLowerCase();
+      const buf = await res.arrayBuffer();
+      const blob = new Blob([buf], { type: ct || 'application/json' });
+      const isZip = ct.includes('zip');
+      const name = isZip ? 'agent.zip' : `${scenarioSel.value}-workflow.json`;
+      downloadBlob(blob, name);
+      statusEl.textContent = `✓ Downloaded ${name}`; statusEl.className = 'hint ok';
+    } catch (err) {
+      console.error(err);
+      statusEl.textContent = `✗ ${err.message}`; statusEl.className = 'hint err';
+    }
+  });
+</script>
 </body>
 </html>

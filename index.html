@@ -18,6 +18,7 @@
   textarea{min-height:160px;font-family:ui-monospace,Consolas,Menlo,monospace;font-size:13px}
   button{cursor:pointer} .primary{background:var(--accent);color:#0b0c10;border:none;font-weight:700}
   .hint{color:var(--muted);font-size:13px}
+  /* suggestions */
   #suggestions{position:relative}
   .suggest-box{position:absolute;left:0;right:0;background:#0f1218;border:1px solid var(--line);border-radius:10px;margin-top:6px;max-height:260px;overflow:auto;z-index:10}
   .suggest-item{padding:8px 10px;cursor:pointer;display:flex;gap:8px;align-items:baseline}
@@ -68,7 +69,7 @@
 <script>
 /* ===== State & helpers ===== */
 const $ = id => document.getElementById(id);
-const statusBar = $('statusBar'), statusText = $('statusText'), statusSub = $('statusSub'), countsEl = $('counts');
+const statusText = $('statusText'), statusSub = $('statusSub'), countsEl = $('counts');
 const scenarioSel = $('scenario'), channelSel = $('channel'), searchEl = $('search'), suggestWrap = $('suggestions'), bpTA = $('bp');
 
 let ALL = [], MAP = {};
@@ -160,30 +161,7 @@ $('search').addEventListener('keydown', (e)=>{
   }
 });
 
-/* ===== data fetch ===== */
-async function bootstrap(){
-  try{
-    const [sc, ind] = await Promise.all([getJSON('/api/scenarios'), getJSON('/api/industries')]);
-    if (!sc.ok || !sc.json?.ok) throw new Error(sc.json?.error || 'scenarios api');
-    if (!ind.ok || !ind.json?.ok) throw new Error(ind.json?.error || 'industries api');
-    ALL = (sc.json.items || []).map(x => ({ ...x, best_reply_shapes: listify(x.best_reply_shapes), tags: listify(x.tags) }));
-    MAP = Object.fromEntries(ALL.map(x => [x.scenario_id, x]));
-    INDUSTRIES = (ind.json.items || []);
-    IND_MAP = Object.fromEntries(INDUSTRIES.map(it => [norm(it.industry_id || ''), it]));
-    ok('Loaded', `${ALL.length} scenarios • ${INDUSTRIES.length} industries`);
-    populateUI(ALL);
-  }catch(e){
-    err('Data load failed — demo fallback', e.message || '');
-    const fallbackS = { scenario_id:'tier1_dso_SCHEDULING_NO_SHOWS', name:'dental', agent_name:'Scheduling Agent', best_reply_shapes:['sms','email'], how_it_works:'Remind, confirm, backfill.', roi_hypothesis:'Reduce no-shows 30%+' };
-    const fallbackI = { industry_id:'dental', painpoints:'no-shows; front-desk overload', kpis:'no-show rate; utilization', channels:'sms; whatsapp', vocabulary:'patient, chair time' };
-    ALL = [fallbackS]; MAP = { [fallbackS.scenario_id]: fallbackS };
-    INDUSTRIES = [fallbackI]; IND_MAP = { [norm(fallbackI.industry_id)]: fallbackI };
-    populateUI(ALL);
-  }
-}
-scenarioSel.addEventListener('change', () => applyScenario(scenarioSel.value));
-<script>
-/* ===== data fetch (FIX) ===== */
+/* ===== data fetch (FIXED bootstrap) ===== */
 async function bootstrap(){
   try{
     const [sc, ind] = await Promise.all([
@@ -205,12 +183,8 @@ async function bootstrap(){
     INDUSTRIES = (ind.json.items || []);
     IND_MAP = Object.fromEntries(INDUSTRIES.map(it => [norm(it.industry_id || ''), it]));
 
-    // Populate UI
     ok('Loaded', `${ALL.length} scenarios • ${INDUSTRIES.length} industries`);
     populateUI(ALL);
-
-    // Show initial suggestions on focus
-    document.getElementById('search').addEventListener('focus', e => renderSuggestions(e.target.value));
   } catch (e){
     // Fallback demo so you can still test
     err('Data load failed — demo fallback', e.message || '');
@@ -234,7 +208,7 @@ async function bootstrap(){
     populateUI(ALL);
   }
 }
-</script>
+scenarioSel.addEventListener('change', () => applyScenario(scenarioSel.value));
 
 /* ===== inference ===== */
 function pickTemplate(s, industry){
@@ -349,7 +323,7 @@ function llmNodes(wf, prompt){
 }
 
 /* ===== Templates ===== */
-// 1) Scheduling
+// Scheduling
 function wfScheduling(s, industry){
   const modules = deriveModulesFromNarrative(s, industry);
   const wf = wfSkeleton(`${s.scenario_id} – ${s.agent_name || 'Scheduling Agent'} (Demo)`);
@@ -362,7 +336,7 @@ function wfScheduling(s, industry){
   const HOW=(s.how_it_works||'').replace(/`/g,'\\`'), ROI=(s.roi_hypothesis||'').replace(/`/g,'\\`'), PAI=(industry?.painpoints||'').replace(/`/g,'\\`');
   node(wf.nodes,"Compose Message","n8n-nodes-base.function",[-720,-20],{functionCode:
 `const a=items[0].json.appointments[0];
-const d=new Date(a.time), ds=d.toLocaleDateString(), ts=d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+const d=new Date(a.time), ds=d.toLocaleDateString(), ts=d.toLocaleTimeString([],{hour:'2-digit', minute:'2-digit'});
 const ctx=[\`${HOW}\`,\`${ROI}\`,\`${PAI}\`].filter(Boolean).join(' ');
 return [{ json:{
   to:"kevanm.spain@gmail.com", toPhone:"+34XXXXXXXXX",
@@ -391,7 +365,7 @@ return [{ json:{ intent } }];`});
   }
   return wf;
 }
-// 2) Billing
+// Billing
 function wfBilling(s, industry){
   const modules = deriveModulesFromNarrative(s, industry);
   const wf = wfSkeleton(`${s.scenario_id} – ${s.agent_name || 'Billing Agent'} (Demo)`);
@@ -423,13 +397,12 @@ return [{ json:{ intent } }];`});
   link(wf.connections,"Wait for Reply","Parse Intent");
   node(wf.nodes,"Update AR (Mock)","n8n-nodes-base.function",[760,-20],{functionCode:`console.log('[AR] update →', $json.intent); return items;`});
   link(wf.connections,"Parse Intent","Update AR (Mock)");
-  // Follow-up cadence (mock)
   node(wf.nodes,"Follow-up (Mock)","n8n-nodes-base.function",[1000,-20],{functionCode:
 `if ($json.intent==='PLAN') console.log('send plan options'); if ($json.intent==='DISPUTE') console.log('create ticket'); return items;`});
   link(wf.connections,"Update AR (Mock)","Follow-up (Mock)");
   return wf;
 }
-// 3) Lead Qualification
+// Lead
 function wfLead(s, industry){
   const modules = deriveModulesFromNarrative(s, industry);
   const wf = wfSkeleton(`${s.scenario_id} – ${s.agent_name || 'Lead Agent'} (Demo)`);
@@ -475,7 +448,7 @@ function buildWorkflowJSON(s) {
 /* ===== Download ===== */
 function downloadJSON(obj, filename){ const txt=JSON.stringify(obj,null,2); const blob=new Blob([txt],{type:'application/json'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=filename; document.body.appendChild(a); a.click(); URL.revokeObjectURL(url); a.remove(); }
 
-/* ===== Boot ===== */
+/* ===== Boot & events ===== */
 $('build').addEventListener('click', () => {
   const sid = (scenarioSel.value || '').trim(); const s = MAP[sid];
   if (!s) { err('No scenario selected'); return; }
@@ -483,6 +456,9 @@ $('build').addEventListener('click', () => {
   downloadJSON(wf, `${sid}-workflow.json`);
   ok('✓ Downloaded workflow', `${sid}-workflow.json`);
 });
+scenarioSel.addEventListener('change', () => applyScenario(scenarioSel.value));
+
+// Kick off
 bootstrap();
 </script>
 </body>

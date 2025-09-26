@@ -18,13 +18,13 @@
   textarea{min-height:160px;font-family:ui-monospace,Consolas,Menlo,monospace;font-size:13px}
   button{cursor:pointer} .primary{background:var(--accent);color:#0b0c10;border:none;font-weight:700}
   .hint{color:var(--muted);font-size:13px}
-  /* suggestions */
   #suggestions{position:relative}
   .suggest-box{position:absolute;left:0;right:0;background:#0f1218;border:1px solid var(--line);border-radius:10px;margin-top:6px;max-height:260px;overflow:auto;z-index:10}
   .suggest-item{padding:8px 10px;cursor:pointer;display:flex;gap:8px;align-items:baseline}
   .suggest-item:hover{background:#121826}
   .suggest-id{font-family:ui-monospace,Consolas,Menlo,monospace;font-size:12px}
   .suggest-name{color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .dbg{font:12px/1.4 ui-monospace,Consolas,monospace;color:#aaa;margin-top:8px;word-break:break-word}
 </style>
 </head>
 <body>
@@ -39,7 +39,7 @@
     <div class="row">
       <div>
         <label for="scenario">Scenario (<code>scenario_id</code>)</label>
-        <select id="scenario"></select>
+        <select id="scenario"><option value="">Loading…</option></select>
       </div>
       <div>
         <label for="channel">Channel (auto)</label>
@@ -63,68 +63,90 @@
       <button id="build" class="primary">Download n8n JSON</button>
       <div class="hint" id="buildHint">Imports directly in n8n</div>
     </div>
+    <div id="dbg" class="dbg"></div>
   </div>
 </div>
 
 <script>
-/* ===== State & helpers ===== */
+/* ================== tiny helpers ================== */
 const $ = id => document.getElementById(id);
 const statusText = $('statusText'), statusSub = $('statusSub'), countsEl = $('counts');
-const scenarioSel = $('scenario'), channelSel = $('channel'), searchEl = $('search'), suggestWrap = $('suggestions'), bpTA = $('bp');
+const scenarioSel = $('scenario'), channelSel = $('channel'), searchEl = $('search'), suggestWrap = $('suggestions'), bpTA = $('bp'), dbg = $('dbg');
 
 let ALL = [], MAP = {};
 let INDUSTRIES = [], IND_MAP = {};
-const listify = v => Array.isArray(v) ? v : String(v || '').split(/[;,|\n|\|]+/).map(x=>x.trim()).filter(Boolean);
-const norm = t => (t || '').toLowerCase();
-const wants = (t, ...words) => { t = norm(t); return words.some(w => t.includes(w)); };
+
+const listify = v => Array.isArray(v) ? v : String(v ?? '')
+  .replace(/^\[|\]$/g,'')  // tolerate "['a','b']" or "[a,b]"
+  .split(/[;,|\n|\|,]+/)
+  .map(x=>x.replace(/^['"]|['"]$/g,'').trim())
+  .filter(Boolean);
+
+const norm = t => (t||'').toLowerCase();
 const ok = (t,sub='') => { statusText.textContent=t; statusSub.textContent=sub; statusText.className='ok'; };
 const err= (t,sub='') => { statusText.textContent=t; statusSub.textContent=sub; statusText.className='err'; };
+function logDbg(...a){ dbg.textContent = a.map(x=> typeof x==='string'?x:JSON.stringify(x)).join(' | '); }
 
-/* ===== API ===== */
-async function getJSON(url){ const r = await fetch(url); const text = await r.text(); try{ return { ok:r.ok, status:r.status, json: JSON.parse(text), raw:text }; } catch{ return { ok:r.ok, status:r.status, json:null, raw:text }; } }
+/* ================== fetch with no-store ================== */
+async function getJSON(url){
+  const r = await fetch(url, { cache: 'no-store' });
+  const raw = await r.text();
+  try { return { ok:r.ok, status:r.status, json: JSON.parse(raw), raw }; }
+  catch { return { ok:r.ok, status:r.status, json:null, raw }; }
+}
 
-/* ===== Channel recommendation ===== */
+/* ================== channel recommendation ================== */
 function recommendedChannel(row) {
   const shapes = listify(row.best_reply_shapes).map(x=>x.toLowerCase());
-  const set = new Set(shapes.map(s => s.includes('whatsapp')?'whatsapp': s.includes('sms')||s.includes('text')?'sms': s.includes('voice')||s.includes('call')?'call': s.includes('email')?'email':s));
+  const set = new Set(shapes.map(s =>
+    s.includes('whatsapp')?'whatsapp':
+    (s.includes('sms')||s.includes('text'))?'sms':
+    (s.includes('voice')||s.includes('call'))?'call':
+    s.includes('email')?'email':s));
   if (set.has('sms')) return 'sms';
   if (set.has('whatsapp')) return 'whatsapp';
   if (set.has('email')) return 'email';
   if (set.has('call')) return 'call';
-  const hay = ((row.name || '') + ' ' + (row.tags || []).join(' ')).toLowerCase();
-  if (hay.includes('schedule') || hay.includes('appointment') || hay.includes('no-show')) return 'sms';
   return 'email';
 }
 
-/* ===== Industry match & preview ===== */
+/* ================== industry + preview ================== */
 function matchIndustryForScenario(s) { const key = norm(s.name || ''); return IND_MAP[key] || null; }
 function previewYaml(s, industry) {
   const br = v => (v==null || String(v).trim()==='' ? '' : String(v));
   const brList = arr => `[${listify(arr).join(', ')}]`;
   const ind = industry ? `
 industry_id: ${industry.industry_id}
-industry_painpoints: ${br((industry.painpoints||''))}
-industry_channels: ${br((industry.channels||''))}
-industry_kpis: ${br((industry.kpis||''))}` : '';
+industry_painpoints: ${(industry.core_pains||industry.painpoints||'').toString().slice(0,220)}...` : '';
   return `scenario_id: ${s.scenario_id}
 name: ${br(s.name)}
 agent_name: ${br(s.agent_name || 'Agent')}
 best_reply_shapes: ${brList(s.best_reply_shapes)}
-triggers: >${br('\\n  ' + (s.triggers || ''))}
-how_it_works: >${br('\\n  ' + (s.how_it_works || ''))}
-tool_stack_dev: >${br('\\n  ' + (s.tool_stack_dev || ''))}
-risk_notes: >${br('\\n  ' + (s.risk_notes || ''))}
-roi_hypothesis: >${br('\\n  ' + (s.roi_hypothesis || ''))}
+triggers: >
+  ${br(s.triggers || '')}
+how_it_works: >
+  ${br(s.how_it_works || '')}
+roi_hypothesis: >
+  ${br(s.roi_hypothesis || '')}
 tags: [${listify(s.tags).join(', ')}]${ind}`;
 }
 
-/* ===== UI wiring ===== */
+/* ================== UI wiring ================== */
 function populateUI(list) {
   scenarioSel.innerHTML = '';
-  list.forEach(s => { const opt=document.createElement('option'); opt.value=s.scenario_id; opt.textContent=s.scenario_id; opt.title=s.name||s.scenario_id; scenarioSel.appendChild(opt); });
+  const frag = document.createDocumentFragment();
+  list.forEach(s => {
+    const opt=document.createElement('option');
+    opt.value=s.scenario_id;
+    opt.textContent=s.scenario_id;
+    opt.title=s.name||s.scenario_id;
+    frag.appendChild(opt);
+  });
+  scenarioSel.appendChild(frag);
   countsEl.textContent = `Loaded ${ALL.length} scenarios • ${INDUSTRIES.length} industries`;
   if (list.length) applyScenario(list[0].scenario_id);
 }
+
 function applyScenario(id) {
   const s = MAP[id] || ALL.find(x => x.scenario_id === id);
   if (!s) return;
@@ -134,19 +156,24 @@ function applyScenario(id) {
   bpTA.value = previewYaml(s, industry);
 }
 
-/* ===== suggestions (no datalist) ===== */
 function renderSuggestions(q=''){
   if (!ALL.length) { suggestWrap.innerHTML=''; return; }
   const needle = q.trim().toLowerCase();
   let matches = ALL;
-  if (needle) matches = ALL.filter(s => s.scenario_id.toLowerCase().includes(needle) || (s.name||'').toLowerCase().includes(needle));
+  if (needle) matches = ALL.filter(s =>
+    (s.scenario_id||'').toLowerCase().includes(needle) ||
+    (s.name||'').toLowerCase().includes(needle));
   matches = matches.slice(0, 50);
   if (!matches.length){ suggestWrap.innerHTML=''; return; }
   const box = document.createElement('div'); box.className = 'suggest-box';
   box.innerHTML = matches.map(m => `<div class="suggest-item" data-id="${m.scenario_id}">
-    <span class="suggest-id">${m.scenario_id}</span><span class="suggest-name">${(m.name||'').replace(/</g,'&lt;')}</span>
+    <span class="suggest-id">${m.scenario_id}</span>
+    <span class="suggest-name">${(m.name||'').replace(/</g,'&lt;')}</span>
   </div>`).join('');
-  box.addEventListener('click', (e)=>{ const el=e.target.closest('.suggest-item'); if(!el)return; const id=el.getAttribute('data-id'); if(MAP[id]){ $('search').value=id; applyScenario(id); suggestWrap.innerHTML=''; }});
+  box.addEventListener('click', (e)=>{
+    const el=e.target.closest('.suggest-item'); if(!el)return;
+    const id=el.getAttribute('data-id'); if(MAP[id]){ $('search').value=id; applyScenario(id); suggestWrap.innerHTML=''; }
+  });
   suggestWrap.innerHTML = ''; suggestWrap.appendChild(box);
 }
 $('search').addEventListener('focus', e => renderSuggestions(e.target.value));
@@ -156,48 +183,76 @@ $('search').addEventListener('keydown', (e)=>{
   if (e.key === 'Enter'){
     const v = e.target.value.trim();
     if (MAP[v]) { applyScenario(v); suggestWrap.innerHTML=''; return; }
-    const first = ALL.find(s => s.scenario_id.toLowerCase().includes(v.toLowerCase()) || (s.name||'').toLowerCase().includes(v.toLowerCase()));
+    const first = ALL.find(s =>
+      (s.scenario_id||'').toLowerCase().includes(v.toLowerCase()) ||
+      (s.name||'').toLowerCase().includes(v.toLowerCase()));
     if (first){ e.target.value = first.scenario_id; applyScenario(first.scenario_id); suggestWrap.innerHTML=''; }
   }
 });
+scenarioSel.addEventListener('change', () => applyScenario(scenarioSel.value));
 
-/* ===== data fetch (FIXED bootstrap) ===== */
+/* ================== bootstrap (defensive) ================== */
 async function bootstrap(){
   try{
     const [sc, ind] = await Promise.all([
       getJSON('/api/scenarios'),
-      getJSON('/api/industries')
+      getJSON('/api/industries'),
     ]);
 
-    if (!sc.ok || !sc.json?.ok) throw new Error(sc.json?.error || `scenarios api ${sc.status}`);
-    if (!ind.ok || !ind.json?.ok) throw new Error(ind.json?.error || `industries api ${ind.status}`);
+    if (!sc.ok || !sc.json || sc.json.ok === false) {
+      throw new Error(sc.json?.error || `scenarios api ${sc.status}`);
+    }
+    if (!ind.ok || !ind.json || ind.json.ok === false) {
+      throw new Error(ind.json?.error || `industries api ${ind.status}`);
+    }
 
-    // Normalize data
-    ALL = (sc.json.items || []).map(x => ({
-      ...x,
+    const sitems = Array.isArray(sc.json.items) ? sc.json.items : [];
+    const iitems = Array.isArray(ind.json.items) ? ind.json.items : [];
+
+    // Normalize scenarios
+    ALL = sitems.map(x => ({
+      scenario_id: x.scenario_id || '',
+      name: x.name || '',
+      triggers: x.triggers || '',
       best_reply_shapes: listify(x.best_reply_shapes),
-      tags: listify(x.tags)
-    }));
+      risk_notes: x.risk_notes || '',
+      agent_name: x.agent_name || '',
+      how_it_works: x.how_it_works || '',
+      tool_stack_dev: x.tool_stack_dev || '',
+      tool_stack_autonomous: x.tool_stack_autonomous || '',
+      tags: listify(x.tags || x['tags (;)'] || '')
+    })).filter(s => s.scenario_id);
+
     MAP = Object.fromEntries(ALL.map(x => [x.scenario_id, x]));
 
-    INDUSTRIES = (ind.json.items || []);
-    IND_MAP = Object.fromEntries(INDUSTRIES.map(it => [norm(it.industry_id || ''), it]));
+    // Normalize industries
+    INDUSTRIES = iitems.map(it => ({
+      industry_id: it.industry_id || it.name || '',
+      painpoints: it.core_pains || it.painpoints || '',
+      kpis: it.success_metrics || it.kpi_examples || '',
+      channels: it.channels || it.core_channels || '',
+      vocabulary: it.agent_language_prompt || ''
+    })).filter(i => i.industry_id);
+
+    IND_MAP = Object.fromEntries(INDUSTRIES.map(it => [norm(it.industry_id), it]));
 
     ok('Loaded', `${ALL.length} scenarios • ${INDUSTRIES.length} industries`);
+    logDbg(`/api/scenarios -> ${ALL.length}`, `/api/industries -> ${INDUSTRIES.length}`);
     populateUI(ALL);
   } catch (e){
-    // Fallback demo so you can still test
-    err('Data load failed — demo fallback', e.message || '');
+    err('Data load failed', e.message || String(e));
+    logDbg('ERROR', e && (e.stack || e.message || String(e)));
+    // Minimal fallback so UI still works
     const fallbackS = {
       scenario_id:'tier1_dso_SCHEDULING_NO_SHOWS',
-      name:'dental',
+      name:'tier1_dso',
       agent_name:'Scheduling Agent',
       best_reply_shapes:['sms','email'],
       how_it_works:'Remind, confirm, backfill.',
       roi_hypothesis:'Reduce no-shows 30%+'
     };
     const fallbackI = {
-      industry_id:'dental',
+      industry_id:'tier1_dso',
       painpoints:'no-shows; front-desk overload',
       kpis:'no-show rate; utilization',
       channels:'sms; whatsapp',
@@ -208,9 +263,8 @@ async function bootstrap(){
     populateUI(ALL);
   }
 }
-scenarioSel.addEventListener('change', () => applyScenario(scenarioSel.value));
 
-/* ===== inference ===== */
+/* ================== builder (same as earlier) ================== */
 function pickTemplate(s, industry){
   const text = [s.scenario_id, s.name, s.triggers, s.how_it_works, s.roi_hypothesis, ...(s.tags||[]), industry?.painpoints, industry?.kpis]
     .filter(Boolean).join(' ').toLowerCase();
@@ -230,41 +284,26 @@ function deriveModulesFromNarrative(s, industry){
   if (!mods.size) mods.add('ReminderFlow');
   return [...mods];
 }
-function parseTools(s){
-  const t = norm(s.tool_stack_dev || '');
-  return { hasTwilio:/twilio/.test(t), hasSlack:/slack/.test(t), hasGCal:/google calendar|gcal/.test(t), hasAirtable:/airtable/.test(t), hasNotion:/notion/.test(t) };
-}
-
-/* ===== LLM prompt ===== */
-function buildLLMPrompt(s, industry, modules, templateKey){
+function buildLLMPrompt(s, industry, modules, key){
   const role = (s.agent_name || 'Agent').trim();
   const sector = industry?.industry_id || (s.name || 'industry');
   const how = (s.how_it_works || '').trim();
   const roi = (s.roi_hypothesis || '').trim();
   const pains = industry?.painpoints || '';
   const kpis = industry?.kpis || '';
-  const vocab = (industry?.vocabulary || '').trim();
-  const goalsByT = {
-    scheduling: ['reduce no-shows','maximize utilization','minimize manual follow-ups'],
-    billing: ['collect payment quickly','reduce DSO/aging','keep tone friendly & compliant'],
-    lead: ['qualify fast','book discovery/screening','capture contact & intent']
-  };
-  const goals = goalsByT[templateKey] || ['assist user outcome'];
+  const goals = { scheduling:['reduce no-shows','maximize utilization'], billing:['collect payment faster','reduce DSO'], lead:['qualify fast','book a call'] }[key] || [];
   return [
 `You are a ${role} for the ${sector} sector.`,
 `How it works: ${how || 'N/A'}`,
 `ROI hypothesis: ${roi || 'N/A'}`,
 industry ? `Industry painpoints: ${pains || 'N/A'}` : null,
 industry ? `Industry KPIs: ${kpis || 'N/A'}` : null,
-industry && vocab ? `Vocabulary/style: ${vocab}` : null,
 `Enabled modules: ${modules.join(', ')}`,
 `Objectives: ${goals.join('; ')}`,
-`Rules: be concise, warm, action-oriented; respect consent/opt-out; for SMS/WA, keep <=320 chars; for voice, short TTS.`,
+`Rules: concise, warm; honor consent/opt-out; SMS/WA ≤320 chars; voice short TTS.`,
 `Output one message string for the selected channel.`
   ].filter(Boolean).join('\n');
 }
-
-/* ===== workflow helpers ===== */
 function wfSkeleton(name){ return { name, nodes:[], connections:{}, active:false, settings:{}, staticData:null, pinData:{} }; }
 function node(nodes, name, type, pos, params={}, extra={}){ nodes.push({ name, type, typeVersion:(/manualTrigger|wait$/.test(type)?1:2), position:pos, parameters:params, ...extra }); }
 function link(conns, a,b){ conns[a] ||= { main:[[]] }; conns[a].main[0].push({ node:b, type:"main", index:0 }); }
@@ -291,10 +330,10 @@ function branchChannels(wf, s){
   link(wf.connections, "Compose Message","Channel = SMS?");
   link(wf.connections, "Compose Message","Channel = WhatsApp?");
   link(wf.connections, "Compose Message","Channel = Call?");
-  // Email path
+  // Email
   node(wf.nodes,"Email Allowlist","n8n-nodes-base.function",[-340,-240],{functionCode:"const cfg=$items('Set Config',0,0).json;const to=$json.to||'';const ok=(cfg.allowedRecipients||[]).includes(to);return [{json:{ok}}];"});
   node(wf.nodes,"Email Allowed?","n8n-nodes-base.if",[-180,-240],{conditions:{boolean:[{value1:"={{$item(0).$node['Email Allowlist'].json.ok}}"}]} );
-  node(wf.nodes,"Email Send","n8n-nodes-base.emailSend",[0,-240],{fromEmail:"",toEmail:"={{$json['to']}}",subject:"={{$json['subject']}}",text:"={{$json['text']}}",options:{ senderName:"Agent" }},{notes:"Pick SMTP credential when demoMode=false"});
+  node(wf.nodes,"Email Send","n8n-nodes-base.emailSend",[0,-240],{fromEmail:"",toEmail:"={{$json['to']}}",subject:"={{$json['subject']}}",text:"={{$json['text']}}",options:{ senderName:"Agent" }},{notes:"Pick SMTP credentials when demoMode=false"});
   link(wf.connections,"Channel = Email?","Email Allowlist"); wf.connections["Channel = Email?"].main[1]=[];
   link(wf.connections,"Email Allowlist","Email Allowed?"); link(wf.connections,"Email Allowed?","Email Send"); wf.connections["Email Allowed?"].main[1]=[{node:"Wait for Reply",type:"main",index:0}];
   // SMS
@@ -321,9 +360,6 @@ function llmNodes(wf, prompt){
   node(wf.nodes,"OpenAI Chat (disabled)","n8n-nodes-base.openAi",[-480,-200],{operation:"chat",model:"gpt-4o-mini",additionalFields:{systemMessage:"={{$json.prompt}}"}},{disabled:true,credentials:{openAiApi:{name:"openai-default"}}});
   link(wf.connections,"LLM Prompt","OpenAI Chat (disabled)");
 }
-
-/* ===== Templates ===== */
-// Scheduling
 function wfScheduling(s, industry){
   const modules = deriveModulesFromNarrative(s, industry);
   const wf = wfSkeleton(`${s.scenario_id} – ${s.agent_name || 'Scheduling Agent'} (Demo)`);
@@ -358,14 +394,11 @@ return [{ json:{ intent } }];`});
   link(wf.connections,"Wait for Reply","Parse Intent");
   node(wf.nodes,"Update PMS (Mock)","n8n-nodes-base.function",[760,-20],{functionCode:`console.log('[PMS] schedule →', $json.intent); return items;`});
   link(wf.connections,"Parse Intent","Update PMS (Mock)");
-  if (modules.includes('Waitlist')){
-    node(wf.nodes,"Fill Slot (Mock)","n8n-nodes-base.function",[1000,-20],{functionCode:
+  node(wf.nodes,"Fill Slot (Mock)","n8n-nodes-base.function",[1000,-20],{functionCode:
 `if ($json.intent==='CANCEL'||$json.intent==='RESCHEDULE'){ console.log('[WAITLIST] backfill'); return [{json:{filled:true}}]; } return [{json:{skipped:true}}];`});
-    link(wf.connections,"Update PMS (Mock)","Fill Slot (Mock)");
-  }
+  link(wf.connections,"Update PMS (Mock)","Fill Slot (Mock)");
   return wf;
 }
-// Billing
 function wfBilling(s, industry){
   const modules = deriveModulesFromNarrative(s, industry);
   const wf = wfSkeleton(`${s.scenario_id} – ${s.agent_name || 'Billing Agent'} (Demo)`);
@@ -402,7 +435,6 @@ return [{ json:{ intent } }];`});
   link(wf.connections,"Update AR (Mock)","Follow-up (Mock)");
   return wf;
 }
-// Lead
 function wfLead(s, industry){
   const modules = deriveModulesFromNarrative(s, industry);
   const wf = wfSkeleton(`${s.scenario_id} – ${s.agent_name || 'Lead Agent'} (Demo)`);
@@ -435,20 +467,21 @@ return [{ json:{ intent } }];`});
   link(wf.connections,"Parse Intent","Route (Mock)");
   return wf;
 }
-
-/* ===== Builder ===== */
 function buildWorkflowJSON(s) {
   const industry = matchIndustryForScenario(s);
   const key = pickTemplate(s, industry);
   if (key==='billing') return wfBilling(s, industry);
   if (key==='lead')    return wfLead(s, industry);
-  return wfScheduling(s, industry); // default
+  return wfScheduling(s, industry);
 }
 
-/* ===== Download ===== */
-function downloadJSON(obj, filename){ const txt=JSON.stringify(obj,null,2); const blob=new Blob([txt],{type:'application/json'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=filename; document.body.appendChild(a); a.click(); URL.revokeObjectURL(url); a.remove(); }
-
-/* ===== Boot & events ===== */
+/* ================== download ================== */
+function downloadJSON(obj, filename){
+  const txt=JSON.stringify(obj,null,2);
+  const blob=new Blob([txt],{type:'application/json'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a'); a.href=url; a.download=filename; document.body.appendChild(a); a.click(); URL.revokeObjectURL(url); a.remove();
+}
 $('build').addEventListener('click', () => {
   const sid = (scenarioSel.value || '').trim(); const s = MAP[sid];
   if (!s) { err('No scenario selected'); return; }
@@ -456,9 +489,8 @@ $('build').addEventListener('click', () => {
   downloadJSON(wf, `${sid}-workflow.json`);
   ok('✓ Downloaded workflow', `${sid}-workflow.json`);
 });
-scenarioSel.addEventListener('change', () => applyScenario(scenarioSel.value));
 
-// Kick off
+/* ================== go ================== */
 bootstrap();
 </script>
 </body>

@@ -21,6 +21,17 @@
   .hint{color:var(--muted);font-size:13px;margin-left:6px}
   .ok{color:#66ffb7}.err{color:#ff9aa8}
   small.badge{background:#0f1218;border:1px solid var(--line);border-radius:8px;padding:2px 6px;margin-left:6px;color:var(--muted)}
+
+  /* suggestions panel */
+  #suggestions{position:relative}
+  .suggest-box{
+    position:absolute; left:0; right:0; background:#0f1218; border:1px solid var(--line);
+    border-radius:10px; margin-top:6px; max-height:260px; overflow:auto; z-index:10
+  }
+  .suggest-item{ padding:8px 10px; cursor:pointer; display:flex; gap:8px; align-items:baseline }
+  .suggest-item:hover{ background:#121826 }
+  .suggest-id{ font-family:ui-monospace,Consolas,Menlo,monospace; font-size:12px; color:var(--ink) }
+  .suggest-name{ color:var(--muted); font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
 </style>
 </head>
 <body>
@@ -46,8 +57,8 @@
     </div>
 
     <label for="search">Search by <code>scenario_id</code></label>
-    <input id="search" list="scenarioIds" placeholder="e.g. tier1_dso_SCHEDULING_NO_SHOWS" />
-    <datalist id="scenarioIds"></datalist>
+    <input id="search" placeholder="e.g. tier1_dso_SCHEDULING_NO_SHOWS" autocomplete="off" />
+    <div id="suggestions"></div>
 
     <label for="bp">Preview (sheet + industry)</label>
     <textarea id="bp" spellcheck="false" readonly></textarea>
@@ -63,17 +74,15 @@
 /* ---------- state & utils ---------- */
 const $ = id => document.getElementById(id);
 const statusEl = $('status'), scenarioSel = $('scenario'), channelSel = $('channel');
-const searchEl = $('search'), bpTA = $('bp'), datalist = $('scenarioIds'), loadedCount = $('loadedCount');
+const searchEl = $('search'), bpTA = $('bp'), loadedCount = $('loadedCount');
+const suggestWrap = document.getElementById('suggestions');
 
 let ALL = [], MAP = {};
 let INDUSTRIES = [], IND_MAP = {};
 
 const listify = v => Array.isArray(v) ? v : String(v || '').split(/[;,|\n|\|]+/).map(x=>x.trim()).filter(Boolean);
 const norm = t => (t || '').toLowerCase();
-const wants = (t, ...words) => {
-  t = norm(t);
-  return words.some(w => t.includes(w));
-};
+const wants = (t, ...words) => { t = norm(t); return words.some(w => t.includes(w)); };
 
 function recommendedChannel(row) {
   const shapes = listify(row.best_reply_shapes);
@@ -123,19 +132,12 @@ function populateUI(list) {
     opt.title = s.name || s.scenario_id;
     scenarioSel.appendChild(opt);
   });
-  datalist.innerHTML = '';
-  ALL.forEach(s => {
-    const o = document.createElement('option');
-    o.value = s.scenario_id;
-    o.label = s.name || s.scenario_id;
-    datalist.appendChild(o);
-  });
   loadedCount.textContent = `Loaded ${ALL.length} scenarios • ${INDUSTRIES.length} industries`;
   if (list.length) applyScenario(list[0].scenario_id);
 }
 
 function matchIndustryForScenario(s) {
-  // Key rule: industry_id == scenario.name (case-insensitive)
+  // Rule: industry_id == scenario.name (case-insensitive)
   const key = norm(s.name || '');
   return IND_MAP[key] || null;
 }
@@ -149,7 +151,7 @@ function applyScenario(id) {
   bpTA.value = previewYaml(s, industry);
 }
 
-/* ---------- Google Sheets fetch ---------- */
+/* ---------- fetch Google Sheets data ---------- */
 async function fetchScenarios() {
   const res = await fetch('/api/scenarios');
   if (!res.ok) throw new Error('Failed to load scenarios');
@@ -187,8 +189,55 @@ async function bootstrap() {
   }
 }
 
-scenarioSel.addEventListener('change', () => applyScenario(scenarioSel.value));
-searchEl.addEventListener('change', () => { const id = searchEl.value.trim(); if (MAP[id]) applyScenario(id); });
+/* ---------- suggestions (replaces datalist) ---------- */
+function renderSuggestions(q=''){
+  if (!Array.isArray(ALL) || !ALL.length) { suggestWrap.innerHTML=''; return; }
+  const needle = q.trim().toLowerCase();
+  let matches = ALL;
+  if (needle) {
+    matches = ALL.filter(s =>
+      s.scenario_id.toLowerCase().includes(needle) ||
+      (s.name||'').toLowerCase().includes(needle)
+    );
+  }
+  matches = matches.slice(0, 50);
+
+  if (!matches.length){ suggestWrap.innerHTML=''; return; }
+
+  const box = document.createElement('div');
+  box.className = 'suggest-box';
+  box.innerHTML = matches.map(m => `
+    <div class="suggest-item" data-id="${m.scenario_id}">
+      <span class="suggest-id">${m.scenario_id}</span>
+      <span class="suggest-name">${(m.name||'').replace(/</g,'&lt;')}</span>
+    </div>`).join('');
+  box.addEventListener('click', (e)=>{
+    const el = e.target.closest('.suggest-item');
+    if (!el) return;
+    const id = el.getAttribute('data-id');
+    if (MAP[id]) {
+      document.getElementById('search').value = id;
+      applyScenario(id);
+      suggestWrap.innerHTML='';
+    }
+  });
+  suggestWrap.innerHTML = '';
+  suggestWrap.appendChild(box);
+}
+searchEl.addEventListener('focus', e => renderSuggestions(e.target.value));
+searchEl.addEventListener('input', e => renderSuggestions(e.target.value));
+searchEl.addEventListener('blur', () => setTimeout(()=> suggestWrap.innerHTML='', 150));
+searchEl.addEventListener('keydown', (e)=>{
+  if (e.key === 'Enter'){
+    const v = e.target.value.trim();
+    if (MAP[v]) { applyScenario(v); suggestWrap.innerHTML=''; return; }
+    const first = ALL.find(s =>
+      s.scenario_id.toLowerCase().includes(v.toLowerCase()) ||
+      (s.name||'').toLowerCase().includes(v.toLowerCase())
+    );
+    if (first){ e.target.value = first.scenario_id; applyScenario(first.scenario_id); suggestWrap.innerHTML=''; }
+  }
+});
 
 /* ---------- inference from narratives + industry ---------- */
 function deriveModulesFromNarrative(s, industry){
@@ -225,9 +274,7 @@ function parseTools(s){
   };
 }
 
-function channelFromShapes(s){
-  return recommendedChannel(s);
-}
+function channelFromShapes(s){ return recommendedChannel(s); }
 
 /* ---------- LLM prompt builder ---------- */
 function buildLLMPrompt(s, industry, modules){
@@ -239,15 +286,11 @@ function buildLLMPrompt(s, industry, modules){
   const kpis = industry?.kpis || '';
   const vocab = (industry?.vocabulary_list || []).join(', ');
   const channels = (industry?.channels_list || []).join(', ');
-  const goals = [
-    'reduce no-shows',
-    'maximize utilization',
-    'minimize staff time on manual follow-ups',
-  ];
-  // tailor some goals if billing/lead etc.
-  const key = pickTemplate(s);
-  if (key === 'billing') goals.splice(0, goals.length, 'collect payment quickly', 'avoid churn risk', 'keep tone friendly & compliant');
-  if (key === 'lead') goals.splice(0, goals.length, 'qualify fast', 'book discovery/screening', 'capture contact + intent');
+  const goals = ['reduce no-shows','maximize utilization','minimize staff time on manual follow-ups'];
+
+  const keyText = [s.scenario_id, s.name, ...(s.tags||[])].join(' ').toLowerCase();
+  if (/(bill|invoice|payment)/.test(keyText)) goals.splice(0, goals.length, 'collect payment quickly','avoid churn risk','keep tone friendly & compliant');
+  if (/(lead|qualification|prospect)/.test(keyText)) goals.splice(0, goals.length, 'qualify fast','book discovery/screening','capture contact + intent');
 
   return [
 `You are a ${role} for the ${sector} sector.`,
@@ -271,7 +314,7 @@ industry && vocab ? `- Vocabulary/style: ${vocab}` : null,
   ].filter(Boolean).join('\n');
 }
 
-/* ---------- workflow helpers shared ---------- */
+/* ---------- workflow helpers ---------- */
 function wfSkeleton(baseName){ return { name: baseName, nodes: [], connections: {}, active:false, settings:{}, staticData:null, pinData:{} }; }
 function add(nodes, name, type, position, parameters={}, extra={}){ nodes.push({ name, type, typeVersion: (type==="n8n-nodes-base.manualTrigger"||type==="n8n-nodes-base.wait")?1:2, position, parameters, ...extra }); }
 function connect(conns, from, to){ conns[from] ||= { main:[[]] }; conns[from].main[0].push({ node: to, type:"main", index:0 }); }
@@ -324,7 +367,6 @@ return [{ json: context }];`
 }
 
 function branchChannels(wf, s){
-  // router IFs
   add(wf.nodes, "Channel = Email?", "n8n-nodes-base.if", [-520,-160], { conditions:{string:[{value1:"={{$items('Set Config',0,0).json.channel}}",operation:"equal",value2:"email"}]} );
   add(wf.nodes, "Channel = SMS?", "n8n-nodes-base.if", [-520,-40],  { conditions:{string:[{value1:"={{$items('Set Config',0,0).json.channel}}",operation:"equal",value2:"sms"}]} );
   add(wf.nodes, "Channel = WhatsApp?", "n8n-nodes-base.if", [-520,80],{ conditions:{string:[{value1:"={{$items('Set Config',0,0).json.channel}}",operation:"equal",value2:"whatsapp"}]} );
@@ -383,7 +425,6 @@ function routeAllSendsToWait(wf){
 }
 
 function addOptionalConnectors(wf, tools){
-  // placeholders; wire from the tail if you wish
   if (tools.hasSlack) {
     add(wf.nodes, "Slack Summary (Mock)", "n8n-nodes-base.function", [1480, 80], { functionCode:"console.log('[SLACK] summary sent'); return items;" });
   }
@@ -395,20 +436,21 @@ function addOptionalConnectors(wf, tools){
   }
 }
 
-/* ---------- templates (scheduling shown) ---------- */
-function wfScheduling(s, channel, tools, modules){
+/* ---------- template: scheduling (industry + HOW/ROI + LLM) ---------- */
+function wfScheduling(s, channel){
   const industry = matchIndustryForScenario(s);
+  const modules = deriveModulesFromNarrative(s, industry);
   const wf = wfSkeleton(`${s.scenario_id} – ${s.agent_name || 'Scheduling Agent'} (Demo)`);
 
   // Manual → Reasoning → Config
   add(wf.nodes, "Manual Trigger", "n8n-nodes-base.manualTrigger", [-1460,-20], {});
   const reasoning = buildReasoningNode(s, modules, industry);
   wf.nodes.push(reasoning);
-  wf.nodes.push(cfgNode(channel));
+  wf.nodes.push(cfgNode(channelFromShapes(s) || channel || 'email'));
   connect(wf.connections, "Manual Trigger", "Design / Reasoning");
   connect(wf.connections, "Design / Reasoning", "Set Config");
 
-  // Load appointment data
+  // Load data
   add(wf.nodes, "Load Data", "n8n-nodes-base.function", [-940,-20], {
     functionCode:
 `return [{ json: {
@@ -423,7 +465,7 @@ function wfScheduling(s, channel, tools, modules){
   });
   connect(wf.connections, "Set Config", "Load Data");
 
-  // Compose message (weave HOW/ROI + industry painpoints)
+  // Compose message with HOW/ROI/industry painpoints
   const HOW = (s.how_it_works||'').replace(/`/g,'\\`');
   const ROI = (s.roi_hypothesis||'').replace(/`/g,'\\`');
   const PAI = (industry?.painpoints || '').replace(/`/g,'\\`');
@@ -449,27 +491,22 @@ return [{ json: {
   });
   connect(wf.connections, "Load Data", "Compose Message");
 
-  // LLM Prompt (custom, data-driven) + optional OpenAI node (disabled)
+  // LLM Prompt + (disabled) OpenAI node
   const prompt = buildLLMPrompt(s, industry, modules).replace(/`/g,'\\`');
   add(wf.nodes, "LLM Prompt", "n8n-nodes-base.function", [-720,-200], {
     functionCode: `return [{ json: { prompt: \`${prompt}\` } }];`
   });
-  // Disabled OpenAI node (enable + set credentials in n8n if you want to use)
   add(wf.nodes, "OpenAI Chat (disabled)", "n8n-nodes-base.openAi", [-480,-200], {
     operation: "chat",
     model: "gpt-4o-mini",
-    additionalFields: {
-      systemMessage: "={{$json.prompt}}",
-      // If you want to pass user content, map from Compose Message etc.
-      // messagesUi: { message: [{ role: "user", content: "={{$item(0).$node['Compose Message'].json.text}}" }] }
-    }
+    additionalFields: { systemMessage: "={{$json.prompt}}" }
   }, { disabled: true, credentials: { openAiApi: { name: "openai-default" } } });
   connect(wf.connections, "LLM Prompt", "OpenAI Chat (disabled)");
 
-  // Channel routers & senders
+  // Channels + senders
   branchChannels(wf, s);
 
-  // Wait → Parse → Update → Optional modules
+  // Wait → Parse → Update → Waitlist/Calendar/Slack as needed
   add(wf.nodes, "Wait for Reply", "n8n-nodes-base.wait", [260,-20], {});
   routeAllSendsToWait(wf);
 
@@ -490,6 +527,8 @@ return [{ json:{ intent } }];`
   });
   connect(wf.connections, "Parse Intent", "Update PMS (Mock)");
 
+  // Optional modules:
+  // Waitlist
   if (modules.includes('Waitlist')) {
     add(wf.nodes, "Fill Slot (Mock)", "n8n-nodes-base.function", [1000,-20], {
       functionCode:
@@ -503,29 +542,38 @@ return [{ json: { skipped:true, intent:$json.intent } }];`
     connect(wf.connections, "Update PMS (Mock)", "Fill Slot (Mock)");
   }
 
+  // Calendar sync (mock)
+  if (modules.includes('CalendarSync')) {
+    add(wf.nodes, "Calendar Sync (Mock)", "n8n-nodes-base.function", [1240,-20], {
+      functionCode:`console.log('[GCAL] Sync appointment'); return items;`
+    });
+    const prev = modules.includes('Waitlist') ? "Fill Slot (Mock)" : "Update PMS (Mock)";
+    connect(wf.connections, prev, "Calendar Sync (Mock)");
+  }
+
+  // Slack summary (mock)
+  if (modules.includes('SlackSummary')) {
+    add(wf.nodes, "Slack Daily Summary", "n8n-nodes-base.function", [1480,-20], {
+      functionCode:`console.log('[SLACK] Summary sent'); return items;`
+    });
+    const prev = modules.includes('CalendarSync') ? "Calendar Sync (Mock)" :
+                 modules.includes('Waitlist') ? "Fill Slot (Mock)" : "Update PMS (Mock)";
+    connect(wf.connections, prev, "Slack Daily Summary");
+  }
+
+  // Optional: write to data store if tools indicate
   addOptionalConnectors(wf, parseTools(s));
   return wf;
 }
 
-/* (optional) other templates could call the same LLM prompt pattern */
-function pickTemplate(s){
-  const text = [s.scenario_id, s.name, ...(s.tags||[])].join(' ').toLowerCase();
-  if (/(schedule|no-?show|appointment|calendar)/.test(text)) return 'scheduling';
-  if (/(bill|invoice|payment|overdue|collection|facture|paiement)/.test(text)) return 'billing';
-  if (/(lead|qualification|prospect|inbound|demo|trial|signup)/.test(text)) return 'lead';
-  return 'scheduling';
-}
-
-/* builder */
+/* ---------- builder ---------- */
 function buildWorkflowJSON(s, channel) {
-  const industry = matchIndustryForScenario(s);
-  const modules = deriveModulesFromNarrative(s, industry);
-  const key = pickTemplate(s);
-  // for brevity, we route all to scheduling for now; you can add billing/lead variants mirroring the same LLM+modules approach
-  return wfScheduling(s, channelFromShapes(s) || channel, parseTools(s), modules);
+  // For brevity we generate the scheduling template (industry-aware).
+  // You can add more templates (billing/lead) and switch based on scenario.
+  return wfScheduling(s, channelFromShapes(s) || channel);
 }
 
-/* download */
+/* ---------- download ---------- */
 function downloadJSON(obj, filename) {
   const txt = JSON.stringify(obj, null, 2);
   const blob = new Blob([txt], { type: 'application/json' });
@@ -534,7 +582,7 @@ function downloadJSON(obj, filename) {
   document.body.appendChild(a); a.click(); URL.revokeObjectURL(url); a.remove();
 }
 
-/* click */
+/* ---------- events ---------- */
 $('build').addEventListener('click', () => {
   statusEl.textContent = 'Building…'; statusEl.className = 'hint';
   const sid = (scenarioSel.value || '').trim();
@@ -545,7 +593,9 @@ $('build').addEventListener('click', () => {
   statusEl.textContent = `✓ Downloaded ${sid}-workflow.json`; statusEl.className = 'hint ok';
 });
 
-/* go */
+scenarioSel.addEventListener('change', () => applyScenario(scenarioSel.value));
+
+/* ---------- go ---------- */
 bootstrap();
 </script>
 </body>

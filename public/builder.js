@@ -1,4 +1,4 @@
-/* builder.js — n8n workflow generator (10 archetypes)
+/* public/builder.js — n8n workflow generator (10 archetypes)
    Exposes: window.Builder.buildWorkflowJSON(scenario, industry) */
 
 // ---------- tiny graph helpers ----------
@@ -61,7 +61,11 @@ function branchChannels(wf){
     subject:"={{$json['subject']}}",
     text:"={{$json['text']}}",
     options:{ senderName:"Agent" }
-  },{ credentials:{ smtp:{ name:"SMTP account" } }});
+  },{ 
+    credentials:{ smtp:{ name:"SMTP account" } },
+    disabled:true,                              // sécurité par défaut
+    notes:"Enable + pick SMTP in n8n when ready."
+  });
   link(wf.connections,"Channel = Email?","Email Allowlist"); wf.connections["Channel = Email?"].main[1]=[];
   link(wf.connections,"Email Allowlist","Email Allowed?");
   link(wf.connections,"Email Allowed?","Email Send");

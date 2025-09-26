@@ -182,6 +182,59 @@ async function bootstrap(){
   }
 }
 scenarioSel.addEventListener('change', () => applyScenario(scenarioSel.value));
+<script>
+/* ===== data fetch (FIX) ===== */
+async function bootstrap(){
+  try{
+    const [sc, ind] = await Promise.all([
+      getJSON('/api/scenarios'),
+      getJSON('/api/industries')
+    ]);
+
+    if (!sc.ok || !sc.json?.ok) throw new Error(sc.json?.error || `scenarios api ${sc.status}`);
+    if (!ind.ok || !ind.json?.ok) throw new Error(ind.json?.error || `industries api ${ind.status}`);
+
+    // Normalize data
+    ALL = (sc.json.items || []).map(x => ({
+      ...x,
+      best_reply_shapes: listify(x.best_reply_shapes),
+      tags: listify(x.tags)
+    }));
+    MAP = Object.fromEntries(ALL.map(x => [x.scenario_id, x]));
+
+    INDUSTRIES = (ind.json.items || []);
+    IND_MAP = Object.fromEntries(INDUSTRIES.map(it => [norm(it.industry_id || ''), it]));
+
+    // Populate UI
+    ok('Loaded', `${ALL.length} scenarios • ${INDUSTRIES.length} industries`);
+    populateUI(ALL);
+
+    // Show initial suggestions on focus
+    document.getElementById('search').addEventListener('focus', e => renderSuggestions(e.target.value));
+  } catch (e){
+    // Fallback demo so you can still test
+    err('Data load failed — demo fallback', e.message || '');
+    const fallbackS = {
+      scenario_id:'tier1_dso_SCHEDULING_NO_SHOWS',
+      name:'dental',
+      agent_name:'Scheduling Agent',
+      best_reply_shapes:['sms','email'],
+      how_it_works:'Remind, confirm, backfill.',
+      roi_hypothesis:'Reduce no-shows 30%+'
+    };
+    const fallbackI = {
+      industry_id:'dental',
+      painpoints:'no-shows; front-desk overload',
+      kpis:'no-show rate; utilization',
+      channels:'sms; whatsapp',
+      vocabulary:'patient, chair time'
+    };
+    ALL = [fallbackS]; MAP = { [fallbackS.scenario_id]: fallbackS };
+    INDUSTRIES = [fallbackI]; IND_MAP = { [norm(fallbackI.industry_id)]: fallbackI };
+    populateUI(ALL);
+  }
+}
+</script>
 
 /* ===== inference ===== */
 function pickTemplate(s, industry){

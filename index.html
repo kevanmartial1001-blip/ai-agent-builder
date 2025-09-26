@@ -2,121 +2,179 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>AI Agent Builder – Scenarios</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AI Agent Builder</title>
   <style>
-    :root{--bg:#0b1220;--card:#0f172a;--line:#1f2937;--text:#e5e7eb;--muted:#94a3b8;--brand:#0ea5e9}
-    *{box-sizing:border-box}
-    body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,Segoe UI,Roboto,Helvetica,Arial}
-    .wrap{max-width:1000px;margin:24px auto;padding:16px}
-    .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px}
-    h1{margin:0 0 8px}.hint{color:var(--muted)}
-    input[type="search"]{width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--line);background:#0b1324;color:var(--text)}
-    .list{margin-top:12px;max-height:360px;overflow:auto;border:1px solid var(--line);border-radius:10px}
-    .row{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid var(--line)}
-    .row:last-child{border-bottom:none}
-    .row b{font-weight:600}
-    button{padding:8px 12px;border-radius:10px;border:1px solid var(--brand);background:var(--brand);color:#00111a;cursor:pointer;font-weight:600}
-    .actions{margin-top:12px;display:flex;gap:12px;align-items:center}
+    :root { --bg:#0b0c10; --card:#151820; --ink:#e9edf1; --muted:#9aa6b2; --accent:#5eead4; --line:#232734; --btn:#1f2937; }
+    html,body { margin:0; padding:0; background:var(--bg); color:var(--ink); font:16px/1.5 system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial, sans-serif; }
+    .wrap{ max-width:1100px; margin:48px auto; padding:0 20px; }
+    h1{ margin:0 0 8px; font-size:28px; }
+    p.muted{ color:var(--muted); margin:0 0 24px; }
+    .grid{ display:grid; grid-template-columns: 2fr 1fr; gap:24px; align-items:start; }
+    .card{ background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px; }
+    textarea{ width:100%; min-height:480px; background:#0f1218; color:var(--ink); border:1px solid var(--line); border-radius:12px; padding:12px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size:14px; }
+    label{ display:block; font-weight:600; margin:14px 0 6px; }
+    select, input{ width:100%; background:#0f1218; color:var(--ink); border:1px solid var(--line); border-radius:10px; padding:10px 12px; }
+    .row{ display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
+    .btnbar{ display:flex; gap:12px; align-items:center; margin-top:16px; }
+    button{ background:var(--btn); border:1px solid var(--line); color:var(--ink); padding:10px 14px; border-radius:10px; cursor:pointer; }
+    button.primary{ background:var(--accent); color:#0b0c10; border:none; font-weight:700; }
+    .hint{ color:var(--muted); font-size:13px; margin-top:8px; }
+    .ok{ color:#60ffa6; }
+    .err{ color:#ffa6a6; }
+    .kbd{ background:#0f1218; border:1px solid var(--line); padding:2px 6px; border-radius:6px; }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <div class="card">
-      <h1>AI Agent Builder – Scenarios</h1>
-      <p class="hint">Search a scenario (by <b>scenario_id</b> or <b>name</b>). Select it, then click <i>Build Workflow</i> to download an n8n importable JSON.</p>
+    <h1>AI Agent Builder</h1>
+    <p class="muted">Paste your <strong>blueprint YAML</strong> (or JSON), choose a channel, then click <span class="kbd">Build</span> to download an import-ready n8n workflow.</p>
 
-      <input id="q" type="search" placeholder="Search scenario_id or name…" />
-      <div id="list" class="list"></div>
+    <div class="grid">
+      <!-- LEFT: Blueprint -->
+      <div class="card">
+        <textarea id="bp" spellcheck="false">version: 0.1
+scenario_id: tier1_dso_SCHEDULING_NO_SHOWS
+name: Scheduling – Reduce No-Shows
+agent_name: Scheduling Agent
+best_reply_shapes: [email]
+triggers: >
+  Regional dental groups operate 5–15 clinics…
+risk_notes: >
+  HIPAA/PHI; TCPA consent; quiet hours 21:00–08:00.
+how_it_works: >
+  Connect PMS; reminders; confirmations; waitlist backfill.
+tool_stack_dev: >
+  PMS API + n8n; Email (demo).
+roi_hypothesis: >
+  Reduce no-shows from ~18% → ~10%.
+tags: [dso, scheduling, reminders, no-shows]</textarea>
+        <div class="btnbar">
+          <button id="build" class="primary">Build workflow</button>
+          <span id="status" class="hint"></span>
+        </div>
+      </div>
 
-      <div class="actions">
-        <span id="sel" class="hint">No scenario selected</span>
-        <button id="build" disabled>Build Workflow</button>
-        <span id="status" class="hint"></span>
+      <!-- RIGHT: Options -->
+      <div class="card">
+        <label for="channel">Channel</label>
+        <select id="channel">
+          <option value="email" selected>Email</option>
+          <option value="sms">SMS (Twilio)</option>
+          <option value="whatsapp">WhatsApp (Twilio Sandbox)</option>
+          <option value="call">Voice Call (Twilio TTS)</option>
+        </select>
+
+        <label for="reply_mode">Reply mode</label>
+        <select id="reply_mode">
+          <option value="none" selected>None (use Wait/Resume)</option>
+          <option value="imap">Email IMAP (Gmail)</option>
+          <option value="webhook">Webhook (Twilio inbound)</option>
+        </select>
+
+        <label for="overrideTo">Send only to (email)</label>
+        <input id="overrideTo" value="kevanm.spain@gmail.com" />
+
+        <label for="overrideToPhone">Send only to (phone, E.164)</label>
+        <input id="overrideToPhone" value="+34XXXXXXXXX" />
+
+        <div class="row">
+          <div>
+            <label for="twilioSms">Twilio FROM (SMS)</label>
+            <input id="twilioSms" value="+13412184164" />
+          </div>
+          <div>
+            <label for="twilioVoice">Twilio FROM (Voice)</label>
+            <input id="twilioVoice" value="+13412184164" />
+          </div>
+        </div>
+
+        <label for="twilioWa">Twilio FROM (WhatsApp)</label>
+        <input id="twilioWa" value="whatsapp:+14155238886" />
+        <p class="hint">WhatsApp: make sure your phone has joined the sandbox first.</p>
+
+        <label for="demoMode">Demo Mode</label>
+        <select id="demoMode">
+          <option value="false" selected>Off – send for real (respect allowlists)</option>
+          <option value="true">On – simulate only</option>
+        </select>
       </div>
     </div>
   </div>
 
   <script>
-  const q = document.getElementById('q');
-  const list = document.getElementById('list');
-  const sel = document.getElementById('sel');
-  const build = document.getElementById('build');
-  const status = document.getElementById('status');
-  let selectedId = null, loading = false, lastQuery = "", nextCursor = null;
+    const $ = (id) => document.getElementById(id);
+    const statusEl = $('status');
 
-  function rowItem(it) {
-    const div = document.createElement('div'); div.className = 'row';
-    const left = document.createElement('div');
-    left.innerHTML = `<b>${it.scenario_id || '(no id)'}</b> — ${it.name || ''}`;
-    const right = document.createElement('div');
-    const btn = Object.assign(document.createElement('button'), { textContent: 'Select' });
-    btn.onclick = () => { selectedId = it.scenario_id; sel.textContent = `Selected: ${it.scenario_id} — ${it.name}`; build.disabled = false; };
-    right.appendChild(btn);
-    div.append(left, right);
-    return div;
-  }
-
-  async function fetchPage(query="", cursor=null) {
-    const u = new URL('/api/scenarios', location.origin);
-    if (query) u.searchParams.set('q', query);
-    if (cursor!=null) u.searchParams.set('cursor', cursor);
-    const r = await fetch(u.toString());
-    if (!r.ok) throw new Error('Failed to load scenarios');
-    return r.json();
-  }
-
-  async function load(query="") {
-    if (loading) return;
-    loading = true; status.textContent = "Loading…"; list.innerHTML = "";
-    try {
-      lastQuery = query; nextCursor = 0;
-      const data = await fetchPage(query, nextCursor);
-      (data.items||[]).forEach(it => list.appendChild(rowItem(it)));
-      nextCursor = data.next_cursor;
-      if (nextCursor!=null) appendMoreBtn();
-      status.textContent = "";
-    } catch(e) { status.textContent = "Error: " + e.message; }
-    finally { loading = false; }
-  }
-
-  function appendMoreBtn() {
-    const more = Object.assign(document.createElement('button'), { textContent: 'Load more' });
-    more.style.margin = '10px';
-    const wrap = document.createElement('div'); wrap.style.textAlign = 'center'; wrap.appendChild(more);
-    list.appendChild(wrap);
-    more.onclick = async () => {
-      more.disabled = true;
-      const d2 = await fetchPage(lastQuery, nextCursor);
-      (d2.items||[]).forEach(it => list.insertBefore(rowItem(it), wrap));
-      nextCursor = d2.next_cursor;
-      if (nextCursor!=null) more.disabled = false; else wrap.remove();
-    };
-  }
-
-  q.oninput = () => { clearTimeout(q._t); q._t = setTimeout(()=>load(q.value.trim()), 250); };
-
-  build.onclick = async () => {
-    if (!selectedId) return;
-    try {
-      status.textContent = "Building…";
-      const r = await fetch('/api/build', {
-        method: 'POST', headers: { 'Content-Type':'application/json' },
-        body: JSON.stringify({ scenario_id: selectedId })
-      });
-      if (!r.ok) {
-        let msg = r.statusText; try { const j=await r.json(); if (j.error) msg=j.error; } catch {}
-        status.textContent = "Error: " + msg; return;
+    async function postBuild(body) {
+      // Try /api/build first; if missing, fall back to /api/compile
+      for (const path of ['/api/build', '/api/compile']) {
+        const res = await fetch(path, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        if (res.ok) return res;
+        if (res.status !== 404) {
+          const txt = await res.text().catch(()=> '');
+          throw new Error(`Build failed (${res.status}): ${txt || res.statusText}`);
+        }
       }
-      const blob = await r.blob();
-      const url = URL.createObjectURL(blob);
-      const a = Object.assign(document.createElement('a'), { href:url, download: selectedId + '.workflow.json' });
-      document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
-      status.textContent = "Done ✔";
-    } catch (e) { status.textContent = "Error: " + e.message; }
-  };
+      throw new Error('No build endpoint found (tried /api/build and /api/compile).');
+    }
 
-  load("");
+    function downloadBlob(blob, filename) {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      URL.revokeObjectURL(url);
+      a.remove();
+    }
+
+    $('build').addEventListener('click', async () => {
+      statusEl.textContent = 'Building…';
+      statusEl.className = 'hint';
+
+      const blueprint = $('bp').value;
+      const options = {
+        channel: $('channel').value,
+        reply_mode: $('reply_mode').value,
+        demoMode: $('demoMode').value === 'true',
+        overrideTo: $('overrideTo').value.trim(),
+        overrideToPhone: $('overrideToPhone').value.trim(),
+        twilio: {
+          fromSms: $('twilioSms').value.trim(),
+          fromWhatsApp: $('twilioWa').value.trim(),
+          fromVoice: $('twilioVoice').value.trim(),
+        }
+      };
+
+      const body = { blueprint, options };
+
+      try {
+        const res = await postBuild(body);
+
+        // the API should return application/json (workflow) or application/zip
+        const ct = res.headers.get('content-type') || '';
+        const buf = await res.arrayBuffer();
+        const blob = new Blob([buf], { type: ct });
+
+        // set filename according to content type
+        const isZip = ct.includes('zip');
+        const filename = isZip ? 'agent.zip' : 'agent-workflow.json';
+
+        downloadBlob(blob, filename);
+        statusEl.textContent = `✓ Downloaded ${filename}`;
+        statusEl.className = 'hint ok';
+      } catch (err) {
+        console.error(err);
+        statusEl.textContent = `✗ ${err.message}`;
+        statusEl.className = 'hint err';
+      }
+    });
   </script>
 </body>
 </html>

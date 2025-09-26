@@ -20,7 +20,6 @@
   button.primary{background:var(--accent);color:#0b0c10;border:none;font-weight:700}
   .hint{color:var(--muted);font-size:13px;margin-left:6px}
   .ok{color:#66ffb7}.err{color:#ff9aa8}
-  .kbd{background:#0f1218;border:1px solid var(--line);padding:2px 6px;border-radius:6px}
   small.badge{background:#0f1218;border:1px solid var(--line);border-radius:8px;padding:2px 6px;margin-left:6px;color:var(--muted)}
 </style>
 </head>
@@ -32,7 +31,7 @@
   <div class="card">
     <div class="row">
       <div>
-        <label for="scenario">Scenario (shows <code>scenario_id</code>)</label>
+        <label for="scenario">Scenario (<code>scenario_id</code>)</label>
         <select id="scenario"></select>
       </div>
       <div>
@@ -50,7 +49,7 @@
     <input id="search" list="scenarioIds" placeholder="e.g. tier1_dso_SCHEDULING_NO_SHOWS" />
     <datalist id="scenarioIds"></datalist>
 
-    <label for="bp">Blueprint (human-readable YAML; request always uses the generated YAML)</label>
+    <label for="bp">Blueprint (readable YAML)</label>
     <textarea id="bp" spellcheck="false"></textarea>
 
     <div class="btnbar">
@@ -62,21 +61,15 @@
 
 <script>
   const $ = (id) => document.getElementById(id);
-  const statusEl = $('status');
-  const scenarioSel = $('scenario');
-  const channelSel = $('channel');
-  const searchEl = $('search');
-  const bpTA = $('bp');
-  const datalist = $('scenarioIds');
-  const loadedCount = $('loadedCount');
+  const statusEl = $('status'), scenarioSel = $('scenario'), channelSel = $('channel');
+  const searchEl = $('search'), bpTA = $('bp'), datalist = $('scenarioIds'), loadedCount = $('loadedCount');
 
-  let ALL = [];
-  let MAP_BY_ID = {};
+  let ALL = [], MAP_BY_ID = {};
 
   const listify = (v) => Array.isArray(v) ? v : String(v || '').split(/[;,|\s]+/).map(x=>x.trim()).filter(Boolean);
 
   function recommendedChannel(row) {
-    const shapes = listify(row.best_reply_shapes || row.channel);
+    const shapes = listify(row.best_reply_shapes);
     const norm = shapes.map(s => s.toLowerCase());
     const set = new Set(norm.map(s =>
       s.includes('whatsapp') ? 'whatsapp' :
@@ -104,6 +97,7 @@ best_reply_shapes: ${brList(s.best_reply_shapes)}
 triggers: >${br('\\n  ' + (s.triggers || ''))}
 how_it_works: >${br('\\n  ' + (s.how_it_works || ''))}
 tool_stack_dev: >${br('\\n  ' + (s.tool_stack_dev || 'n8n; SMTP; Twilio'))}
+tool_stack_autonomous: >${br('\\n  ' + (s.tool_stack_autonomous || ''))}
 roi_hypothesis: >${br('\\n  ' + (s.roi_hypothesis || ''))}
 tags: [${listify(s.tags).join(', ')}]`;
   }
@@ -113,8 +107,8 @@ tags: [${listify(s.tags).join(', ')}]`;
     list.forEach(s => {
       const opt = document.createElement('option');
       opt.value = s.scenario_id;
-      opt.textContent = s.scenario_id;     // show ID
-      opt.title = s.name || s.scenario_id; // human name on hover
+      opt.textContent = s.scenario_id;      // show id
+      opt.title = s.name || s.scenario_id;  // human name on hover
       scenarioSel.appendChild(opt);
     });
     datalist.innerHTML = '';
@@ -151,36 +145,20 @@ tags: [${listify(s.tags).join(', ')}]`;
     } catch (e) {
       console.error(e);
       statusEl.textContent = '✗ Error: Failed to load scenarios'; statusEl.className = 'hint err';
-      const fallback = {
-        scenario_id: 'tier1_dso_SCHEDULING_NO_SHOWS',
-        name: 'DSO – Scheduling (reduce no-shows)',
-        agent_name: 'Scheduling Agent',
-        best_reply_shapes: ['sms','email'],
-        triggers: 'Regional dental groups operate 5–15 clinics. High no-show rates.',
-      };
+      const fallback = { scenario_id:'tier1_dso_SCHEDULING_NO_SHOWS', name:'DSO – Scheduling (reduce no-shows)', agent_name:'Scheduling Agent', best_reply_shapes:['sms','email'] };
       ALL = [fallback]; MAP_BY_ID = { [fallback.scenario_id]: fallback };
       populateUI(ALL);
     }
   }
 
   scenarioSel.addEventListener('change', () => applyScenario(scenarioSel.value));
-  searchEl.addEventListener('change', () => {
-    const id = searchEl.value.trim();
-    if (MAP_BY_ID[id]) applyScenario(id);
-  });
+  searchEl.addEventListener('change', () => { const id = searchEl.value.trim(); if (MAP_BY_ID[id]) applyScenario(id); });
 
   async function postBuild(body) {
     for (const path of ['/api/build', '/api/compile']) {
-      const res = await fetch(path, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-        body: JSON.stringify(body)
-      });
+      const res = await fetch(path, { method:'POST', headers:{ 'Content-Type':'application/json', 'Accept':'application/json' }, body: JSON.stringify(body) });
       if (res.ok) return res;
-      if (res.status !== 404) {
-        const txt = await res.text().catch(()=> '');
-        throw new Error(`Build failed (${res.status}): ${txt || res.statusText}`);
-      }
+      if (res.status !== 404) { const txt = await res.text().catch(()=> ''); throw new Error(`Build failed (${res.status}): ${txt || res.statusText}`); }
     }
     throw new Error('No build endpoint found.');
   }
@@ -191,37 +169,42 @@ tags: [${listify(s.tags).join(', ')}]`;
     document.body.appendChild(a); a.click(); URL.revokeObjectURL(url); a.remove();
   }
 
-  // CLICK: always send YAML string + top-level scenario_id
+  // CLICK → send blueprint as a JSON STRING (contains scenario_id)
   $('build').addEventListener('click', async () => {
     statusEl.textContent = 'Building…'; statusEl.className = 'hint';
 
     const sid = (scenarioSel.value || '').trim();
     const s = MAP_BY_ID[sid];
-    if (!s) {
-      statusEl.textContent = '✗ No scenario selected'; statusEl.className = 'hint err';
-      return;
-    }
+    if (!s) { statusEl.textContent = '✗ No scenario selected'; statusEl.className = 'hint err'; return; }
 
-    // Generate YAML fresh from the selected scenario (don’t rely on textarea)
-    const yaml = makeYaml(s);
-    bpTA.value = yaml; // keep UI in sync
+    const blueprintObj = {
+      version: '0.1',
+      scenario_id: s.scenario_id,
+      name: s.name || '',
+      agent_name: s.agent_name || 'Agent',
+      triggers: s.triggers || '',
+      best_reply_shapes: listify(s.best_reply_shapes),
+      risk_notes: s.risk_notes || '',
+      how_it_works: s.how_it_works || '',
+      tool_stack_dev: s.tool_stack_dev || '',
+      tool_stack_autonomous: s.tool_stack_autonomous || '',
+      tags: listify(s.tags),
+      roi_hypothesis: s.roi_hypothesis || ''
+    };
+
+    // keep YAML for display only
+    bpTA.value = makeYaml(s);
 
     const body = {
-      // Many backends expect this to be a string containing YAML or JSON
-      blueprint: yaml,
-      // Some parsers check top-level scenario_id too — send it explicitly
-      scenario_id: s.scenario_id,
+      blueprint: JSON.stringify(blueprintObj), // << send as STRING so EJS builders can JSON.parse and find scenario_id
+      scenario_id: s.scenario_id,              // << belt & suspenders: top-level too
       options: {
         channel: channelSel.value,
         reply_mode: 'none',
         demoMode: false,
         overrideTo: 'kevanm.spain@gmail.com',
         overrideToPhone: '+34XXXXXXXXX',
-        twilio: {
-          fromSms: '+13412184164',
-          fromWhatsApp: 'whatsapp:+14155238886',
-          fromVoice: '+13412184164'
-        }
+        twilio: { fromSms:'+13412184164', fromWhatsApp:'whatsapp:+14155238886', fromVoice:'+13412184164' }
       }
     };
 

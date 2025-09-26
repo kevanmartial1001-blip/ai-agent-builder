@@ -1,9 +1,18 @@
 {
-  "name": "<%= name %> – <%= agent_name %> (Demo)",
+  "name": "<%= scenario_id %> – <%= agent_name %> (Demo)",
   "nodes": [
     {
       "parameters": {
-        "functionCode": "// Emits two upcoming appointments for the demo based on scenario\nreturn [{\n  json: {\n    scenario_id: \"<%= scenario_id %>\",\n    appointments: [\n      { id:\"A1001\", first:\"Sara\",  last:\"L.\", email:\"sara@example.com\",  time:\"2025-10-02T10:00\", doctor:\"Dr. Lee\", confirmed:false },\n      { id:\"A1002\", first:\"Marco\", last:\"T.\", email:\"marco@example.com\", time:\"2025-10-02T11:30\", doctor:\"Dr. Chen\", confirmed:false }\n    ]\n  }\n}];"
+        "functionCode": "// Global config for the workflow. Flip demoMode to false to use real SMTP.\nreturn [{ json: {\n  demoMode: true,                // << set to false to use Email Send\n  overrideTo: \"you@example.com\"  // optional hardcoded recipient for testing\n}}];"
+      },
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [-1060, -20],
+      "name": "Set Demo Config"
+    },
+    {
+      "parameters": {
+        "functionCode": "// Emits a couple of upcoming appointments for the selected scenario\nreturn [{\n  json: {\n    scenario_id: \"<%= scenario_id %>\",\n    name: \"<%= name %>\",\n    appointments: [\n      { id: \"A1001\", first: \"Sara\",  last: \"L.\", email: \"sara@example.com\",  time: \"2025-10-02T10:00\", doctor: \"Dr. Lee\",  confirmed: false },\n      { id: \"A1002\", first: \"Marco\", last: \"T.\", email: \"marco@example.com\", time: \"2025-10-02T11:30\", doctor: \"Dr. Chen\", confirmed: false }\n    ]\n  }\n}];"
       },
       "type": "n8n-nodes-base.function",
       "typeVersion": 2,
@@ -12,12 +21,36 @@
     },
     {
       "parameters": {
-        "functionCode": "// Build message from the first appointment\nconst appt = items[0].json.appointments[0];\nconst d = new Date(appt.time);\nconst dateStr = d.toLocaleDateString();\nconst timeStr = d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});\nreturn [{ json: {\n  to: appt.email,\n  subject: \"Appointment reminder\",\n  text: `Hi ${appt.first}, your appointment is on ${dateStr} at ${timeStr} with ${appt.doctor}.\\nReply 1 to CONFIRM, 2 to RESCHEDULE, 3 to CANCEL.`,\n  meta: { scenario_id: $json.scenario_id }\n}}];"
+        "functionCode": "// Build an outbound message from the first appointment.\n// If overrideTo is set in config, force the recipient.\nconst appt = items[0].json.appointments[0];\nconst d = new Date(appt.time);\nconst dateStr = d.toLocaleDateString();\nconst timeStr = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });\n\nconst cfg = $items(\"Set Demo Config\", 0, 0)?.json || {};\nconst to = cfg.overrideTo || appt.email;\n\nreturn [{ json: {\n  to,\n  subject: \"Appointment reminder\",\n  text: `Hi ${appt.first}, your appointment is on ${dateStr} at ${timeStr} with ${appt.doctor}.\\nReply 1 to CONFIRM, 2 to RESCHEDULE, 3 to CANCEL.`,\n  meta: { scenario_id: $json.scenario_id, name: $json.name }\n}}];"
       },
       "type": "n8n-nodes-base.function",
       "typeVersion": 2,
-      "position": [-480, -20],
+      "position": [-520, -20],
       "name": "Compose Message"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$items(\"Set Demo Config\", 0, 0).json.demoMode}}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-280, -20],
+      "name": "Demo Mode?"
+    },
+    {
+      "parameters": {
+        "functionCode": "// Simulate sending (no SMTP). Keeps the flow runnable out-of-the-box.\nconsole.log(\"[SIMULATED SEND] To:\", $json.to, \"Subject:\", $json.subject);\nreturn items;"
+      },
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [-40, -120],
+      "name": "Simulate Send"
     },
     {
       "parameters": {
@@ -28,21 +61,21 @@
       },
       "type": "n8n-nodes-base.emailSend",
       "typeVersion": 2,
-      "position": [-160, -20],
+      "position": [-40, 100],
       "name": "Email Send",
-      "notes": "Select SMTP credentials after import (Gmail app-password works)."
+      "notes": "Select SMTP credentials when demoMode=false."
     },
     {
       "parameters": {},
       "type": "n8n-nodes-base.wait",
       "typeVersion": 1,
-      "position": [160, -20],
+      "position": [220, -20],
       "name": "Wait for Reply",
       "notes": "Click Resume to simulate a reply."
     },
     {
       "parameters": {
-        "functionCode": "// Simulate a reply; change replyText to test flows\nconst replyText = \"1\"; // 1=CONFIRM, 2=RESCHEDULE, 3=CANCEL, or any sentence\nlet intent = \"HUMAN\";\nconst t = replyText.toLowerCase();\nif (t === \"1\" || t.includes(\"yes\") || t.includes(\"confirm\")) intent = \"CONFIRM\";\nelse if (t === \"3\" || t.includes(\"cancel\")) intent = \"CANCEL\";\nelse if (t === \"2\" || t.includes(\"reschedule\") || t.includes(\"another\") || t.includes(\"next week\")) intent = \"RESCHEDULE\";\nelse if (t.includes(\"late\")) intent = \"LATE\";\nreturn [{ json: { intent } }];"
+        "functionCode": "// Parse (simulated) reply. Change replyText to test.\nconst replyText = \"1\"; // 1=CONFIRM, 2=RESCHEDULE, 3=CANCEL, 'late' → LATE\nlet intent = \"HUMAN\";\nconst t = replyText.toLowerCase();\nif (t === \"1\" || t.includes(\"yes\") || t.includes(\"confirm\")) intent = \"CONFIRM\";\nelse if (t === \"3\" || t.includes(\"cancel\")) intent = \"CANCEL\";\nelse if (t === \"2\" || t.includes(\"reschedule\") || t.includes(\"another\") || t.includes(\"next week\")) intent = \"RESCHEDULE\";\nelse if (t.includes(\"late\")) intent = \"LATE\";\nreturn [{ json: { intent } }];"
       },
       "type": "n8n-nodes-base.function",
       "typeVersion": 2,
@@ -51,30 +84,130 @@
     },
     {
       "parameters": {
-        "functionCode": "// Mock PMS write-back per intent\nconst intent = $json.intent;\nconsole.log('PMS update →', intent);\nreturn [{ json: { updated: true, intent } }];"
+        "functionCode": "// Mock PMS write-back per intent\nconst intent = $json.intent;\nconsole.log(\"[PMS] Update →\", intent);\nreturn [{ json: { updated: true, intent } }];"
       },
       "type": "n8n-nodes-base.function",
       "typeVersion": 2,
-      "position": [800, -20],
+      "position": [760, -20],
       "name": "Update PMS (Mock)"
     },
     {
       "parameters": {
-        "functionCode": "// If slot freed, pick top of waitlist (demo)\nconst intent = $json.intent;\nif (intent === 'CANCEL' || intent === 'RESCHEDULE') {\n  const next = { first:'Lena', last:'K.', email:'lena@example.com', priority: 9 };\n  console.log('Waitlist backfill →', next);\n  return [{ json: { filledWith: next, intent } }];\n}\nreturn [{ json: { skipped: true, intent } }];"
+        "functionCode": "// If slot freed, pick top of waitlist (demo)\nconst intent = $json.intent;\nif (intent === 'CANCEL' || intent === 'RESCHEDULE') {\n  const next = { first:'Lena', last:'K.', email:'lena@example.com', priority:9 };\n  console.log('[WAITLIST] Backfill →', next);\n  return [{ json: { filledWith: next, intent } }];\n}\nreturn [{ json: { skipped:true, intent } }];"
       },
       "type": "n8n-nodes-base.function",
       "typeVersion": 2,
-      "position": [1120, -20],
+      "position": [1040, -20],
       "name": "Fill Slot (Mock)"
     }
   ],
   "connections": {
-    "Load Appointments": { "main": [[{ "node": "Compose Message", "type": "main", "index": 0 }]] },
-    "Compose Message":   { "main": [[{ "node": "Email Send",     "type": "main", "index": 0 }]] },
-    "Email Send":        { "main": [[{ "node": "Wait for Reply",  "type": "main", "index": 0 }]] },
-    "Wait for Reply":    { "main": [[{ "node": "Parse Intent (Demo)", "type": "main", "index": 0 }]] },
-    "Parse Intent (Demo)": { "main": [[{ "node": "Update PMS (Mock)", "type": "main", "index": 0 }]] },
-    "Update PMS (Mock)":   { "main": [[{ "node": "Fill Slot (Mock)",   "type": "main", "index": 0 }]] }
+    "Set Demo Config": {
+      "main": [
+        [
+          {
+            "node": "Load Appointments",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Appointments": {
+      "main": [
+        [
+          {
+            "node": "Compose Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compose Message": {
+      "main": [
+        [
+          {
+            "node": "Demo Mode?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Demo Mode?": {
+      "main": [
+        [
+          {
+            "node": "Simulate Send",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Email Send",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate Send": {
+      "main": [
+        [
+          {
+            "node": "Wait for Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email Send": {
+      "main": [
+        [
+          {
+            "node": "Wait for Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait for Reply": {
+      "main": [
+        [
+          {
+            "node": "Parse Intent (Demo)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Intent (Demo)": {
+      "main": [
+        [
+          {
+            "node": "Update PMS (Mock)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update PMS (Mock)": {
+      "main": [
+        [
+          {
+            "node": "Fill Slot (Mock)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
   },
   "active": false,
   "settings": {},

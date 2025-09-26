@@ -335,7 +335,7 @@ function pickTemplate(s, industry){
   return 'scheduling';
 }
 
-/* ---------- COMPOSERS (10 archetypes) ---------- */
+/* ---------- COMPOSERS (first 3) ---------- */
 function composeScheduling(s, industry){
   const wf = wfSkeleton(`${s.scenario_id} – ${s.agent_name || 'Scheduling Agent'} (Demo)`);
   node(wf.nodes,"Manual Trigger","n8n-nodes-base.manualTrigger",[-1460,-20],{});
@@ -434,6 +434,7 @@ return [{ json:{ intent } }];`});
   llmNodes(wf, buildLLMPrompt(s, industry, 'lead'));
   return wf;
 }
+</script>
 <script>
 function composeSupport(s, industry){
   const wf = wfSkeleton(`${s.scenario_id} – ${s.agent_name || 'Support Agent'} (Demo)`);
@@ -668,7 +669,6 @@ function buildWorkflowJSON(s){
    =========================== */
 function renderPreview(){
   if (!ACTIVE) { preview.value=""; return; }
-  // build and pretty-print
   const wf = buildWorkflowJSON(ACTIVE);
   preview.value = JSON.stringify(wf, null, 2);
 }

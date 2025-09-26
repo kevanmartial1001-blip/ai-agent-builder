@@ -1,7 +1,5 @@
 // api/scenarios.js
-// Returns scenarios for the dropdown.
-// Mode A (preferred): set SCENARIOS_CSV_URL to a published CSV of your sheet.
-// Mode B: set SHEET_ID + GOOGLE_API_KEY (+ optional SHEET_TAB, default "Scenarios") to use the Sheets API v4.
+// Flexible scenarios loader: CSV (SCENARIOS_CSV_URL) OR Sheets API (SHEET_ID + GOOGLE_API_KEY + optional SHEET_TAB).
 
 const HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -9,124 +7,145 @@ const HEADERS = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
-// --- tiny helpers ---------------------------------------------------------
-const toObj = (header, row) =>
-  Object.fromEntries(header.map((h, i) => [h, (row[i] ?? "").toString().trim()]));
+const ACCENT_MAP = { 'à':'a','á':'a','â':'a','ä':'a','ç':'c','é':'e','è':'e','ê':'e','ë':'e','î':'i','ï':'i','ô':'o','ö':'o','ù':'u','û':'u','ü':'u','ÿ':'y','ñ':'n' };
+const deaccent = (s) => s.replace(/[^\u0000-\u007E]/g, ch => ACCENT_MAP[ch] || ch);
 
-const normTags = (s) =>
-  (s ? s.split(/[;,\s]+/).map((t) => t.trim()).filter(Boolean) : []);
+// Normalize a header key: lowercase, remove accents, strip spaces/punct like "()"
+const normKey = (s) => deaccent((s || ""))
+  .toLowerCase()
+  .replace(/\s+/g, '')
+  .replace(/[()\-_/\\.,:;'"`]/g, '');
 
-function parseCsv(csvText) {
-  // handles quotes, doubles, commas
-  const lines = csvText.split(/\r?\n/);
+const pick = (obj, ...candidates) => {
+  for (const c of candidates) if (obj[c] != null && obj[c] !== '') return obj[c];
+  return '';
+};
+
+const splitList = (s) =>
+  (s || '').toString().split(/[;,|\s]+/).map(v => v.trim()).filter(Boolean);
+
+const parseCsv = (csvText) => {
+  const lines = csvText.split(/\r?\n/).filter(l => l.length);
   if (!lines.length) return { headers: [], rows: [] };
-  const headers = (lines.shift() || "")
-    .split(",")
-    .map((h) => h.trim().replace(/^"|"$/g, ""));
+
+  // raw headers
+  const rawHeaders = lines.shift().split(',').map(h => h.replace(/^"|"$/g, '').trim());
+  const headers = rawHeaders.map(h => normKey(h));
 
   const rows = [];
   for (const line of lines) {
-    if (!line) continue;
+    let cur = '', inQ = false;
     const out = [];
-    let cur = "", inQ = false;
     for (let i = 0; i < line.length; i++) {
       const ch = line[i];
-      if (ch === '"' && line[i + 1] === '"') { cur += '"'; i++; continue; }
+      if (ch === '"' && line[i+1] === '"') { cur += '"'; i++; continue; }
       if (ch === '"') { inQ = !inQ; continue; }
-      if (ch === ',' && !inQ) { out.push(cur); cur = ""; continue; }
+      if (ch === ',' && !inQ) { out.push(cur); cur = ''; continue; }
       cur += ch;
     }
     out.push(cur);
-    rows.push(out.map((c) => c.replace(/^"|"$/g, "")));
+    rows.push(out.map(c => c.replace(/^"|"$/g, '')));
   }
-  return { headers, rows };
-}
+  return { headers, rows, rawHeaders };
+};
 
-function mapRow(x) {
-  // Normalize to the fields the UI/builder expects
+const toObj = (headers, row) =>
+  Object.fromEntries(headers.map((h, i) => [h, (row[i] ?? '').toString().trim()]));
+
+const mapRow = (rowNorm) => {
+  // accept many header variants thanks to normKey
+  const scenario_id = pick(rowNorm, 'scenarioid', 'id', 'scenariocode');
+  const name       = pick(rowNorm, 'name', 'title');
+  const triggers   = pick(rowNorm, 'triggers', 'pain');
+  const brs        = pick(rowNorm, 'bestreplyshapes', 'channel', 'channels');
+  const risk_notes = pick(rowNorm, 'risknotes');
+  const agent_name = pick(rowNorm, 'agentname', 'agent');
+  const how_it     = pick(rowNorm, 'howitworks', 'howitwork', 'how');
+  const tool_dev   = pick(rowNorm, 'toolstackdev', 'tools', 'stack');
+  const tool_auto  = pick(rowNorm, 'toolstackautonomous', 'toolstackauto');
+  const tagsRaw    = pick(rowNorm, 'tags', 'tags;', 'tags;');
+  const roi        = pick(rowNorm, 'roihypothesis', 'roi');
+
   return {
-    scenario_id: x["scenario_id"] || x["id"] || "",
-    name: x["name"] || x["title"] || "",
-    triggers: x["triggers"] || "",
-    best_reply_shapes: (x["best_reply_shapes"] || x["channel"] || "")
-      .toString()
-      .split(/[;, ]+/)
-      .map((s) => s.trim())
-      .filter(Boolean),
-    risk_notes: x["risk_notes"] || "",
-    agent_name: x["agent_name"] || "",
-    how_it_works: x["how_it_works"] || "",
-    tool_stack_dev: x["tool_stack_dev"] || "",
-    tool_stack_autonomous: x["tool_stack_autonomous"] || "",
-    tags: normTags(x["tags (;)"] || x["tags"] || ""),
-    roi_hypothesis: x["roi_hypothesis"] || "",
+    scenario_id,
+    name,
+    triggers,
+    best_reply_shapes: splitList(brs),
+    risk_notes,
+    agent_name,
+    how_it_works: how_it,
+    tool_stack_dev: tool_dev,
+    tool_stack_autonomous: tool_auto,
+    tags: splitList(tagsRaw),
+    roi_hypothesis: roi,
   };
-}
+};
 
-// --- main handler ---------------------------------------------------------
 module.exports = async (req, res) => {
   Object.entries(HEADERS).forEach(([k, v]) => res.setHeader(k, v));
-  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method === 'OPTIONS') return res.status(204).end();
 
   try {
-    const { q = "", cursor = "0", max } = req.query || {};
+    const { q = '', cursor = '0', max, debug } = req.query || {};
     const qLC = q.toString().toLowerCase();
     const start = parseInt(cursor, 10) || 0;
-    const MAX = Math.min(parseInt(max || process.env.MAX_RESULTS || "10000", 10) || 10000, 10000);
+    const MAX = Math.min(parseInt(max || process.env.MAX_RESULTS || '10000', 10) || 10000, 10000);
 
-    const CSV_URL = process.env.SCENARIOS_CSV_URL || "";
+    const CSV_URL = process.env.SCENARIOS_CSV_URL || '';
     let items = [];
+    let source = '';
 
     if (CSV_URL) {
-      // ----- Mode A: published CSV -----
+      // Published CSV mode
       const r = await fetch(CSV_URL);
       if (!r.ok) throw new Error(`CSV fetch error: ${r.status} ${r.statusText}`);
       const text = await r.text();
-      const { headers, rows } = parseCsv(text);
-      const body = rows.map((rw) => toObj(headers, rw));
-      items = body.map(mapRow).filter((x) => x.scenario_id && x.name);
+      const { headers, rows, rawHeaders } = parseCsv(text);
+      const body = rows.map((rw) => {
+        const objRaw = toObj(rawHeaders.map(normKey), rw);
+        return objRaw;
+      });
+      items = body.map(mapRow).filter(x => x.scenario_id && x.name);
+      source = 'csv';
+      if (debug) return res.status(200).json({ ok:true, source, normalizedHeaders: rawHeaders.map(normKey), sample: body.slice(0,3) });
     } else {
-      // ----- Mode B: Google Sheets API v4 -----
+      // Sheets API v4 mode
       const SHEET_ID = process.env.SHEET_ID;
       const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
-      const TAB = process.env.SHEET_TAB || "Scenarios";
+      const TAB = process.env.SHEET_TAB || 'Scenarios';
       if (!SHEET_ID || !GOOGLE_API_KEY)
-        return res.status(500).json({ ok: false, error: "Missing SCENARIOS_CSV_URL or (SHEET_ID + GOOGLE_API_KEY)" });
+        return res.status(500).json({ ok:false, error: 'Missing SCENARIOS_CSV_URL or (SHEET_ID + GOOGLE_API_KEY)' });
 
       const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(TAB)}?key=${GOOGLE_API_KEY}`;
       const r = await fetch(url);
       if (!r.ok) throw new Error(`Sheets API error: ${r.status} ${r.statusText}`);
       const data = await r.json();
       const rows = data.values || [];
-      if (!rows.length) return res.json({ ok: true, items: [] });
+      if (!rows.length) return res.json({ ok:true, source:'sheets', count:0, items:[] });
 
-      const header = rows[0].map((h) => h.trim());
-      const body = rows.slice(1).map((rw) => toObj(header, rw));
-      items = body.map(mapRow).filter((x) => x.scenario_id && x.name);
+      const headerRaw = rows[0].map(h => h.trim());
+      const headerNorm = headerRaw.map(normKey);
+      const body = rows.slice(1).map(rw => toObj(headerNorm, rw));
+      items = body.map(mapRow).filter(x => x.scenario_id && x.name);
+      source = 'sheets';
+      if (debug) return res.status(200).json({ ok:true, source, normalizedHeaders: headerNorm, sample: body.slice(0,3) });
     }
 
-    // optional query filter
     if (qLC) {
       items = items.filter(
-        (it) =>
-          (it.scenario_id || "").toLowerCase().includes(qLC) ||
-          (it.name || "").toLowerCase().includes(qLC)
+        it => (it.scenario_id || '').toLowerCase().includes(qLC) ||
+              (it.name || '').toLowerCase().includes(qLC)
       );
     }
 
-    // pagination
     const page = items.slice(start, start + MAX);
-    const next = start + MAX < items.length ? start + MAX : null;
+    const next = (start + MAX < items.length) ? start + MAX : null;
 
-    res.setHeader("Cache-Control", "public, max-age=120");
+    res.setHeader('Cache-Control', 'public, max-age=120');
     return res.status(200).json({
-      ok: true,
-      count: items.length,
-      page_count: page.length,
-      next_cursor: next,
-      items: page,
+      ok: true, source, count: items.length, page_count: page.length, next_cursor: next, items: page
     });
   } catch (err) {
-    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+    return res.status(500).json({ ok:false, error: String(err?.message || err) });
   }
 };

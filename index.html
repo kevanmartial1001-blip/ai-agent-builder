@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>AI Agent Builder – Scenarios</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root{--bg:#0b1220;--card:#0f172a;--line:#1f2937;--text:#e5e7eb;--muted:#94a3b8;--brand:#0ea5e9}
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,Segoe UI,Roboto,Helvetica,Arial}
+    .wrap{max-width:1000px;margin:24px auto;padding:16px}
+    .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px}
+    h1{margin:0 0 8px}.hint{color:var(--muted)}
+    input[type="search"]{width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--line);background:#0b1324;color:var(--text)}
+    .list{margin-top:12px;max-height:360px;overflow:auto;border:1px solid var(--line);border-radius:10px}
+    .row{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid var(--line)}
+    .row:last-child{border-bottom:none}
+    .row b{font-weight:600}
+    button{padding:8px 12px;border-radius:10px;border:1px solid var(--brand);background:var(--brand);color:#00111a;cursor:pointer;font-weight:600}
+    .actions{margin-top:12px;display:flex;gap:12px;align-items:center}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>AI Agent Builder – Scenarios</h1>
+      <p class="hint">Search a scenario (by <b>scenario_id</b> or <b>name</b>). Select it, then click <i>Build Workflow</i> to download an n8n importable JSON.</p>
+
+      <input id="q" type="search" placeholder="Search scenario_id or name…" />
+      <div id="list" class="list"></div>
+
+      <div class="actions">
+        <span id="sel" class="hint">No scenario selected</span>
+        <button id="build" disabled>Build Workflow</button>
+        <span id="status" class="hint"></span>
+      </div>
+    </div>
+  </div>
+
+  <script>
+  const q = document.getElementById('q');
+  const list = document.getElementById('list');
+  const sel = document.getElementById('sel');
+  const build = document.getElementById('build');
+  const status = document.getElementById('status');
+  let selectedId = null, loading = false, lastQuery = "", nextCursor = null;
+
+  function rowItem(it) {
+    const div = document.createElement('div'); div.className = 'row';
+    const left = document.createElement('div');
+    left.innerHTML = `<b>${it.scenario_id || '(no id)'}</b> — ${it.name || ''}`;
+    const right = document.createElement('div');
+    const btn = Object.assign(document.createElement('button'), { textContent: 'Select' });
+    btn.onclick = () => { selectedId = it.scenario_id; sel.textContent = `Selected: ${it.scenario_id} — ${it.name}`; build.disabled = false; };
+    right.appendChild(btn);
+    div.append(left, right);
+    return div;
+  }
+
+  async function fetchPage(query="", cursor=null) {
+    const u = new URL('/api/scenarios', location.origin);
+    if (query) u.searchParams.set('q', query);
+    if (cursor!=null) u.searchParams.set('cursor', cursor);
+    const r = await fetch(u.toString());
+    if (!r.ok) throw new Error('Failed to load scenarios');
+    return r.json();
+  }
+
+  async function load(query="") {
+    if (loading) return;
+    loading = true; status.textContent = "Loading…"; list.innerHTML = "";
+    try {
+      lastQuery = query; nextCursor = 0;
+      const data = await fetchPage(query, nextCursor);
+      (data.items||[]).forEach(it => list.appendChild(rowItem(it)));
+      nextCursor = data.next_cursor;
+      if (nextCursor!=null) appendMoreBtn();
+      status.textContent = "";
+    } catch(e) { status.textContent = "Error: " + e.message; }
+    finally { loading = false; }
+  }
+
+  function appendMoreBtn() {
+    const more = Object.assign(document.createElement('button'), { textContent: 'Load more' });
+    more.style.margin = '10px';
+    const wrap = document.createElement('div'); wrap.style.textAlign = 'center'; wrap.appendChild(more);
+    list.appendChild(wrap);
+    more.onclick = async () => {
+      more.disabled = true;
+      const d2 = await fetchPage(lastQuery, nextCursor);
+      (d2.items||[]).forEach(it => list.insertBefore(rowItem(it), wrap));
+      nextCursor = d2.next_cursor;
+      if (nextCursor!=null) more.disabled = false; else wrap.remove();
+    };
+  }
+
+  q.oninput = () => { clearTimeout(q._t); q._t = setTimeout(()=>load(q.value.trim()), 250); };
+
+  build.onclick = async () => {
+    if (!selectedId) return;
+    try {
+      status.textContent = "Building…";
+      const r = await fetch('/api/build', {
+        method: 'POST', headers: { 'Content-Type':'application/json' },
+        body: JSON.stringify({ scenario_id: selectedId })
+      });
+      if (!r.ok) {
+        let msg = r.statusText; try { const j=await r.json(); if (j.error) msg=j.error; } catch {}
+        status.textContent = "Error: " + msg; return;
+      }
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = Object.assign(document.createElement('a'), { href:url, download: selectedId + '.workflow.json' });
+      document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+      status.textContent = "Done ✔";
+    } catch (e) { status.textContent = "Error: " + e.message; }
+  };
+
+  load("");
+  </script>
+</body>
+</html>

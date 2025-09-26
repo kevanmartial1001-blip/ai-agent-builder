@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="fr">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
@@ -13,7 +13,7 @@
   .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
   label{display:block;font-weight:600;margin:12px 0 6px}
   select,textarea,input,button{width:100%;background:#0f1218;color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
-  textarea{min-height:260px;font-family:ui-monospace,Consolas,Menlo,monospace;font-size:13px}
+  textarea{min-height:220px;font-family:ui-monospace,Consolas,Menlo,monospace;font-size:13px}
   button{cursor:pointer} .primary{background:var(--accent);color:#0b0c10;border:none;font-weight:700}
   .hint{color:var(--muted);font-size:13px}
   #suggestions{position:relative}
@@ -62,22 +62,25 @@
   </div>
 </div>
 
-<!-- IMPORTANT: load the real builder (this exposes window.Builder.buildWorkflowJSON) -->
+<!-- votre builder externe (doit exposer window.Builder.buildWorkflowJSON) -->
 <script src="/builder.js"></script>
 
 <script>
-/* ===== small helpers & state ===== */
+/* ========== Small helpers ========== */
 const $ = id => document.getElementById(id);
-const scenarioSel=$('scenario'), channelSel=$('channel'),
-      searchEl=$('search'), suggestWrap=$('suggestions'),
-      bpTA=$('bp'), dbg=$('dbg');
+const scenarioSel = $('scenario'), channelSel = $('channel'),
+      searchEl = $('search'), suggestWrap = $('suggestions'), bpTA = $('bp'),
+      dbg = $('dbg');
 
-let ALL=[], MAP={};
-let INDUSTRIES=[], IND_MAP={};
+let ALL = [], MAP = {};
+let INDUSTRIES = [], IND_MAP = {};
 
-const listify = v => Array.isArray(v) ? v :
-  String(v ?? '').replace(/^\[|\]$/g,'')
-  .split(/[;,|\n|\|,]+/).map(x=>x.replace(/^['"]|['"]$/g,'').trim()).filter(Boolean);
+/* robust string → array */
+function listify(v){ return Array.isArray(v) ? v : String(v ?? '')
+  .replace(/^\[|\]$/g,'')
+  .split(/[;,|\n|\|,]+/)
+  .map(x=>x.replace(/^['"]|['"]$/g,'').trim())
+  .filter(Boolean); }
 
 async function getJSON(url){
   const r = await fetch(url, { cache:'no-store' });
@@ -100,12 +103,14 @@ function recommendedChannel(row){
   return 'email';
 }
 function matchIndustryForScenario(s){
-  const key=(s.name||'').toLowerCase();
+  const key = (s.name||'').toLowerCase();
   return IND_MAP[key] || null;
 }
+
+/* petite fiche YAML utile en fallback */
 function previewYaml(s, industry){
-  const br=v=> (v==null||String(v).trim()===''?'':String(v));
-  const brList=arr=>`[${listify(arr).join(', ')}]`;
+  const br = v => (v==null || String(v).trim()==='' ? '' : String(v));
+  const brList = arr => `[${listify(arr).join(', ')}]`;
   const ind = industry ? `
 industry_id: ${industry.industry_id}
 industry_painpoints: ${(industry.painpoints||'').toString().slice(0,220)}...` : '';
@@ -122,10 +127,10 @@ roi_hypothesis: >
 tags: [${listify(s.tags).join(', ')}]${ind}`;
 }
 
-/* ===== UI populate & actions ===== */
+/* ========== UI populate + actions ========== */
 function populateUI(list){
-  scenarioSel.innerHTML='';
-  const frag=document.createDocumentFragment();
+  scenarioSel.innerHTML = '';
+  const frag = document.createDocumentFragment();
   list.forEach(s=>{
     const o=document.createElement('option');
     o.value=s.scenario_id; o.textContent=s.scenario_id; o.title=s.name||s.scenario_id;
@@ -134,21 +139,42 @@ function populateUI(list){
   scenarioSel.appendChild(frag);
   if (list.length) applyScenario(list[0].scenario_id);
 }
+
+/* écrire un message d’erreur dans la zone Preview */
+function showPreviewError(msg) {
+  bpTA.value = `/* Preview error */\n${msg}`;
+}
+
 function applyScenario(id){
   const s = MAP[id] || ALL.find(x=>x.scenario_id===id);
-  if (!s) return;
+  if (!s) { showPreviewError('No scenario found for id: ' + id); return; }
+
   const industry = matchIndustryForScenario(s);
   scenarioSel.value = s.scenario_id;
   channelSel.value  = recommendedChannel(s);
-  // preview shows YAML (left) AND real workflow JSON (right) for safety
-  const wf = window.Builder.buildWorkflowJSON(s);   // << use real builder
-  bpTA.value = JSON.stringify(wf, null, 2);
+
+  // 1) Montrer un résumé YAML immédiatement
+  const yaml = previewYaml(s, industry);
+
+  // 2) Essayer de construire le workflow n8n via le builder externe
+  try {
+    if (!window.Builder || typeof window.Builder.buildWorkflowJSON !== 'function') {
+      bpTA.value = `${yaml}\n\n/* Builder not loaded. Check /builder.js (cache/404). */`;
+      console.warn('Builder not loaded. window.Builder =', window.Builder);
+      return;
+    }
+    const wf = window.Builder.buildWorkflowJSON(s);
+    bpTA.value = JSON.stringify(wf, null, 2);
+  } catch (err) {
+    console.error('buildWorkflowJSON() error:', err);
+    bpTA.value = `${yaml}\n\n/* buildWorkflowJSON error */\n${(err && err.message) ? err.message : String(err)}`;
+  }
 }
 
-/* ===== remote search (8k+) ===== */
-let searchTimer=null;
+/* ========== Remote search across 8k+ ========== */
+let searchTimer = null;
 async function remoteSearch(q){
-  if (!q || q.trim().length<2){ suggestWrap.innerHTML=''; return; }
+  if (!q || q.trim().length < 2){ suggestWrap.innerHTML=''; return; }
   const url = `/api/scenarios?q=${encodeURIComponent(q)}&limit=50`;
   const res = await getJSON(url);
   const items = (res.ok && res.json && Array.isArray(res.json.items)) ? res.json.items : [];
@@ -156,7 +182,7 @@ async function remoteSearch(q){
 }
 function renderSuggestions(matches){
   if (!matches || !matches.length){ suggestWrap.innerHTML=''; return; }
-  const box=document.createElement('div'); box.className='suggest-box';
+  const box = document.createElement('div'); box.className='suggest-box';
   box.innerHTML = matches.map(m=>{
     const id=(m.scenario_id||'').replace(/</g,'&lt;');
     const nm=(m.name||'').replace(/</g,'&lt;');
@@ -165,27 +191,28 @@ function renderSuggestions(matches){
         <span class="suggest-name">${nm}</span>
       </div>`;
   }).join('');
-  box.addEventListener('click',(e)=>{
-    const el=e.target.closest('.suggest-item'); if(!el) return;
-    const id=el.getAttribute('data-id');
+  box.addEventListener('click', (e)=>{
+    const el = e.target.closest('.suggest-item'); if(!el) return;
+    const id = el.getAttribute('data-id');
+    // si non présent dans les 25 préchargés, on stocke un minimum
     if (!MAP[id]){
-      const m=matches.find(x=>x.scenario_id===id);
+      const m = matches.find(x=>x.scenario_id===id);
       if (m){
-        MAP[id]={
-          scenario_id:m.scenario_id||'',
-          name:m.name||'',
-          triggers:m.triggers||'',
-          best_reply_shapes:listify(m.best_reply_shapes),
-          risk_notes:m.risk_notes||'',
-          agent_name:m.agent_name||'',
-          how_it_works:m.how_it_works||'',
-          tool_stack_dev:m.tool_stack_dev||'',
-          tool_stack_autonomous:m.tool_stack_autonomous||'',
-          tags:listify(m.tags||m['tags (;)']||'')
+        MAP[id] = {
+          scenario_id: m.scenario_id||'',
+          name: m.name||'',
+          triggers: m.triggers||'',
+          best_reply_shapes: listify(m.best_reply_shapes),
+          risk_notes: m.risk_notes||'',
+          agent_name: m.agent_name||'',
+          how_it_works: m.how_it_works||'',
+          tool_stack_dev: m.tool_stack_dev||'',
+          tool_stack_autonomous: m.tool_stack_autonomous||'',
+          tags: listify(m.tags||m['tags (;)']||'')
         };
       }
     }
-    $('search').value=id;
+    $('search').value = id;
     applyScenario(id);
     suggestWrap.innerHTML='';
   });
@@ -193,36 +220,45 @@ function renderSuggestions(matches){
 }
 searchEl.addEventListener('input', e=>{
   clearTimeout(searchTimer);
-  searchTimer=setTimeout(()=>remoteSearch(e.target.value), 180);
+  searchTimer = setTimeout(()=>remoteSearch(e.target.value), 180);
 });
-searchEl.addEventListener('focus', ()=>{
+searchEl.addEventListener('focus', ()=> {
   if (ALL.length) renderSuggestions(ALL.slice(0,10));
 });
 searchEl.addEventListener('blur', ()=> setTimeout(()=>suggestWrap.innerHTML='',150));
 searchEl.addEventListener('keydown', e=>{
   if (e.key==='Enter'){
-    const v=e.target.value.trim();
+    const v = e.target.value.trim();
     if (MAP[v]){ applyScenario(v); suggestWrap.innerHTML=''; return; }
     remoteSearch(v);
   }
 });
 scenarioSel.addEventListener('change', ()=> applyScenario(scenarioSel.value));
 
-/* ===== download using the real builder ===== */
-function downloadJSON(txt, filename){
+/* ========== Download ========== */
+function downloadJSON(obj, filename){
+  const txt=JSON.stringify(obj,null,2);
   const blob=new Blob([txt],{type:'application/json'});
   const url=URL.createObjectURL(blob);
   const a=document.createElement('a'); a.href=url; a.download=filename; document.body.appendChild(a); a.click(); URL.revokeObjectURL(url); a.remove();
 }
 $('build').addEventListener('click', ()=>{
   const sid=(scenarioSel.value||'').trim(); const s=MAP[sid];
-  if (!s){ dbg.innerHTML='<span class="err">No scenario selected.</span>'; return; }
-  const wf = window.Builder.buildWorkflowJSON(s);  // << REAL builder
-  const txt = JSON.stringify(wf, null, 2);
-  downloadJSON(txt, `${sid}.n8n.json`);
+  if(!s){ dbg.innerHTML='<span class="err">No scenario selected.</span>'; return; }
+
+  try{
+    if (!window.Builder || typeof window.Builder.buildWorkflowJSON !== 'function') {
+      dbg.innerHTML = '<span class="err">Builder not loaded (using YAML in preview only). Check /builder.js.</span>';
+      return;
+    }
+    const wf = window.Builder.buildWorkflowJSON(s);
+    downloadJSON(wf, `${sid}.n8n.json`);
+  } catch (e) {
+    dbg.innerHTML = '<span class="err">buildWorkflowJSON error:</span> ' + (e.message||String(e));
+  }
 });
 
-/* ===== bootstrap (25 fast) ===== */
+/* ========== Bootstrap (ONLY 25 for fast UI) ========== */
 async function bootstrap(){
   try{
     const [sc, ind] = await Promise.all([
@@ -265,6 +301,11 @@ async function bootstrap(){
     populateUI(ALL);
   } catch (e){
     dbg.innerHTML = '<span class="err">Bootstrap error:</span> ' + (e.message||String(e));
+    const fallbackS={scenario_id:'tier1_dso_SCHEDULING_NO_SHOWS',name:'tier1_dso',agent_name:'Scheduling Agent',best_reply_shapes:['sms','email'],how_it_works:'Remind, confirm, backfill.',roi_hypothesis:'Reduce no-shows 30%+'};
+    const fallbackI={industry_id:'tier1_dso',painpoints:'no-shows; front-desk overload',kpis:'no-show rate; utilization'};
+    ALL=[fallbackS]; MAP={ [fallbackS.scenario_id]: fallbackS };
+    INDUSTRIES=[fallbackI]; IND_MAP={ [fallbackI.industry_id]: fallbackI };
+    populateUI(ALL);
   }
 }
 bootstrap();

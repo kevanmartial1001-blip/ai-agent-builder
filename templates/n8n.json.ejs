@@ -2,6 +2,13 @@
   "name": "<%= scenario_id %> – <%= agent_name %> (Demo)",
   "nodes": [
     {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [-1280, -20],
+      "name": "Manual Trigger"
+    },
+    {
       "parameters": {
         "functionCode": "// Global config for the workflow. Flip demoMode to false to use real SMTP.\nreturn [{ json: {\n  demoMode: true,                // << set to false to use Email Send\n  overrideTo: \"you@example.com\"  // optional hardcoded recipient for testing\n}}];"
       },
@@ -32,9 +39,7 @@
       "parameters": {
         "conditions": {
           "boolean": [
-            {
-              "value1": "={{$items(\"Set Demo Config\", 0, 0).json.demoMode}}"
-            }
+            { "value1": "={{$items(\"Set Demo Config\", 0, 0).json.demoMode}}" }
           ]
         }
       },
@@ -102,111 +107,38 @@
     }
   ],
   "connections": {
+    "Manual Trigger": {
+      "main": [[{ "node": "Set Demo Config", "type": "main", "index": 0 }]]
+    },
     "Set Demo Config": {
-      "main": [
-        [
-          {
-            "node": "Load Appointments",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
+      "main": [[{ "node": "Load Appointments", "type": "main", "index": 0 }]]
     },
     "Load Appointments": {
-      "main": [
-        [
-          {
-            "node": "Compose Message",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
+      "main": [[{ "node": "Compose Message", "type": "main", "index": 0 }]]
     },
     "Compose Message": {
-      "main": [
-        [
-          {
-            "node": "Demo Mode?",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
+      "main": [[{ "node": "Demo Mode?", "type": "main", "index": 0 }]]
     },
     "Demo Mode?": {
       "main": [
-        [
-          {
-            "node": "Simulate Send",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Email Send",
-            "type": "main",
-            "index": 0
-          }
-        ]
+        [{ "node": "Simulate Send", "type": "main", "index": 0 }],
+        [{ "node": "Email Send",   "type": "main", "index": 0 }]
       ]
     },
     "Simulate Send": {
-      "main": [
-        [
-          {
-            "node": "Wait for Reply",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
+      "main": [[{ "node": "Wait for Reply", "type": "main", "index": 0 }]]
     },
     "Email Send": {
-      "main": [
-        [
-          {
-            "node": "Wait for Reply",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
+      "main": [[{ "node": "Wait for Reply", "type": "main", "index": 0 }]]
     },
     "Wait for Reply": {
-      "main": [
-        [
-          {
-            "node": "Parse Intent (Demo)",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
+      "main": [[{ "node": "Parse Intent (Demo)", "type": "main", "index": 0 }]]
     },
     "Parse Intent (Demo)": {
-      "main": [
-        [
-          {
-            "node": "Update PMS (Mock)",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
+      "main": [[{ "node": "Update PMS (Mock)", "type": "main", "index": 0 }]]
     },
     "Update PMS (Mock)": {
-      "main": [
-        [
-          {
-            "node": "Fill Slot (Mock)",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
+      "main": [[{ "node": "Fill Slot (Mock)", "type": "main", "index": 0 }]]
     }
   },
   "active": false,

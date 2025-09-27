@@ -1,7 +1,9 @@
 // api/build.js
-// Wide layout, vertical-per-channel branches, no waypoint nodes, fully linked.
-// Adds LLM-driven DECISION steps with explicit outcomes (all paths A→Z).
-// Uses known, conservative n8n node versions (so every node has link handles).
+// Chronological, easy-to-read layout.
+// Left: per-channel Enter → pre-send steps → Send (per channel)
+// Converge: shared Decision node (LLM outcomes or smart defaults)
+// Fan-out: outcome lanes → steps → send → CRM/Calendar updates → collect
+// Spacing increased to avoid overlap. Known node versions so all tiles are linkable.
 // Env: SHEET_ID, GOOGLE_API_KEY, SHEET_TAB?=Scenarios, OPENAI_API_KEY
 
 const HEADERS = {
@@ -11,18 +13,18 @@ const HEADERS = {
   "Content-Type": "application/json; charset=utf-8",
 };
 
-// ====== Layout ======
+// ====== Layout (more space) ======
 const LAYOUT = {
-  laneGap: 1900,
-  stepX: 460,
-  branchY: 440,
-  channelY: 280,
-  prodHeader: { x: -1520, y: 40 },
-  prodStart:  { x: -1380, y: 300 },
-  demoHeader: { x: -1520, y: 40 },
-  demoStart:  { x: -1380, y: 300 },
-  switchX: -300,
-  errorRowYPad: 380,
+  laneGap: 2100,
+  stepX: 520,          // wider columns
+  branchY: 520,        // more space between branches
+  channelY: 360,       // more space between channels in a branch
+  prodHeader: { x: -1680, y: 40 },
+  prodStart:  { x: -1520, y: 320 },
+  demoHeader: { x: -1680, y: 40 },
+  demoStart:  { x: -1520, y: 320 },
+  switchX: -360,
+  errorRowYPad: 420,
 };
 
 const GUIDE = { showWaypoints: false, numberSteps: true };
@@ -39,9 +41,11 @@ const DEFAULT_HTTP = {
   pms_upcoming: "https://example.com/pms/upcoming",
   ticket_create: "https://example.com/ticket/create",
   calendar_book: "https://example.com/calendar/book",
+  crm_upsert: "https://example.com/crm/upsert",
+  crm_log: "https://example.com/crm/log",
+  waitlist_fill: "https://example.com/waitlist/fill",
 };
 
-// ====== Archetypes & rules ======
 const ARCH_RULES = [
   { a:'APPOINTMENT_SCHEDULING', rx:/(appointment|appointments|scheduling|no[-_ ]?show|calendar)/i },
   { a:'CUSTOMER_SUPPORT_INTAKE', rx:/\b(cs|support|helpdesk|ticket|sla|triage|escalation|deflection|kb)\b/i },
@@ -52,18 +56,18 @@ const ARCH_RULES = [
   { a:'CHURN_WINBACK', rx:/\b(churn|win[-_ ]?back|reactivation|retention|loyalty)\b/i },
   { a:'RENEWALS_CSM', rx:/\b(renewal|qbr|success|csm|upsell|cross-?sell)\b/i },
   { a:'AR_FOLLOWUP', rx:/\b(a\/?r|accounts?\s*receivable|invoice|collections?|dso|reconciliation)\b/i },
-  { a:'AP_AUTOMATION', rx:/\b(a\/?p|accounts?\s*payable|invoices?|3[-\s]?way|three[-\s]?way|matching|approvals?)\b/i },
+  { a:'AP_AUTOMATION', rx:/\b(a\/?p|accounts?\s*payable|invoices?|3[-\s]?way|matching|approvals?)\b/i },
   { a:'INVENTORY_MONITOR', rx:/\b(inventory|stock|sku|threshold|warehouse|3pl|wms|backorder)\b/i },
-  { a:'REPLENISHMENT_PO', rx:/\b(replenishment|purchase[-_ ]?order|po|procure|procurement|vendors?|suppliers?)\b/i },
+  { a:'REPLENISHMENT_PO', rx:/\b(replenishment|purchase[-_ ]?order|po|procure|procurement|vendors?)\b/i },
   { a:'FIELD_SERVICE_DISPATCH', rx:/\b(dispatch|work[-_ ]?orders?|technicians?|field|geo|eta|route|yard)\b/i },
-  { a:'COMPLIANCE_AUDIT', rx:/\b(compliance|audit|audits|policy|governance|sox|iso|gdpr|hipaa|attestation)\b/i },
-  { a:'INCIDENT_MGMT', rx:/\b(incident|sev[: ]?(high|p[12])|major|rca|postmortem|downtime|uptime|slo)\b/i },
+  { a:'COMPLIANCE_AUDIT', rx:/\b(compliance|audit|policy|sox|iso|gdpr|hipaa|attestation)\b/i },
+  { a:'INCIDENT_MGMT', rx:/\b(incident|sev[: ]?(high|p[12])|major|rca|downtime|slo)\b/i },
   { a:'DATA_PIPELINE_ETL', rx:/\b(etl|pipeline|ingest|transform|load|csv|s3|gcs|orchestration)\b/i },
-  { a:'REPORTING_KPI_DASH', rx:/\b(dashboard|dashboards|kpi|scorecard|report|reporting)\b/i },
+  { a:'REPORTING_KPI_DASH', rx:/\b(dashboard|kpi|scorecard|report)\b/i },
   { a:'ACCESS_GOVERNANCE', rx:/\b(access|rbac|sso|entitlements|seats|identity|pii|dlp)\b/i },
   { a:'PRIVACY_DSR', rx:/\b(dsr|data\s*subject|privacy\s*request|gdpr|ccpa)\b/i },
   { a:'RECRUITING_INTAKE', rx:/\b(recruit(ing)?|ats|cv|resume|candidate|interviews?)\b/i },
-];
+};
 
 const TRIGGER_PREF = {
   APPOINTMENT_SCHEDULING: 'cron', CUSTOMER_SUPPORT_INTAKE: 'webhook', FEEDBACK_NPS: 'cron',
@@ -116,7 +120,7 @@ async function openaiJSON(prompt, schemaHint){
         temperature:0.35,
         response_format:{type:"json_object"},
         messages:[
-          {role:"system",content:"You are an expert workflow designer for n8n. Exhaustively enumerate decision outcomes. Always return valid JSON."},
+          {role:"system",content:"You are an expert n8n workflow architect. Return exhaustive, chronological decisions. Always valid JSON."},
           {role:"user",content:prompt+(schemaHint?("\n\nSchema:\n"+schemaHint):"")}
         ]
       })
@@ -126,6 +130,7 @@ async function openaiJSON(prompt, schemaHint){
   }catch{ return null; }
 }
 
+// Prompt: ask for explicit chronology & decision outcomes
 function makeDesignerPrompt(row){
   const ctx=[
     `SCENARIO_ID: ${row.scenario_id||''}`,
@@ -139,14 +144,12 @@ function makeDesignerPrompt(row){
     `TAGS: ${row["tags (;)"]||row.tags||''}`,
   ].join("\n");
   return `
-Design a bullet-proof n8n workflow and enumerate ALL realistic outcomes using industry knowledge + context (TRIGGERS/BEST_REPLY_SHAPES/RISK_NOTES/ROI_HYPOTHESIS).
+Design a chronological, bullet-proof workflow. Enforce order:
+(1) Pre-flight/lookups → (2) Compose → (3) Send → (4) Decision (exhaustive outcomes) → (5) Outcome steps → (6) Final updates.
+Use industry knowledge + TRIGGERS/BEST_REPLY_SHAPES/RISK_NOTES/ROI_HYPOTHESIS.
 
-Rules:
-- "trigger": one of ["cron","webhook","imap","manual"].
-- "channels": ordered subset of ["email","sms","whatsapp","call"].
-- "branches": ≤6. Each branch is a high-level path.
-- Step kinds: "compose" | "http" | "update" | "route" | "wait" | "score" | "lookup" | "book" | "ticket" | "notify" | "store" | "decision".
-- A "decision" step MUST include exhaustive "outcomes". Each outcome: { "value": string, "steps": Step[] }.
+Step kinds: "compose" | "http" | "update" | "route" | "wait" | "score" | "lookup" | "book" | "ticket" | "notify" | "store" | "decision".
+A "decision" step MUST include "outcomes": [{ "value": "...", "steps": Step[] }].
 
 Return JSON:
 {
@@ -155,14 +158,14 @@ Return JSON:
   "channels": ["email","sms","whatsapp","call"],
   "branches": [
     { "name":"...", "condition":"...", "steps":[
-        { "name":"...", "kind":"compose|http|update|route|wait|score|lookup|book|ticket|notify|store" },
-        { "name":"...", "kind":"decision", "outcomes":[
-          { "value":"...", "steps":[{ "name":"...","kind":"..." }, ...] }, ...
-        ] }
-    ] }
+      { "name":"...", "kind":"lookup|http|compose|update|..."},
+      { "name":"...", "kind":"decision", "outcomes":[
+        { "value":"...", "steps":[{ "name":"...","kind":"..." }, ...] }, ...
+      ]}
+    ]}
   ],
   "errors": [{ "name":"...", "mitigation":"..." }],
-  "systems": ["pms","crm","calendar","kb","twilio","email"]
+  "systems": ["calendar","crm","kb","twilio","email"]
 }
 
 Context:
@@ -180,8 +183,8 @@ function makeMessagingPrompt(row, archetype, channels){
     `RISK_NOTES: ${row.risk_notes||''}`,
   ].join("\n");
   return `
-Write concise outreach content for ${JSON.stringify(channels)} for archetype ${archetype}.
-No IVR "press 1". 3–6 short lines each.
+Write concise outreach for ${JSON.stringify(channels)} for archetype ${archetype}.
+No IVR. 3–6 short lines each.
 
 Return JSON: { "email": { "subject":"...", "body":"..." }, "sms": {"body":"..."}, "whatsapp":{"body":"..."}, "call":{"script":"..."} }
 
@@ -265,6 +268,44 @@ function makeMessages(row, archetype, channels){
   );
 }
 
+// ====== Helpers: default decision for Scheduling (chronology A→Z) ======
+function schedulingDefaults(){
+  return {
+    name: "Confirm Appointment",
+    kind: "decision",
+    outcomes: [
+      { value:"confirm", steps:[
+        { name:"Update Calendar (confirm slot)", kind:"update" },
+        { name:"CRM Log", kind:"store" },
+        { name:"Reminder T-2h", kind:"notify" }
+      ]},
+      { value:"reschedule", steps:[
+        { name:"Check Availability", kind:"lookup" },
+        { name:"Propose New Slot", kind:"book" }
+      ]},
+      { value:"cancel", steps:[
+        { name:"Release Slot", kind:"update" },
+        { name:"Fill from Waitlist", kind:"http" }
+      ]},
+      { value:"no_response", steps:[
+        { name:"Follow-up Sequence", kind:"notify" }
+      ]}
+    ]
+  };
+}
+function genericDefaults(){
+  return {
+    name: "User Response",
+    kind: "decision",
+    outcomes: [
+      { value:"proceed", steps:[{name:"Update System",kind:"update"}] },
+      { value:"needs_info", steps:[{name:"Request Info",kind:"notify"}] },
+      { value:"escalate", steps:[{name:"Create Ticket",kind:"ticket"}] },
+      { value:"no_response", steps:[{name:"Retry / Reminder",kind:"notify"}] },
+    ],
+  };
+}
+
 // ---------- core build ----------
 async function buildWorkflowFromRow(row, opts){
   const compat=(opts.compat||'safe')==='full'?'full':'safe';
@@ -314,6 +355,7 @@ async function buildWorkflowFromRow(row, opts){
         else trig = addManual(wf, LAYOUT.prodStart.x, LAYOUT.prodStart.y, "Manual Trigger");
       }
 
+      // Init context
       const init = addFunction(wf, isDemo ? "Init Demo Context" : "Init Context (PROD)", `
 const seed=${JSON.stringify(DEMO)};
 const scenario=${JSON.stringify({
@@ -334,18 +376,20 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
         (isDemo?LAYOUT.demoStart.x:LAYOUT.prodStart.x)+LAYOUT.stepX, LAYOUT.prodStart.y);
       connect(wf, trig, init);
 
-      let cursor = init;
-      if(!isDemo && systems.includes('pms')){
-        const fetch = addHTTP(wf, "Fetch Upcoming (PMS)", `={{'${DEFAULT_HTTP.pms_upcoming}'}}`, "={{$json}}", LAYOUT.prodStart.x + 2*LAYOUT.stepX, LAYOUT.prodStart.y);
-        connect(wf, cursor, fetch); cursor = fetch;
+      // Optional pre-flight / lookups (chronology step 1)
+      let preflight = init;
+      if(!isDemo && systems.includes('calendar')){
+        const fetch = addHTTP(wf, "Fetch Upcoming (Calendar)", `={{'${DEFAULT_HTTP.pms_upcoming}'}}`, "={{$json}}", LAYOUT.prodStart.x + 2*LAYOUT.stepX, LAYOUT.prodStart.y);
+        connect(wf, preflight, fetch); preflight = fetch;
       }
 
+      // Branch switch
       const sw = addSwitch(wf, "Branch (LLM)", "={{$json.__branch || 'main'}}",
         (branches.length?branches:[{name:"main"}]).map(b=>({operation:'equal', value2:String(b.name||'main').slice(0,48)})),
         LAYOUT.switchX, LAYOUT.prodStart.y);
-      connect(wf, cursor, sw);
+      connect(wf, preflight, sw);
 
-      // VERTICAL CHANNELS PER BRANCH with DECISION support
+      // Build branches with the orange-zone chronology
       let lastCollectorOfLastBranch = null;
       const baseBranchY = LAYOUT.prodStart.y - Math.floor(LAYOUT.branchY * (Math.max(branches.length,1)-1)/2);
 
@@ -354,98 +398,52 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
         const chCount = Math.max(channels.length,1);
         const firstChY = branchTopY - Math.floor(LAYOUT.channelY * (chCount-1)/2);
 
+        // Split steps into pre-send steps and (optional) decision definition
+        const steps = Array.isArray(b.steps)?b.steps:[];
+        const firstDecisionIdx = steps.findIndex(s=>String(s.kind||'').toLowerCase()==='decision');
+        const preSendSteps = firstDecisionIdx>=0 ? steps.slice(0, firstDecisionIdx) : steps;
+        const decisionSpec = firstDecisionIdx>=0 ? steps[firstDecisionIdx] : null;
+
+        // Shared Decision (one per branch), outcomes from LLM or defaults
+        let decision = decisionSpec;
+        if(!decision || !Array.isArray(decision.outcomes) || !decision.outcomes.length){
+          decision = (archetype==='APPOINTMENT_SCHEDULING') ? schedulingDefaults() : genericDefaults();
+        }
+        const decisionX = LAYOUT.prodStart.x + (5 + Math.max(preSendSteps.length,1))*LAYOUT.stepX;
+
+        const dRules = decision.outcomes.map(o=>({operation:'equal', value2:String(o.value||'outcome').slice(0,64)}));
+        const dSwitchName = `[${GUIDE.numberSteps?`[3] `:''}Decision] ${decision.name}`;
+        const sharedDecision = addSwitch(wf, dSwitchName, "={{$json.__decision || 'default'}}", dRules, decisionX, branchTopY);
+        // We'll connect each channel path into this switch later.
+
         let prevChannelCollector = null;
 
         channels.forEach((ch, chIdx)=>{
           const rowY = firstChY + chIdx*LAYOUT.channelY;
 
+          // [2] Enter + pre-send steps (chronology)
           let stepNo=0;
-          const enterName = GUIDE.numberSteps
-            ? `[${++stepNo}] Enter: ${b.name||'Case'} · ${ch.toUpperCase()}`
-            : `Enter: ${b.name||'Case'} · ${ch.toUpperCase()}`;
-          const enter = addFunction(wf, enterName,
+          const enterName = GUIDE.numberSteps ? `[1] Enter: ${b.name||'Case'} · ${ch.toUpperCase()}` : `Enter: ${b.name||'Case'} · ${ch.toUpperCase()}`;
+          let prev = addFunction(wf, enterName,
             `return [{...$json,__branch:${JSON.stringify(b.name||'case')},__cond:${JSON.stringify(b.condition||'')},__channel:${JSON.stringify(ch)}}];`,
-            LAYOUT.prodStart.x + 4*LAYOUT.stepX, rowY);
+            LAYOUT.prodStart.x + 3*LAYOUT.stepX, rowY);
 
-          if (chIdx === 0) connect(wf, sw, enter, bIdx);
-          if (prevChannelCollector) connect(wf, prevChannelCollector, enter);
+          if (chIdx === 0) connect(wf, sw, prev, bIdx);
+          if (prevChannelCollector) connect(wf, prevChannelCollector, prev);
 
-          const steps = Array.isArray(b.steps)?b.steps:[];
-          let prev = enter;
-
-          for (let k=0; k<steps.length; k++){
-            const st = steps[k];
-            const x = LAYOUT.prodStart.x + (5+k)*LAYOUT.stepX;
-            const title = GUIDE.numberSteps ? `[${++stepNo}] ${st.name||'Step'}` : (st.name||'Step');
+          // Pre-send steps
+          preSendSteps.forEach((st,k)=>{
+            const x = LAYOUT.prodStart.x + (4+k)*LAYOUT.stepX;
+            const title = GUIDE.numberSteps ? `[2.${k+1}] ${st.name||'Step'}` : (st.name||'Step');
             const kind=String(st.kind||'').toLowerCase();
-
-            if(kind==='decision' && Array.isArray(st.outcomes) && st.outcomes.length){
-              // Decision: fan out lanes per outcome
-              const rulz = st.outcomes.map(o=>({operation:'equal', value2:String(o.value||'outcome').slice(0,64)}));
-              const dSwitch = addSwitch(wf, `${title} (Decision)`, "={{$json.__decision || 'default'}}", rulz, x, rowY);
-              connect(wf, prev, dSwitch);
-
-              let lastOutcomeCollector = null;
-              st.outcomes.forEach((o, oIdx)=>{
-                const oy = rowY - 120 + (oIdx*120);
-                const oEnter = addFunction(wf, `[${stepNo}.${oIdx+1}] Outcome: ${o.value||'path'}`,
-                  `return [{...$json,__decision:${JSON.stringify(String(o.value||'path'))}}];`,
-                  x + Math.floor(LAYOUT.stepX*0.6), oy);
-                connect(wf, dSwitch, oEnter, oIdx);
-
-                let oPrev = oEnter;
-                const oSteps = Array.isArray(o.steps)?o.steps:[];
-                oSteps.forEach((os, ok)=>{
-                  const ox = x + (ok+1)*Math.floor(LAYOUT.stepX*0.8);
-                  const ot = `[${stepNo}.${oIdx+1}.${ok+1}] ${os.name||'Step'}`;
-                  const okind = String(os.kind||'').toLowerCase();
-                  let node;
-                  if(okind==='compose'){
-                    node = addFunction(wf, ot, `
-const ch=${JSON.stringify(ch)};
-const m=$json.msg||{};
-const bodies={ email:(m.email?.body)||'', sms:(m.sms?.body)||'', whatsapp:(m.whatsapp?.body)||'', call:(m.call?.script)||''};
-return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, ox, oy);
-                  } else if(['http','update','store','notify','route'].includes(okind)){
-                    node = addHTTP(wf, ot, "={{'https://example.com/step'}}", "={{$json}}", ox, oy);
-                  } else if(okind==='book'){
-                    node = addHTTP(wf, ot, `={{'${DEFAULT_HTTP.calendar_book}'}}`, "={{$json}}", ox, oy);
-                  } else if(okind==='ticket'){
-                    node = addHTTP(wf, ot, `={{'${DEFAULT_HTTP.ticket_create}'}}`, "={{$json}}", ox, oy);
-                  } else {
-                    node = addFunction(wf, ot, "return [$json];", ox, oy);
-                  }
-                  connect(wf, oPrev, node);
-                  oPrev = node;
-                });
-
-                // Sender & collector for this outcome
-                const sendX = x + Math.floor(LAYOUT.stepX*0.8) + (Math.max(oSteps.length,0)+1)*Math.floor(LAYOUT.stepX*0.8);
-                const sender = makeSenderNode(wf, ch, sendX, oy, compat, isDemo);
-                try{ wf.nodes[wf.nodes.findIndex(n=>n.name===sender)].name = `[${stepNo}.${oIdx+1}] Send: ${ch.toUpperCase()}`; }catch{}
-                connect(wf, oPrev, sender);
-
-                const oCollector = addCollector(wf, sendX + Math.floor(LAYOUT.stepX*0.6), oy);
-                connect(wf, sender, oCollector);
-
-                if (lastOutcomeCollector) connect(wf, lastOutcomeCollector, oCollector);
-                lastOutcomeCollector = oCollector;
-              });
-
-              prev = lastOutcomeCollector; // continue after decision fan-in
-              continue;
-            }
-
-            // Non-decision step
             let node;
             if(kind==='compose'){
               node = addFunction(wf, title, `
 const ch=${JSON.stringify(ch)};
-const m=$json||{};
-const msg=$json.msg||{};
-const bodies={ email:(msg.email?.body)||'', sms:(msg.sms?.body)||'', whatsapp:(msg.whatsapp?.body)||'', call:(msg.call?.script)||''};
-return [{...m, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
-            } else if(['http','update','store','notify','route'].includes(kind)){
+const m=$json.msg||{};
+const bodies={ email:(m.email?.body)||'', sms:(m.sms?.body)||'', whatsapp:(m.whatsapp?.body)||'', call:(m.call?.script)||''};
+return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
+            } else if(['http','update','store','notify','route','lookup','score','wait'].includes(kind)){
               node = addHTTP(wf, title, "={{'https://example.com/step'}}", "={{$json}}", x, rowY);
             } else if(kind==='book'){
               node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.calendar_book}'}}`, "={{$json}}", x, rowY);
@@ -454,30 +452,82 @@ return [{...m, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
             } else{
               node = addFunction(wf, title, "return [$json];", x, rowY);
             }
-            connect(wf, prev, node);
-            prev = node;
-          }
+            connect(wf, prev, node); prev = node;
+          });
 
-          // Send + collect when last step was NOT a decision
-          const lastIsDecision = steps.some(s=>String(s.kind||'').toLowerCase()==='decision');
-          if(!lastIsDecision){
-            const sendX = LAYOUT.prodStart.x + (5 + steps.length)*LAYOUT.stepX;
-            const sendTitle = GUIDE.numberSteps ? `[${++stepNo}] Send: ${ch.toUpperCase()}` : `Send: ${ch.toUpperCase()}`;
-            const sender = makeSenderNode(wf, ch, sendX, rowY, compat, isDemo);
-            try{ wf.nodes[wf.nodes.findIndex(n=>n.name===sender)].name = sendTitle; }catch{}
-            connect(wf, prev, sender);
-            const collector = addCollector(wf, sendX + LAYOUT.stepX, rowY);
-            connect(wf, sender, collector);
-            if (prevChannelCollector) connect(wf, prevChannelCollector, collector);
-            prevChannelCollector = collector;
-          }
+          // Send per channel
+          const sendX = LAYOUT.prodStart.x + (4 + Math.max(preSendSteps.length,0))*LAYOUT.stepX;
+          const sendTitle = GUIDE.numberSteps ? `[3] Send: ${ch.toUpperCase()}` : `Send: ${ch.toUpperCase()}`;
+          const sender = makeSenderNode(wf, ch, sendX, rowY, compat, isDemo);
+          try{ wf.nodes[wf.nodes.findIndex(n=>n.name===sender)].name = sendTitle; }catch{}
+          connect(wf, prev, sender);
 
-          if (bIdx === (Math.max(branches.length,1)-1) && chIdx === (chCount-1)) {
-            lastCollectorOfLastBranch = prevChannelCollector;
-          }
+          // Converge into the shared Decision
+          connect(wf, sender, sharedDecision);
+
+          // We’ll finish the per-channel chain after the decision fan-in, using collectors.
+          // For readability, set the running collector as the Decision node (it chains later).
+          prevChannelCollector = sharedDecision;
         });
+
+        // Decision fan-out lanes (chronology [4] + [5])
+        let lastOutcomeCollector = null;
+        decision.outcomes.forEach((o, idx)=>{
+          const oy = branchTopY - Math.floor(140*decision.outcomes.length/2) + idx*140;
+          const oEnter = addFunction(wf, `[4.${idx+1}] Outcome: ${o.value||'path'}`,
+            `return [{...$json,__decision:${JSON.stringify(String(o.value||'path'))}}];`,
+            decisionX + Math.floor(LAYOUT.stepX*0.6), oy);
+          connect(wf, sharedDecision, oEnter, idx);
+
+          let oPrev = oEnter;
+          const oSteps = Array.isArray(o.steps)?o.steps:[];
+          oSteps.forEach((os, ok)=>{
+            const ox = decisionX + (ok+1)*Math.floor(LAYOUT.stepX*0.8);
+            const ot = `[5.${idx+1}.${ok+1}] ${os.name||'Step'}`;
+            const okind = String(os.kind||'').toLowerCase();
+            let node;
+            if(okind==='compose'){
+              node = addFunction(wf, ot, `
+const ch=$json.__channel || 'email';
+const m=$json.msg||{};
+const bodies={ email:(m.email?.body)||'', sms:(m.sms?.body)||'', whatsapp:(m.whatsapp?.body)||'', call:(m.call?.script)||''};
+return [{...$json, message:bodies[ch] || bodies.email || 'Update'}];`, ox, oy);
+            } else if(['http','update','store','notify','route','lookup','score','wait'].includes(okind)){
+              node = addHTTP(wf, ot, "={{'https://example.com/step'}}", "={{$json}}", ox, oy);
+            } else if(okind==='book'){
+              node = addHTTP(wf, ot, `={{'${DEFAULT_HTTP.calendar_book}'}}`, "={{$json}}", ox, oy);
+            } else if(okind==='ticket'){
+              node = addHTTP(wf, ot, `={{'${DEFAULT_HTTP.ticket_create}'}}`, "={{$json}}", ox, oy);
+            } else {
+              node = addFunction(wf, ot, "return [$json];", ox, oy);
+            }
+            connect(wf, oPrev, node); oPrev = node;
+          });
+
+          // Post-decision send (confirmation, reminders, etc.)
+          const send2 = makeSenderNode(wf, 'email', decisionX + Math.floor(LAYOUT.stepX*0.8) + (Math.max(oSteps.length,0)+1)*Math.floor(LAYOUT.stepX*0.8), oy, compat, isDemo);
+          try{ wf.nodes[wf.nodes.findIndex(n=>n.name===send2)].name = `[6.${idx+1}] Send: EMAIL/CONFIRM`; }catch{}
+          connect(wf, oPrev, send2);
+
+          // Final updates (CRM/Calendar) and collector
+          const upd = addHTTP(wf, `[7.${idx+1}] Final Update (CRM/Calendar)`,
+            "={{$json.__decision==='confirm' ? '"+DEFAULT_HTTP.crm_upsert+"' : '"+DEFAULT_HTTP.crm_log+"'}}",
+            "={{$json}}", pos(decisionX + Math.floor(LAYOUT.stepX*1.6) + (Math.max(oSteps.length,0)+1)*Math.floor(LAYOUT.stepX*0.8), oy)[0],
+            oy);
+          connect(wf, send2, upd);
+
+          const oCollector = addCollector(wf, upd.position[0] + Math.floor(LAYOUT.stepX*0.6), oy);
+          connect(wf, upd, oCollector);
+
+          if (lastOutcomeCollector) connect(wf, lastOutcomeCollector, oCollector);
+          lastOutcomeCollector = oCollector;
+        });
+
+        // Keep reference to chain branches
+        lastCollectorOfLastBranch = lastOutcomeCollector;
       });
 
+      // Errors row
       if(errors.length && lastCollectorOfLastBranch){
         const bottomOfBranches = baseBranchY + (Math.max(branches.length,1)-1)*LAYOUT.branchY;
         const errY = bottomOfBranches + LAYOUT.errorRowYPad;
@@ -486,8 +536,7 @@ return [{...m, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
         errors.forEach((e,i)=>{
           const fix = addFunction(wf, GUIDE.numberSteps?`[E${i+1}] ${e.name||'Error'}`:(e.name||'Error'),
             `// ${e.mitigation||''}\nreturn [$json];`, LAYOUT.prodStart.x + (5+i)*LAYOUT.stepX, errY);
-          connect(wf, prev, fix);
-          prev = fix;
+          connect(wf, prev, fix); prev = fix;
         });
         const fin = addCollector(wf, LAYOUT.prodStart.x + (6 + errors.length)*LAYOUT.stepX, errY);
         connect(wf, prev, fin);
@@ -502,12 +551,13 @@ return [{...m, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
   }
 
   wf.staticData=wf.staticData||{};
-  wf.staticData.__design={ archetype, prodTrigger, channels, systems, branches, errors, guide: GUIDE, layout: { verticalChannels: true, decisions: "switch+lanes" } };
+  wf.staticData.__design={ archetype, prodTrigger, channels, systems, branches, errors, guide: GUIDE,
+    layout: { verticalChannels:true, sharedDecision:true, chronology:true } };
 
   return sanitizeWorkflow(wf);
 }
 
-// ---------- HTTP handler (same signature as your working version) ----------
+// ---------- HTTP handler (same signature) ----------
 module.exports = async (req,res)=>{
   Object.entries(HEADERS).forEach(([k,v])=>res.setHeader(k,v));
   if(req.method==="OPTIONS") return res.status(204).end();
@@ -537,5 +587,5 @@ module.exports = async (req,res)=>{
   }
 };
 
-// Force Node runtime on Vercel (same as before)
+// Force Node runtime on Vercel
 module.exports.config = { runtime: 'nodejs20.x' };

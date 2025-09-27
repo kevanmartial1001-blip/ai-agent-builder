@@ -1,16 +1,25 @@
 // api/build.js
-// Deep per-scenario builder (server-side).
-// - Reads one scenario row from Google Sheets
-// - Uses LLM to propose schema (triggers / branches / channels / errors) and messaging
-// - Builds two lanes: PROD (real trigger, external tools present) + DEMO (manual trigger + seeded contacts + fake tools)
-// - Safe import sanitization (no undefined types or dangling connections)
-// Env vars: SHEET_ID, GOOGLE_API_KEY, SHEET_TAB?=Scenarios, OPENAI_API_KEY
+// Deep per-scenario builder with better layout spacing + mirrored demo lane.
+// Env: SHEET_ID, GOOGLE_API_KEY, SHEET_TAB?=Scenarios, OPENAI_API_KEY
 
 const HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
   "Content-Type": "application/json; charset=utf-8",
+};
+
+// ====== Layout tuning (more space so labels show clearly) ======
+const LAYOUT = {
+  laneGap: 1600,   // vertical distance between PROD and DEMO lanes
+  stepX: 340,      // horizontal distance between nodes
+  branchY: 280,    // vertical distance between branches
+  prodHeader: { x: -1320, y: 40 },
+  prodStart:  { x: -1180, y: 300 },
+  demoHeader: { x: -1320, y: 40 },
+  demoStart:  { x: -1180, y: 300 },
+  switchX: -220,
+  errorRowYPad: 240, // extra padding under the last branch row for errors block
 };
 
 const DEMO = {
@@ -105,6 +114,9 @@ const CHANNEL_NORMALIZE = [
   { k: 'email', rx: /email/i },
 ];
 
+// ---------- utils ----------
+const uid = (p) => `${p}_${Math.random().toString(36).slice(2, 10)}`;
+const pos = (x, y) => [x, y];
 function toObj(header, row) {
   return Object.fromEntries(header.map((h, i) => [h, (row[i] ?? "").toString().trim()]));
 }
@@ -120,6 +132,7 @@ function chooseArchetype(row) {
   return 'SALES_OUTREACH';
 }
 
+// ---------- sheet + llm ----------
 async function fetchSheetRowByScenarioId(scenarioId) {
   const SHEET_ID = process.env.SHEET_ID;
   const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
@@ -139,7 +152,7 @@ async function fetchSheetRowByScenarioId(scenarioId) {
 
 async function openaiJSON(prompt, schemaHint) {
   const key = process.env.OPENAI_API_KEY;
-  if (!key) return null; // allow fallback when not configured
+  if (!key) return null;
   try {
     const r = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
@@ -163,7 +176,6 @@ async function openaiJSON(prompt, schemaHint) {
   }
 }
 
-/* ---------- LLM prompts (from your spec) ---------- */
 function makeDesignerPrompt(row) {
   const ctx = [
     `SCENARIO_ID: ${row.scenario_id || ''}`,
@@ -179,23 +191,19 @@ function makeDesignerPrompt(row) {
 
   return `
 Based on the context below, design a bullet-proof workflow shape for n8n with:
-- "trigger": one of ["cron","webhook","imap","manual"] (what should start PROD lane)
+- "trigger": one of ["cron","webhook","imap","manual"]
 - "channels": array subset of ["email","sms","whatsapp","call"] in recommended order
-- "branches": an array of conditional situations users may choose or that may occur (max 6). Each branch has:
-   { "name": string, "condition": string (plain language), "steps": [ { "name": string, "kind": string } ] }
-- "errors": most likely error cases and the auto-handling (2–4 items)
-- "systems": list of external systems to involve (e.g. ["pms","crm","calendar","slack","wms","erp","accounting","kb","bi","iam","privacy","ats"])
-- "archetype": choose the closest of these 20 and allow customizing it:
-  [APPOINTMENT_SCHEDULING, CUSTOMER_SUPPORT_INTAKE, FEEDBACK_NPS, KNOWLEDGEBASE_FAQ, SALES_OUTREACH,
-   LEAD_QUAL_INBOUND, CHURN_WINBACK, RENEWALS_CSM, AR_FOLLOWUP, AP_AUTOMATION, INVENTORY_MONITOR,
-   REPLENISHMENT_PO, FIELD_SERVICE_DISPATCH, COMPLIANCE_AUDIT, INCIDENT_MGMT, DATA_PIPELINE_ETL,
-   REPORTING_KPI_DASH, ACCESS_GOVERNANCE, PRIVACY_DSR, RECRUITING_INTAKE]
+- "branches": array (max 6). Each branch:
+   { "name": string, "condition": string, "steps": [ { "name": string, "kind": "compose|http|update|route|wait|score|lookup|book|ticket|notify|store|decision" } ] }
+- "errors": likely errors + mitigations
+- "systems": external systems to involve
+- "archetype": one of the 20 standard archetypes (allow customizing to fit case)
 Return JSON:
 {
   "archetype": "...",
   "trigger": "cron|webhook|imap|manual",
   "channels": ["email","sms",...],
-  "branches": [{ "name": "...", "condition": "...", "steps": [{ "name":"...", "kind":"compose|http|update|route|wait|score|lookup|book|ticket|notify|store|decision" }] }],
+  "branches": [{ "name": "...", "condition": "...", "steps": [{"name":"...","kind":"..."}]}],
   "errors": [{ "name":"...", "mitigation":"..." }],
   "systems": ["pms","crm",...]
 }
@@ -225,10 +233,7 @@ ${ctx}
 `;
 }
 
-/* ---------- workflow builder primitives ---------- */
-const uid = (p) => `${p}_${Math.random().toString(36).slice(2, 10)}`;
-const pos = (x, y) => [x, y];
-
+// ---------- workflow primitives ----------
 function baseWorkflow(name) {
   return { name, nodes: [], connections: {}, active: false, settings: {}, staticData: {}, __yOffset: 0 };
 }
@@ -249,7 +254,7 @@ function withYOffset(wf, yOffset, fn) {
   wf.__yOffset = yOffset;
   try { fn(); } finally { wf.__yOffset = prev; }
 }
-function addHeader(wf, label, x=-1320, y=40) {
+function addHeader(wf, label, x, y) {
   return addNode(wf, {
     id: uid("label"),
     name: `=== ${label} ===`,
@@ -259,10 +264,10 @@ function addHeader(wf, label, x=-1320, y=40) {
     parameters: { functionCode: "return [$json];" }
   });
 }
-function addManual(wf, x=-1180, y=300, label="Manual Trigger") {
+function addManual(wf, x, y, label="Manual Trigger") {
   return addNode(wf, { id: uid("manual"), name: label, type: "n8n-nodes-base.manualTrigger", typeVersion: 1, position: pos(x, y), parameters: {} });
 }
-function addCron(wf, label="Cron (15m)", x=-1180, y=140, compat='safe') {
+function addCron(wf, label, x, y, compat) {
   if (compat === "full") {
     return addNode(wf, { id: uid("cron"), name: label, type: "n8n-nodes-base.cron", typeVersion: 1, position: pos(x, y),
       parameters: { triggerTimes: { item: [{ mode: "everyX", everyX: { hours: 0, minutes: 15 } }] } } });
@@ -270,7 +275,7 @@ function addCron(wf, label="Cron (15m)", x=-1180, y=140, compat='safe') {
   return addNode(wf, { id: uid("cronph"), name: `${label} (Placeholder)`, type: "n8n-nodes-base.function", typeVersion: 2, position: pos(x, y),
     parameters: { functionCode: "return [$json];" } });
 }
-function addWebhook(wf, label="Webhook (Incoming)", x=-1180, y=300, compat='safe') {
+function addWebhook(wf, label, x, y, compat) {
   if (compat === "full") {
     return addNode(wf, { id: uid("webhook"), name: label, type: "n8n-nodes-base.webhook", typeVersion: 1, position: pos(x, y),
       parameters: { path: uid("hook"), methods: ["POST"], responseMode: "onReceived" } });
@@ -278,7 +283,7 @@ function addWebhook(wf, label="Webhook (Incoming)", x=-1180, y=300, compat='safe
   return addNode(wf, { id: uid("webph"), name: `${label} (Placeholder)`, type: "n8n-nodes-base.function", typeVersion: 2, position: pos(x, y),
     parameters: { functionCode: "return [$json];" } });
 }
-function addHTTP(wf, name, urlExpr, bodyExpr, x, y, method="POST", compat='safe') {
+function addHTTP(wf, name, urlExpr, bodyExpr, x, y, method="POST") {
   return addNode(wf, { id: uid("http"), name, type: "n8n-nodes-base.httpRequest", typeVersion: 4, position: pos(x, y),
     parameters: { url: urlExpr, method, jsonParameters: true, sendBody: true, bodyParametersJson: bodyExpr } });
 }
@@ -298,256 +303,16 @@ function addSplit(wf, x, y, size=20) {
   return addNode(wf, { id: uid("split"), name: "Split In Batches", type: "n8n-nodes-base.splitInBatches", typeVersion: 1, position: pos(x, y),
     parameters: { batchSize: size } });
 }
-function addCollector(wf, x=1600, y=300) {
+function addCollector(wf, x, y) {
   return addFunction(wf, "Collector (Inspect)", `
 const now=new Date().toISOString();
 const arr=Array.isArray(items)?items:[{json:$json}];
-return arr.map((it,i)=>({json:{...it.json,__collected_at:now, index:i}}));`, x,y);
-}
-function sanitizeWorkflow(wf) {
-  const REQUIRED_TYPE = "n8n-nodes-base.function";
-  const nameCounts = {};
-  const byName = new Map();
-
-  wf.nodes = (wf.nodes || []).map((n, idx) => {
-    if (!n.name || typeof n.name !== "string") n.name = `Node ${idx+1}`;
-    const k = n.name.toLowerCase();
-    if (nameCounts[k] == null) nameCounts[k] = 0; else nameCounts[k] += 1;
-    if (nameCounts[k] > 0) n.name = `${n.name} #${nameCounts[k]}`;
-
-    if (!n.type || typeof n.type !== "string" || !n.type.trim()) {
-      n.type = REQUIRED_TYPE;
-      n.typeVersion = typeof n.typeVersion === "number" ? n.typeVersion : 2;
-      n.parameters ||= { functionCode: "return [$json];" };
-    }
-    if (typeof n.typeVersion !== "number") n.typeVersion = 1;
-
-    if (!Array.isArray(n.position) || n.position.length !== 2) {
-      n.position = [ -1000, 300 + (idx * 40) ];
-    } else {
-      n.position = [ Number(n.position[0]) || 0, Number(n.position[1]) || 0 ];
-    }
-    if (!n.parameters || typeof n.parameters !== "object") n.parameters = {};
-    byName.set(n.name, n);
-    return n;
-  });
-
-  const conns = wf.connections || {};
-  for (const [from, m] of Object.entries(conns)) {
-    if (!byName.has(from)) { delete conns[from]; continue; }
-    if (!m || typeof m !== "object") { delete conns[from]; continue; }
-    if (!Array.isArray(m.main)) m.main = [];
-    m.main = m.main.map(arr => Array.isArray(arr) ? arr.filter(link => byName.has(link?.node)) : []);
-  }
-  wf.connections = conns;
-  wf.name = String(wf.name || "AI Agent Workflow");
-  return wf;
+return arr.map((it,i)=>({json:{...it.json,__collected_at:now, index:i}}));`, x, y);
 }
 
-/* ---------- Main build function ---------- */
-async function buildWorkflowFromRow(row, opts) {
-  const compat = (opts.compat || 'safe') === 'full' ? 'full' : 'safe';
-  const includeDemo = opts.includeDemo !== false;
-
-  // Normalize shapes → channels
-  const channels = [];
-  const shapes = listify(row.best_reply_shapes);
-  for (const sh of shapes) {
-    for (const norm of CHANNEL_NORMALIZE) {
-      if (norm.rx.test(sh) && !channels.includes(norm.k)) channels.push(norm.k);
-    }
-  }
-  if (!channels.length) channels.push('email');
-
-  // Initial archetype guess (then LLM may refine)
-  let archetype = chooseArchetype(row);
-  let prodTrigger = TRIGGER_PREF[archetype] || 'manual';
-
-  // Ask the LLM for schema + systems + refined archetype
-  const designer = await openaiJSON(
-    makeDesignerPrompt(row),
-    `{"archetype":string,"trigger":"cron|webhook|imap|manual","channels":string[],"branches":[{"name":string,"condition":string,"steps":[{"name":string,"kind":string}]}],"errors":[{"name":string,"mitigation":string}],"systems":string[]}`
-  );
-
-  const design = designer || {};
-  if (Array.isArray(design.channels) && design.channels.length) {
-    // trust LLM order but keep only known
-    const allowed = ['email','sms','whatsapp','call'];
-    const llmCh = design.channels.filter(c => allowed.includes(String(c).toLowerCase()));
-    if (llmCh.length) { channels.splice(0, channels.length, ...llmCh); }
-  }
-  if (typeof design.trigger === 'string') {
-    const v = design.trigger.toLowerCase();
-    if (['cron','webhook','imap','manual'].includes(v)) prodTrigger = v;
-  }
-  if (typeof design.archetype === 'string' && design.archetype.trim()) {
-    archetype = design.archetype.trim().toUpperCase();
-  }
-  const systems = Array.isArray(design.systems) ? design.systems.map(s=>String(s).toLowerCase()) : [];
-
-  // Ask the LLM for bespoke messaging
-  const msg = await openaiJSON(
-    makeMessagingPrompt(row, archetype, channels),
-    `{"email":{"subject":string,"body":string},"sms":{"body":string},"whatsapp":{"body":string},"call":{"script":string}}`
-  ) || {};
-
-  const title = `${row.scenario_id || 'Scenario'} — ${row.name || ''}`.trim();
-  const wf = baseWorkflow(title);
-
-  // --------- Lane A: PROD ----------
-  withYOffset(wf, 0, () => {
-    addHeader(wf, "PRODUCTION LANE", -1320, 40);
-    // trigger
-    let startName;
-    if (prodTrigger === 'cron') startName = addCron(wf, "Cron (from LLM)", -1180, 140, compat);
-    else if (prodTrigger === 'webhook') startName = addWebhook(wf, "Webhook (from LLM)", -1180, 300, compat);
-    else if (prodTrigger === 'imap') startName = addFunction(wf, "IMAP Intake (Placeholder)", "return [$json];", -1180, 300);
-    else startName = addManual(wf, -1180, 300, "Manual Trigger");
-
-    // init context
-    const init = addFunction(wf, "Init Context (PROD)", `
-const scenario=${JSON.stringify({
-      scenario_id: row.scenario_id || '',
-      agent_name: row.agent_name || '',
-      name: row.name || '',
-      triggers: row.triggers || '',
-      how_it_works: row.how_it_works || '',
-      roi_hypothesis: row.roi_hypothesis || '',
-      risk_notes: row.risk_notes || '',
-      tags: listify(row["tags (;)"] || row.tags),
-      archetype,
-    })};
-const channels=${JSON.stringify(channels)};
-const systems=${JSON.stringify(systems)};
-const msg=${JSON.stringify(msg)};
-return [{...$json, scenario, channels, systems, msg}];
-`, -940, 300);
-    connect(wf, startName, init);
-
-    // optional fetch lists for certain archetypes/systems
-    let cursor = init;
-    if (systems.includes('pms')) {
-      const fetch = addHTTP(wf, "Fetch Upcoming (PMS)", `={{'${DEFAULT_HTTP.pms_upcoming}'}}`, "={{$json}}", -700, 300, "POST", compat);
-      connect(wf, cursor, fetch); cursor = fetch;
-    }
-    if (['RENEWALS_CSM','AR_FOLLOWUP','REPORTING_KPI_DASH','DATA_PIPELINE_ETL'].includes(archetype)) {
-      const split = addSplit(wf, -460, 300, 25); connect(wf, cursor, split); cursor = split;
-    }
-
-    // branch switch (from LLM)
-    const branches = Array.isArray(design.branches) ? design.branches : [];
-    let afterBranch = cursor;
-    if (branches.length) {
-      const sw = addSwitch(wf, "Branch (LLM)", "={{$json.__branch || 'main'}}",
-        branches.map(b => ({ operation: 'equal', value2: String(b.name || 'case').slice(0,48) })), -220, 300);
-      connect(wf, cursor, sw);
-
-      // For each branch, add its steps
-      branches.forEach((b, idx) => {
-        let prev = addFunction(wf, `Enter: ${b.name || 'Case'}`, `return [{...$json,__branch:${JSON.stringify(b.name||'case')},__cond:${JSON.stringify(b.condition||'')}}];`,
-          40, 180 + (idx * 120));
-        connect(wf, sw, prev, idx);
-        (Array.isArray(b.steps) ? b.steps : []).forEach((st, k) => {
-          const kind = String(st.kind || '').toLowerCase();
-          let nodeName;
-          if (kind === 'compose') {
-            nodeName = addFunction(wf, `Compose — ${st.name || 'Message'}`, `
-const ch=($json.channels && $json.channels[0]) || 'email';
-const m=$json.msg||{};
-const bodies={ email:(m.email?.body)||'', sms:(m.sms?.body)||'', whatsapp:(m.whatsapp?.body)||'', call:(m.call?.script)||''};
-return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, 300 + (k*260), 180 + (idx*120));
-          } else if (kind === 'http' || kind === 'update' || kind === 'store') {
-            nodeName = addHTTP(wf, st.name || 'HTTP', "={{'https://example.com/step'}}", "={{$json}}", 300 + (k*260), 180 + (idx*120), "POST", compat);
-          } else if (kind === 'book') {
-            nodeName = addHTTP(wf, st.name || 'Book Calendar', `={{'${DEFAULT_HTTP.calendar_book}'}}`, "={{$json}}", 300 + (k*260), 180 + (idx*120), "POST", compat);
-          } else if (kind === 'ticket') {
-            nodeName = addHTTP(wf, st.name || 'Create Ticket', `={{'${DEFAULT_HTTP.ticket_create}'}}`, "={{$json}}", 300 + (k*260), 180 + (idx*120), "POST", compat);
-          } else if (kind === 'lookup' || kind === 'score' || kind === 'decision' || kind === 'route' || kind === 'wait') {
-            nodeName = addFunction(wf, `${st.name || 'Logic'}`, "return [$json];", 300 + (k*260), 180 + (idx*120));
-          } else {
-            nodeName = addFunction(wf, `${st.name || 'Step'}`, "return [$json];", 300 + (k*260), 180 + (idx*120));
-          }
-          connect(wf, prev, nodeName);
-          prev = nodeName;
-        });
-        // After each branch path, send on channels (drip)
-        let last = prev;
-        channels.forEach((ch, i) => {
-          const sender = makeSenderNode(wf, ch, 300 + ( ( (Array.isArray(b.steps)?b.steps.length:0) + 1 + i) * 260), 180 + (idx*120), compat, false);
-          connect(wf, last, sender);
-          last = sender;
-        });
-        const merge = addCollector(wf, 300 + ( ((Array.isArray(b.steps)?b.steps.length:0) + channels.length + 2) * 260), 180 + (idx*120));
-        connect(wf, last, merge);
-        afterBranch = merge; // last merge becomes cursor
-      });
-    }
-
-    // errors handling
-    const errors = Array.isArray(design.errors) ? design.errors : [];
-    if (errors.length) {
-      const errGate = addFunction(wf, "Error Monitor (LLM List)", `return [$json];`, 40, 520);
-      connect(wf, afterBranch, errGate);
-      let prev = errGate;
-      errors.forEach((e, idx) => {
-        const fix = addFunction(wf, `Mitigate: ${e.name || 'Error'}`, `// ${e.mitigation || ''}\nreturn [$json];`, 300 + idx*260, 520);
-        connect(wf, prev, fix);
-        prev = fix;
-      });
-      const fin = addCollector(wf, 300 + errors.length*260 + 260, 520);
-      connect(wf, prev, fin);
-    }
-  });
-
-  // --------- Lane B: DEMO ----------
-  if (includeDemo) {
-    withYOffset(wf, 900, () => {
-      addHeader(wf, "DEMO LANE (Manual Trigger + Seeded Contacts)", -1320, 40);
-      const man = addManual(wf, -1180, 300, "Demo Manual Trigger");
-      const init = addFunction(wf, "Init Demo Context", `
-const seed=${JSON.stringify(DEMO)};
-const scenario=${JSON.stringify({
-        scenario_id: row.scenario_id || '',
-        agent_name: row.agent_name || '',
-        name: row.name || '',
-        triggers: row.triggers || '',
-        how_it_works: row.how_it_works || '',
-        roi_hypothesis: row.roi_hypothesis || '',
-        risk_notes: row.risk_notes || '',
-        tags: listify(row["tags (;)"] || row.tags),
-        archetype,
-      })};
-const channels=${JSON.stringify(channels)};
-const msg=${JSON.stringify(msg)};
-return [{...seed, scenario, channels, msg, demo:true}];
-`, -940, 300);
-      connect(wf, man, init);
-
-      // Simple straight-line copy of production shape: compose -> send on each channel -> collector
-      const comp = addFunction(wf, "Compose (Demo)", `
-const m=$json.msg||{};
-const chs=$json.channels||['email'];
-const pick=(c)=> c==='sms'?(m.sms?.body||''): c==='whatsapp'?(m.whatsapp?.body||'') : c==='call'?(m.call?.script||'') : (m.email?.body||'');
-return [{...$json, message: pick(chs[0])||'Hello!'}];`, -700, 300);
-      connect(wf, init, comp);
-
-      let prev = comp;
-      channels.forEach((ch, i) => {
-        const s = makeSenderNode(wf, ch, -460 + i*260, 300, compat, true);
-        connect(wf, prev, s);
-        prev = s;
-      });
-      const fin = addCollector(wf, -460 + channels.length*260 + 260, 300);
-      connect(wf, prev, fin);
-    });
-  }
-
-  return sanitizeWorkflow(wf);
-}
-
+// sender nodes
 function makeSenderNode(wf, channel, x, y, compat, demo) {
   const friendly = channel.toUpperCase();
-  // For compat='full' we place actual nodes; else, function placeholders that echo payload
   if (compat === 'full') {
     if (channel === 'email') {
       return addNode(wf, {
@@ -599,18 +364,285 @@ function makeSenderNode(wf, channel, x, y, compat, demo) {
       });
     }
     if (channel === 'call') {
-      return addHTTP(wf, demo ? "Place Call (Demo)" : "Place Call", "={{$json.callWebhook || 'https://example.com/call'}}",
+      return addHTTP(wf, demo ? "Place Call (Demo)" : "Place Call",
+        "={{$json.callWebhook || 'https://example.com/call'}}",
         "={{ { to:$json.to, from:$json.callFrom, text: ($json.message || $json.msg?.call?.script || 'Hello!') } }}",
-        x, y, "POST", 'full');
+        x, y, "POST");
     }
   }
-  // safe mode demo placeholder
+  // safe-mode placeholder
   return addFunction(wf, `Demo Send ${friendly}`, `
 const d=$json;
 return [{channel:${JSON.stringify(channel)}, to:d.to, emailTo:d.emailTo, smsFrom:d.smsFrom, waFrom:d.waFrom, callFrom:d.callFrom, message:d.message || '(no message)'}];`, x, y);
 }
 
-/* ------------------- HTTP handler ------------------- */
+// ---------- sanitization ----------
+function sanitizeWorkflow(wf) {
+  const REQUIRED_TYPE = "n8n-nodes-base.function";
+  const nameCounts = {};
+  const byName = new Map();
+
+  wf.nodes = (wf.nodes || []).map((n, idx) => {
+    if (!n.name || typeof n.name !== "string") n.name = `Node ${idx+1}`;
+    const k = n.name.toLowerCase();
+    if (nameCounts[k] == null) nameCounts[k] = 0; else nameCounts[k] += 1;
+    if (nameCounts[k] > 0) n.name = `${n.name} #${nameCounts[k]}`;
+
+    if (!n.type || typeof n.type !== "string" || !n.type.trim()) {
+      n.type = REQUIRED_TYPE;
+      n.typeVersion = typeof n.typeVersion === "number" ? n.typeVersion : 2;
+      n.parameters ||= { functionCode: "return [$json];" };
+    }
+    if (typeof n.typeVersion !== "number") n.typeVersion = 1;
+
+    if (!Array.isArray(n.position) || n.position.length !== 2) {
+      n.position = [ -1000, 300 + (idx * 40) ];
+    } else {
+      n.position = [ Number(n.position[0]) || 0, Number(n.position[1]) || 0 ];
+    }
+    if (!n.parameters || typeof n.parameters !== "object") n.parameters = {};
+    byName.set(n.name, n);
+    return n;
+  });
+
+  const conns = wf.connections || {};
+  for (const [from, m] of Object.entries(conns)) {
+    if (!byName.has(from)) { delete conns[from]; continue; }
+    if (!m || typeof m !== "object") { delete conns[from]; continue; }
+    if (!Array.isArray(m.main)) m.main = [];
+    m.main = m.main.map(arr => Array.isArray(arr) ? arr.filter(link => byName.has(link?.node)) : []);
+  }
+  wf.connections = conns;
+  wf.name = String(wf.name || "AI Agent Workflow");
+  return wf;
+}
+
+// ---------- LLM prompts ----------
+function makeDesigner(row) {
+  return openaiJSON(
+    makeDesignerPrompt(row),
+    `{"archetype":string,"trigger":"cron|webhook|imap|manual","channels":string[],"branches":[{"name":string,"condition":string,"steps":[{"name":string,"kind":string}]}],"errors":[{"name":string,"mitigation":string}],"systems":string[]}`
+  );
+}
+function makeMessages(row, archetype, channels) {
+  return openaiJSON(
+    makeMessagingPrompt(row, archetype, channels),
+    `{"email":{"subject":string,"body":string},"sms":{"body":string},"whatsapp":{"body":string},"call":{"script":string}}`
+  );
+}
+
+// ---------- core build ----------
+async function buildWorkflowFromRow(row, opts) {
+  const compat = (opts.compat || 'safe') === 'full' ? 'full' : 'safe';
+  const includeDemo = opts.includeDemo !== false;
+
+  // channels from best_reply_shapes
+  const channels = [];
+  const shapes = listify(row.best_reply_shapes);
+  for (const sh of shapes) for (const norm of CHANNEL_NORMALIZE)
+    if (norm.rx.test(sh) && !channels.includes(norm.k)) channels.push(norm.k);
+  if (!channels.length) channels.push('email');
+
+  // initial archetype/trigger
+  let archetype = chooseArchetype(row);
+  let prodTrigger = TRIGGER_PREF[archetype] || 'manual';
+
+  // LLM design + messages
+  const design = (await makeDesigner(row)) || {};
+  if (Array.isArray(design.channels) && design.channels.length) {
+    const allowed = ['email','sms','whatsapp','call'];
+    const llmCh = design.channels.filter(c => allowed.includes(String(c).toLowerCase()));
+    if (llmCh.length) { channels.splice(0, channels.length, ...llmCh); }
+  }
+  if (typeof design.trigger === 'string' && ['cron','webhook','imap','manual'].includes(design.trigger.toLowerCase())) {
+    prodTrigger = design.trigger.toLowerCase();
+  }
+  if (typeof design.archetype === 'string' && design.archetype.trim()) {
+    archetype = design.archetype.trim().toUpperCase();
+  }
+  const systems = Array.isArray(design.systems) ? design.systems.map(s=>String(s).toLowerCase()) : [];
+  const branches = Array.isArray(design.branches) ? design.branches : [];
+  const errors = Array.isArray(design.errors) ? design.errors : [];
+
+  const msg = (await makeMessages(row, archetype, channels)) || {};
+
+  const title = `${row.scenario_id || 'Scenario'} — ${row.name || ''}`.trim();
+  const wf = baseWorkflow(title);
+
+  // helper: build a lane (prod or demo) with shared layout rules
+  function buildLane({ laneLabel, yOffset, triggerKind, isDemo }) {
+    withYOffset(wf, yOffset, () => {
+      // header
+      addHeader(wf, laneLabel,
+        isDemo ? LAYOUT.demoHeader.x : LAYOUT.prodHeader.x,
+        isDemo ? LAYOUT.demoHeader.y : LAYOUT.prodHeader.y);
+
+      // trigger
+      let startName;
+      if (isDemo) {
+        startName = addManual(wf, LAYOUT.demoStart.x, LAYOUT.demoStart.y, "Demo Manual Trigger");
+      } else {
+        if (triggerKind === 'cron')   startName = addCron(wf, "Cron (from LLM)", LAYOUT.prodStart.x, LAYOUT.prodStart.y - 160, compat);
+        else if (triggerKind === 'webhook') startName = addWebhook(wf, "Webhook (from LLM)", LAYOUT.prodStart.x, LAYOUT.prodStart.y, compat);
+        else if (triggerKind === 'imap')    startName = addFunction(wf, "IMAP Intake (Placeholder)", "return [$json];", LAYOUT.prodStart.x, LAYOUT.prodStart.y);
+        else                                startName = addManual(wf, LAYOUT.prodStart.x, LAYOUT.prodStart.y, "Manual Trigger");
+      }
+
+      // init context
+      const init = addFunction(wf, isDemo ? "Init Demo Context" : "Init Context (PROD)", `
+const seed=${JSON.stringify(DEMO)};
+const scenario=${JSON.stringify({
+        scenario_id: row.scenario_id || '',
+        agent_name: row.agent_name || '',
+        name: row.name || '',
+        triggers: row.triggers || '',
+        how_it_works: row.how_it_works || '',
+        roi_hypothesis: row.roi_hypothesis || '',
+        risk_notes: row.risk_notes || '',
+        tags: listify(row["tags (;)"] || row.tags),
+        archetype,
+      })};
+const channels=${JSON.stringify(channels)};
+const systems=${JSON.stringify(systems)};
+const msg=${JSON.stringify(msg)};
+return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{...$json, scenario, channels, systems, msg}"}];
+`, (isDemo ? LAYOUT.demoStart.x + LAYOUT.stepX : LAYOUT.prodStart.x + LAYOUT.stepX), LAYOUT.prodStart.y);
+      connect(wf, startName, init);
+
+      // optional “fetch list / split” step for list-based flows
+      let cursor = init;
+      if (!isDemo) {
+        if (systems.includes('pms')) {
+          const fetch = addHTTP(wf, "Fetch Upcoming (PMS)",
+            `={{'${DEFAULT_HTTP.pms_upcoming}'}}`, "={{$json}}",
+            LAYOUT.prodStart.x + 2*LAYOUT.stepX, LAYOUT.prodStart.y);
+          connect(wf, cursor, fetch); cursor = fetch;
+        }
+        if (['RENEWALS_CSM','AR_FOLLOWUP','REPORTING_KPI_DASH','DATA_PIPELINE_ETL'].includes(archetype)) {
+          const split = addSplit(wf, LAYOUT.prodStart.x + 3*LAYOUT.stepX, LAYOUT.prodStart.y, 25);
+          connect(wf, cursor, split); cursor = split;
+        }
+      }
+
+      // branch switch (same structure for demo + prod)
+      const sw = addSwitch(
+        wf,
+        "Branch (LLM)",
+        "={{$json.__branch || 'main'}}",
+        (branches.length ? branches : [{ name: "main" }]).map(b => ({ operation: 'equal', value2: String(b.name || 'main').slice(0,48) })),
+        LAYOUT.switchX, LAYOUT.prodStart.y
+      );
+      connect(wf, cursor, sw);
+
+      // Build each branch rail left→right with generous spacing
+      const lastNodes = [];
+      const baseY = LAYOUT.prodStart.y - Math.floor(LAYOUT.branchY * (Math.max(branches.length,1)-1)/2);
+      (branches.length ? branches : [{ name:"main", steps: [] }]).forEach((b, idx) => {
+        const rowY = baseY + idx * LAYOUT.branchY;
+
+        // Enter node (holder of condition string)
+        let prev = addFunction(wf, `Enter: ${b.name || 'Case'}`,
+          `return [{...$json,__branch:${JSON.stringify(b.name||'case')},__cond:${JSON.stringify(b.condition||'')}}];`,
+          LAYOUT.prodStart.x + 4*LAYOUT.stepX, rowY);
+        connect(wf, sw, prev, idx);
+
+        // Steps
+        const steps = Array.isArray(b.steps) ? b.steps : [];
+        steps.forEach((st, k) => {
+          const x = LAYOUT.prodStart.x + (5 + k)*LAYOUT.stepX;
+          const y = rowY;
+          const kind = String(st.kind || '').toLowerCase();
+          let node;
+          if (kind === 'compose') {
+            node = addFunction(wf, `Compose — ${st.name || 'Message'}`, `
+const ch=($json.channels && $json.channels[0]) || 'email';
+const m=$json.msg||{};
+const bodies={ email:(m.email?.body)||'', sms:(m.sms?.body)||'', whatsapp:(m.whatsapp?.body)||'', call:(m.call?.script)||''};
+return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, y);
+          } else if (['http','update','store','notify','route'].includes(kind)) {
+            node = addHTTP(wf, st.name || kind.toUpperCase(), "={{'https://example.com/step'}}", "={{$json}}", x, y);
+          } else if (kind === 'book') {
+            node = addHTTP(wf, st.name || 'Book Calendar', `={{'${DEFAULT_HTTP.calendar_book}'}}`, "={{$json}}", x, y);
+          } else if (kind === 'ticket') {
+            node = addHTTP(wf, st.name || 'Create Ticket', `={{'${DEFAULT_HTTP.ticket_create}'}}`, "={{$json}}", x, y);
+          } else if (['lookup','score','decision','wait'].includes(kind)) {
+            node = addFunction(wf, st.name || 'Logic', "return [$json];", x, y);
+          } else {
+            node = addFunction(wf, st.name || 'Step', "return [$json];", x, y);
+          }
+          connect(wf, prev, node);
+          prev = node;
+        });
+
+        // Send on each channel (drip), sequentially connected so you can follow the itinerary
+        channels.forEach((ch, i) => {
+          const x = LAYOUT.prodStart.x + (5 + steps.length + i)*LAYOUT.stepX;
+          const sender = makeSenderNode(wf, ch, x, rowY, compat, isDemo);
+          connect(wf, prev, sender);
+          prev = sender;
+        });
+
+        // End collector for this branch
+        const end = addCollector(
+          wf,
+          LAYOUT.prodStart.x + (6 + steps.length + channels.length)*LAYOUT.stepX,
+          rowY
+        );
+        connect(wf, prev, end);
+        lastNodes.push(end);
+      });
+
+      // Sequential spine: connect each branch’s collector to the next, so the whole path is visually traceable
+      for (let i=0; i<lastNodes.length-1; i++) {
+        connect(wf, lastNodes[i], lastNodes[i+1]);
+      }
+      const afterBranch = lastNodes[lastNodes.length-1];
+
+      // Errors row placed clearly under branches
+      if (errors.length) {
+        const errY = baseY + (Math.max(branches.length,1)-1)*LAYOUT.branchY + LAYOUT.errorRowYPad;
+        const errGate = addFunction(wf, "Error Monitor (LLM List)", `return [$json];`,
+          LAYOUT.prodStart.x + 4*LAYOUT.stepX, errY);
+        connect(wf, afterBranch, errGate);
+        let prev = errGate;
+        errors.forEach((e, i) => {
+          const fix = addFunction(wf, `Mitigate: ${e.name || 'Error'}`, `// ${e.mitigation || ''}\nreturn [$json];`,
+            LAYOUT.prodStart.x + (5 + i)*LAYOUT.stepX, errY);
+          connect(wf, prev, fix);
+          prev = fix;
+        });
+        const fin = addCollector(wf, LAYOUT.prodStart.x + (6 + errors.length)*LAYOUT.stepX, errY);
+        connect(wf, prev, fin);
+      }
+    });
+  }
+
+  // ===== LANE A: PROD =====
+  buildLane({
+    laneLabel: "PRODUCTION LANE",
+    yOffset: 0,
+    triggerKind: prodTrigger,
+    isDemo: false
+  });
+
+  // ===== LANE B: DEMO (exact mirror, far below) =====
+  if (includeDemo) {
+    buildLane({
+      laneLabel: "DEMO LANE (Manual Trigger + Seeded Contacts)",
+      yOffset: LAYOUT.laneGap,
+      triggerKind: 'manual',
+      isDemo: true
+    });
+  }
+
+  // store the LLM blueprint for transparency (visible in n8n JSON)
+  wf.staticData = wf.staticData || {};
+  wf.staticData.__design = { archetype, prodTrigger, channels, systems, branches, errors };
+
+  return sanitizeWorkflow(wf);
+}
+
+// ---------- HTTP handler ----------
 module.exports = async (req, res) => {
   Object.entries(HEADERS).forEach(([k, v]) => res.setHeader(k, v));
   if (req.method === "OPTIONS") return res.status(204).end();
@@ -640,7 +672,6 @@ module.exports = async (req, res) => {
 
     const wf = await buildWorkflowFromRow(row, { compat, includeDemo });
 
-    // Return inline JSON (UI reads it) and also allow attachment download if called directly
     res.status(200);
     res.setHeader("Content-Type", "application/json; charset=utf-8");
     res.setHeader("Content-Disposition", `attachment; filename="${(row.scenario_id || 'workflow')}.n8n.json"`);

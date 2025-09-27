@@ -12,25 +12,25 @@ const HEADERS = {
   "Content-Type": "application/json; charset=utf-8",
 };
 
-// ====== Layout (more air to prevent overlap) ======
+// ====== Layout (extra air across the full canvas) ======
 const LAYOUT = {
-  laneGap: 2100,
-  stepX: 520,
-  branchY: 520,
-  channelY: 360,
-  outcomeRowY: 200,
-  prodHeader: { x: -1520, y: 40 },
-  prodStart:  { x: -1380, y: 300 },
-  demoHeader: { x: -1520, y: 40 },
-  demoStart:  { x: -1380, y: 300 },
-  switchX: -420,
-  errorRowYPad: 460,
+  laneGap: 3000,        // more distance between PROD and DEMO
+  stepX: 680,           // more horizontal distance between numbered steps
+  branchY: 760,         // more distance between branches
+  channelY: 460,        // more distance between channels
+  outcomeRowY: 320,     // more vertical spacing between decision outcomes
+  prodHeader: { x: -1700, y: 40 },
+  prodStart:  { x: -1560, y: 300 },
+  demoHeader: { x: -1700, y: 40 },
+  demoStart:  { x: -1560, y: 300 },
+  switchX: -680,        // branch switch further left so first columns breathe
+  errorRowYPad: 680,    // more room under branches for error lane
 };
 
 // Visual guide options
 const GUIDE = { showWaypoints: false, numberSteps: true };
 
-// “Orange band” labels for your UI
+// “Orange band” style hint for your UI renderer
 const ZONE = { FLOW: "FLOW AREA", ERR: "ERROR AREA" };
 
 const DEMO = {
@@ -281,7 +281,6 @@ function sanitizeWorkflow(wf){
     if(typeof n.typeVersion!=='number') n.typeVersion=1;
     if(!Array.isArray(n.position)||n.position.length!==2){ n.position=[-1000, 300+(idx*40)]; }
     if(!n.parameters||typeof n.parameters!=='object') n.parameters={};
-    // ensure function nodes have code
     if(n.type==="n8n-nodes-base.function" && !n.parameters.functionCode){
       n.parameters.functionCode = "return [$json];";
     }
@@ -317,6 +316,7 @@ function makeMessages(row, archetype, channels){
 
 // ---------- Canonical chronological flow for Appointment Scheduling ----------
 function buildCanonicalSchedulingBranches(channelsIn){
+  // Preferred per-channel order
   const desired = ['call','sms','whatsapp','email'];
   const channels = desired.filter(c=>channelsIn.includes(c)).concat(channelsIn.filter(c=>!desired.includes(c)));
 
@@ -372,13 +372,16 @@ async function buildWorkflowFromRow(row, opts){
   const compat=(opts.compat||'safe')==='full'?'full':'safe';
   const includeDemo=opts.includeDemo!==false;
 
+  // channels from best_reply_shapes
   const channels=[]; const shapes=listify(row.best_reply_shapes);
   for(const sh of shapes){ for(const norm of CHANNEL_NORMALIZE){ if(norm.rx.test(sh) && !channels.includes(norm.k)) channels.push(norm.k); } }
   if(!channels.length) channels.push('email');
 
+  // choose archetype/trigger
   let archetype=chooseArchetype(row);
   let prodTrigger=TRIGGER_PREF[archetype]||'manual';
 
+  // LLM design + messages
   const design=(await makeDesigner(row))||{};
   if(Array.isArray(design.channels)&&design.channels.length){
     const allowed=['email','sms','whatsapp','call'];
@@ -394,6 +397,7 @@ async function buildWorkflowFromRow(row, opts){
   let systems=Array.isArray(design.systems)?design.systems.map(s=>String(s).toLowerCase()):[];
   let branches=Array.isArray(design.branches)?design.branches:[];
 
+  // Enforce strict chronological flow for APPOINTMENT_SCHEDULING if LLM is empty/sparse
   if(archetype==='APPOINTMENT_SCHEDULING'){
     const sparse = !branches.length || !branches.some(b=>Array.isArray(b.steps)&&b.steps.length);
     if(sparse){
@@ -418,6 +422,7 @@ async function buildWorkflowFromRow(row, opts){
   // lane builder (prod/demo)
   function buildLane({ laneLabel, yOffset, triggerKind, isDemo }){
     withYOffset(wf, yOffset, () => {
+      // Orange-band section header
       addHeader(wf, `${ZONE.FLOW} · ${laneLabel}`, isDemo?LAYOUT.demoHeader.x:LAYOUT.prodHeader.x, isDemo?LAYOUT.demoHeader.y:LAYOUT.prodHeader.y);
 
       let trig;
@@ -511,7 +516,8 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
                 let oPrev = oEnter;
                 const oSteps = Array.isArray(o.steps)?o.steps:[];
                 oSteps.forEach((os, ok)=>{
-                  const ox = x + (ok+1)*Math.floor(LAYOUT.stepX*0.85);
+                  // wider inner spacing inside each outcome path
+                  const ox = x + (ok+1)*Math.floor(LAYOUT.stepX*1.05);
                   const ot = `[${stepNo}.${oIdx+1}.${ok+1}] ${os.name||'Step'}`;
                   const okind = String(os.kind||'').toLowerCase();
                   let node;
@@ -536,13 +542,13 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, ox, oy);
                   oPrev = node;
                 });
 
-                // Sender & collector for this outcome
-                const sendX = x + Math.floor(LAYOUT.stepX*0.85) + (Math.max(oSteps.length,0)+1)*Math.floor(LAYOUT.stepX*0.85);
+                // Sender & collector for this outcome (pushed further right)
+                const sendX = x + Math.floor(LAYOUT.stepX*1.1) + (Math.max(oSteps.length,0)+1)*Math.floor(LAYOUT.stepX*1.05);
                 const sender = makeSenderNode(wf, ch, sendX, oy, compat, isDemo);
                 try{ wf.nodes[wf.nodes.findIndex(n=>n.name===sender)].name = `[${stepNo}.${oIdx+1}] Send: ${ch.toUpperCase()}`; }catch{}
                 connect(wf, oPrev, sender);
 
-                const oCollector = addCollector(wf, sendX + Math.floor(LAYOUT.stepX*0.7), oy);
+                const oCollector = addCollector(wf, sendX + Math.floor(LAYOUT.stepX*0.9), oy);
                 connect(wf, sender, oCollector);
 
                 if (lastOutcomeCollector) connect(wf, lastOutcomeCollector, oCollector);
@@ -577,10 +583,10 @@ return [{...m, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
             prev = node;
           }
 
-          // Send + collect when last step was NOT a decision
+          // Send + collect when last step was NOT a decision (push further right)
           const lastIsDecision = steps.some(s=>String(s.kind||'').toLowerCase()==='decision');
           if(!lastIsDecision){
-            const sendX = LAYOUT.prodStart.x + (5 + steps.length)*LAYOUT.stepX;
+            const sendX = LAYOUT.prodStart.x + (5 + steps.length)*LAYOUT.stepX + Math.floor(LAYOUT.stepX*0.4);
             const sendTitle = GUIDE.numberSteps ? `[${++stepNo}] Send: ${ch.toUpperCase()}` : `Send: ${ch.toUpperCase()}`;
             const sender = makeSenderNode(wf, ch, sendX, rowY, compat, isDemo);
             try{ wf.nodes[wf.nodes.findIndex(n=>n.name===sender)].name = sendTitle; }catch{}
@@ -591,6 +597,7 @@ return [{...m, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
             prevChannelCollector = collector;
           }
 
+          // Remember last collector for error row
           if (bIdx === (Math.max(branches.length,1)-1) && chIdx === (chCount-1)) {
             lastCollectorOfLastBranch = prevChannelCollector;
           }
@@ -601,7 +608,7 @@ return [{...m, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
         const bottomOfBranches = baseBranchY + (Math.max(branches.length,1)-1)*LAYOUT.branchY;
         const errY = bottomOfBranches + LAYOUT.errorRowYPad;
 
-        // Error “orange band”
+        // Error band
         addHeader(wf, `${ZONE.ERR} · ${laneLabel}`, LAYOUT.prodStart.x + 3*LAYOUT.stepX, errY - 120);
 
         let prev = addFunction(wf, "Error Monitor (LLM List)", "return [$json];", LAYOUT.prodStart.x + 4*LAYOUT.stepX, errY);

@@ -1,8 +1,6 @@
-// /api/build.js — ultra-safe exporter for n8n import
-// - Only Manual Trigger + Function nodes
-// - ASCII-only, unique node names
-// - Variable-based connections only
-// - Strong sanitizer
+// /api/build.js — Rich LLM-structured workflow, import-safe (Function-only)
+// Visuals: Prod lane (top), Demo lane (bottom). Branch swimlanes, channels vertical, steps horizontal.
+// Uses only Manual Trigger + Function nodes (no If/Switch/HTTP/etc.) to avoid import issues.
 
 const fetch = global.fetch;
 
@@ -27,51 +25,50 @@ const DEMO = {
   callFrom: "+13412184164",
 };
 
-// layout
+// ---------- layout (wide, spaced, readable) ----------
 const LAYOUT = {
-  laneGap: 2600,
-  stepX: 520,
-  channelGap: 360,
-  prodHeader: { x: -2000, y: 60 },
-  prodStart:  { x: -1800, y: 420 },
-  demoHeader: { x: -2000, y: 60 },
-  demoStart:  { x: -1800, y: 420 },
+  laneGapY: 3000,       // distance between PROD and DEMO lanes
+  stepX: 520,           // horizontal distance between steps
+  channelGapY: 360,     // vertical gap between channels under a branch
+  branchGapY: 640,      // vertical gap between branches
+  leftX: -2200,         // far left X
+  entryX: -1700,        // where manual starts
+  headerY: 60,
+  baseY: 420,           // common Y baseline
 };
 
 function baseWorkflow(name){
-  return { name, nodes:[], connections:{}, active:false, settings:{}, staticData:{}, __yOffset:0, __names:new Set() };
+  return { name, nodes:[], connections:{}, active:false, settings:{}, staticData:{}, __y:0, __names:new Set() };
 }
 
-// sanitize to ASCII and make unique
+// sanitize to ASCII & unique
 function safeName(wf, raw){
   const ascii = String(raw||'')
     .normalize("NFKD")
-    .replace(/[^\x20-\x7E]/g,'')       // remove non-ASCII
+    .replace(/[^\x20-\x7E]/g,'')
     .replace(/\s+/g,' ')
-    .replace(/[^\w\s\-().]/g,'')       // remove weird punctuation
+    .replace(/[^\w\s\-().]/g,'')
     .trim() || 'Node';
-  let base = ascii;
-  let n = 1;
-  while (wf.__names.has(base)) { n++; base = `${ascii} ${n}`; }
-  wf.__names.add(base);
-  return base;
+  let name = ascii, n = 1;
+  while (wf.__names.has(name)) { n++; name = `${ascii} ${n}`; }
+  wf.__names.add(name);
+  return name;
 }
 
 function addNode(wf, node){
-  // ensure function node
   const name = safeName(wf, node.name || 'Node');
   const out = {
     id: node.id || `node_${Math.random().toString(36).slice(2,10)}`,
     name,
     type: "n8n-nodes-base.function",
     typeVersion: 2,
-    position: Array.isArray(node.position) && node.position.length===2
-      ? [node.position[0], node.position[1] + (wf.__yOffset||0)]
-      : [-1200, 300 + wf.nodes.length*80 + (wf.__yOffset||0)],
+    position: Array.isArray(node.position)&&node.position.length===2
+      ? [node.position[0], node.position[1] + wf.__y]
+      : [LAYOUT.leftX, LAYOUT.baseY + wf.nodes.length*80 + wf.__y],
     parameters: { functionCode: node.parameters?.functionCode || "return [$json];" }
   };
   wf.nodes.push(out);
-  return out.name; // return sanitized, unique name
+  return out.name;
 }
 
 function connect(wf, from, to){
@@ -81,100 +78,121 @@ function connect(wf, from, to){
   wf.connections[from].main[0].push({ node: to, type: "main", index: 0 });
 }
 
-function withYOffset(wf,yOffset,fn){ const prev=wf.__yOffset||0; wf.__yOffset=yOffset; try{ fn(); } finally { wf.__yOffset=prev; } }
+function withYOffset(wf,y,fn){ const prev=wf.__y; wf.__y=y; try{ fn(); } finally { wf.__y=prev; } }
 
-// primitives (safe)
+// primitives
 function addHeader(wf,label,x,y){ return addNode(wf,{ name:`=== ${label} ===`, position:pos(x,y) }); }
 function addManual(wf,x,y,label){ return addNode(wf,{ name: label||"Manual Trigger", position:pos(x,y) }); }
-function addFn(wf,name,code,x,y){ return addNode(wf,{ name, position:pos(x,y), parameters:{ functionCode: code||"return [$json];"} }); }
-function addArrow(wf,label,x,y){ return addFn(wf, label, "return [$json];", x,y); }
+function addFn(wf,name,code,x,y){ return addNode(wf,{ name, position:pos(x,y), parameters:{ functionCode: code||"return [$json];" } }); }
+function addArrow(wf,label,x,y){ return addFn(wf,label,"return [$json];",x,y); }
 function addExternalStep(wf,label,x,y){ return addFn(wf, `[${label}]`, "return [$json];", x,y); }
 
-// classifier & channels (safe)
-function deriveChannels(s){
-  const shapes=listify(s.best_reply_shapes||[]);
-  const out=[]; const map=[['whatsapp',/whatsapp/i],['sms',/(sms|text)/i],['call',/(voice|call)/i],['email',/email/i]];
-  for(const sh of shapes){ for(const [k,rx] of map){ if(rx.test(sh) && !out.includes(k)) out.push(k); } }
-  return out.length?out:['email','sms','email'];
-}
-
-// LLM (optional; JSON-only; not required for import safety)
+// ---------- LLM helpers ----------
 async function callOpenAI({ system, user, model }){
   const key = process.env.OPENAI_API_KEY;
   if(!key) return null;
   try{
-    const r = await fetch("https://api.openai.com/v1/chat/completions", {
+    const r = await fetch("https://api.openai.com/v1/chat/completions",{
       method:"POST",
       headers:{ "Content-Type":"application/json", "Authorization":`Bearer ${key}` },
       body: JSON.stringify({
         model: model || "gpt-4o-mini",
-        temperature: 0.4,
-        messages: [ { role:"system", content: system }, { role:"user", content: user } ]
+        temperature: 0.35,
+        messages:[{role:"system",content:system},{role:"user",content:user}]
       })
     });
     if(!r.ok) return null;
     const data = await r.json();
     return data?.choices?.[0]?.message?.content || null;
-  } catch { return null; }
+  }catch{ return null; }
 }
 
 function makeDesignerPrompt(row){
   const ctx = JSON.stringify({
-    scenario_id: row.scenario_id, name: row.name,
-    triggers: row.triggers, best_reply_shapes: row.best_reply_shapes,
-    risk_notes: row.risk_notes, how_it_works: row.how_it_works,
-    tool_stack_dev: row.tool_stack_dev, roi_hypothesis: row.roi_hypothesis, tags: row.tags
+    scenario_id: row.scenario_id,
+    name: row.name,
+    agent_name: row.agent_name,
+    triggers: row.triggers,
+    best_reply_shapes: row.best_reply_shapes,
+    risk_notes: row.risk_notes,
+    how_it_works: row.how_it_works,
+    tool_stack_dev: row.tool_stack_dev,
+    roi_hypothesis: row.roi_hypothesis,
+    tags: row.tags
   }, null, 2);
-  return {
-    system: "You design bulletproof business workflows for n8n. Output strict JSON only.",
-    user:
-`Given this scenario context (JSON below), propose:
-- trigger: one of ["manual","cron","webhook","imap"] (string)
-- channels: array of any of ["email","sms","whatsapp","call"] in delivery order
-- branches: array of branch objects { id, steps:[{name,kind}] }
-- errors: array of { when, action }
-JSON only.
 
-context:
+  return {
+    system: "You are a senior solutions architect for business automations using n8n. Output JSON only.",
+    user:
+`From the context below, design a robust workflow spec with these keys:
+{
+  "trigger": "manual" | "cron" | "webhook" | "imap",
+  "channels": ["email"|"sms"|"whatsapp"|"call", ...],    // preferred order
+  "branches": [
+    {
+      "id": "main" | "alt" | "vip" | ...,
+      "label": "Short label for the branch",
+      "steps": [
+        { "name": "Human readable step name", "kind": "fetch|compose|decide|update|notify|wait|route|external|transform|log|error|end", "detail": "short description" }
+      ]
+    }
+  ],
+  "errors": [
+    { "when": "where the error can happen", "action": "fallback or corrective action" }
+  ]
+}
+
+Guidelines:
+- Make branches exhaustive enough to be useful (2–4 typical branches per scenario).
+- Steps should be concise and specific to this scenario and industry.
+- Include realistic step names and detail, not placeholders.
+
+Context:
 ${ctx}`
   };
 }
 
 function makeMessagingPrompt(row){
   const ctx = JSON.stringify({
-    scenario_id: row.scenario_id, agent_name: row.agent_name, industry: row.name,
-    triggers: row.triggers, how_it_works: row.how_it_works, roi_hypothesis: row.roi_hypothesis
+    scenario_id: row.scenario_id,
+    agent_name: row.agent_name,
+    industry: row.name,
+    triggers: row.triggers,
+    how_it_works: row.how_it_works,
+    roi_hypothesis: row.roi_hypothesis
   }, null, 2);
-  return {
-    system: "You write natural, human-sounding omni-channel copy. Output strict JSON only.",
-    user:
-`Write short, natural copy for email, sms, whatsapp, and a call talk-track for this context.
-Include keys: { "email": {subject,body}, "sms": body, "whatsapp": body, "call": script }.
-JSON only.
 
-context:
+  return {
+    system: "You write natural, human-sounding omni-channel copy. Output JSON only.",
+    user:
+`Write concise, human copy for:
+{ "email": { "subject": "...", "body": "..." }, "sms": "....", "whatsapp": "....", "call": "...." }
+
+Style: friendly, professional, scenario-specific. Use the context:
+
 ${ctx}`
   };
 }
 
-// lane (channels vertical → steps horizontal), Function-only
-function buildLane(wf, row, messaging, designer, { yOffset, isDemo }){
-  const channels = Array.isArray(designer?.channels)&&designer.channels.length ? designer.channels : deriveChannels(row);
+// ---------- channels ----------
+function deriveChannelsFallback(s){
+  const shapes=listify(s.best_reply_shapes||[]);
+  const out=[]; const map=[['whatsapp',/whatsapp/i],['sms',/(sms|text)/i],['call',/(voice|call)/i],['email',/email/i]];
+  for(const sh of shapes){ for(const [k,rx] of map){ if(rx.test(sh) && !out.includes(k)) out.push(k); } }
+  return out.length?out:['email','sms','email'];
+}
 
-  withYOffset(wf, yOffset, ()=>{
-    addHeader(wf, isDemo ? "DEMO LANE (Manual Trigger + Seeds)" : "PRODUCTION LANE",
-      isDemo?LAYOUT.demoHeader.x:LAYOUT.prodHeader.x,
-      isDemo?LAYOUT.demoHeader.y:LAYOUT.prodHeader.y);
+// ---------- core rendering (branch swimlanes → channels vertical → steps horizontal) ----------
+function renderLane(wf, row, designer, messaging, { isDemo, yStart }){
+  withYOffset(wf, yStart, ()=>{
 
-    const startX = isDemo ? LAYOUT.demoStart.x : LAYOUT.prodStart.x;
-    const startY = isDemo ? LAYOUT.demoStart.y : LAYOUT.prodStart.y;
+    // Header + Trigger + Init
+    addHeader(wf, isDemo ? "DEMO LANE (Manual Trigger + Seeds)" : "PRODUCTION LANE", LAYOUT.leftX, LAYOUT.headerY);
 
-    const trig = addManual(wf, startX, startY, isDemo ? "Demo Manual Trigger" : "Manual Trigger (Prod)");
-    const toInit = addArrow(wf, "Start -> Init", startX + Math.floor(LAYOUT.stepX/2), startY); connect(wf, trig, toInit);
+    const trig = addManual(wf, LAYOUT.entryX, LAYOUT.baseY, isDemo ? "Demo Manual Trigger" : "Manual Trigger");
+    const toInit = addArrow(wf, "Start -> Init", LAYOUT.entryX + Math.floor(LAYOUT.stepX/2), LAYOUT.baseY); connect(wf, trig, toInit);
 
-    const init = addFn(
-      wf, isDemo ? "Init Demo Context" : "Init Context",
-      `
+    const init = addFn(wf, isDemo ? "Init Demo Context" : "Init Context", `
 const seed=${JSON.stringify(DEMO)};
 const scenario=${JSON.stringify({
   scenario_id: row.scenario_id || '',
@@ -184,89 +202,116 @@ const scenario=${JSON.stringify({
   roi_hypothesis: row.roi_hypothesis || ''
 })};
 const msg=${JSON.stringify(messaging||{})};
-return [${isDemo? "{...seed, scenario, msg, demo:true}" : "{...$json, scenario, msg}"}];`,
-      startX + LAYOUT.stepX, startY
-    );
+const d = ${isDemo ? "{...seed, scenario, msg, demo:true}" : "{...$json, scenario, msg}"};
+return [d];`, LAYOUT.entryX + LAYOUT.stepX, LAYOUT.baseY);
     connect(wf, toInit, init);
 
-    const enter = addArrow(wf, "Init -> main", startX + 2*LAYOUT.stepX, startY); connect(wf, init, enter);
+    const toBranches = addArrow(wf, "Init -> Branching", LAYOUT.entryX + 2*LAYOUT.stepX, LAYOUT.baseY);
+    connect(wf, init, toBranches);
 
-    const chBaseY = startY - Math.floor(LAYOUT.channelGap * (Math.max(channels.length,1)-1)/2);
-    const chStartX = startX + 3*LAYOUT.stepX;
+    // Branch list (from LLM or fallback)
+    const branches = Array.isArray(designer?.branches) && designer.branches.length
+      ? designer.branches
+      : [{ id:"main", label:"Main Path", steps:[
+          { name:"Prepare Data",   kind:"transform", detail:"Normalize and enrich scenario fields" },
+          { name:"Compose Message", kind:"compose", detail:"Channel-aware message from context" },
+          { name:"Update System",   kind:"external", detail:"Log/update status in external system" },
+          { name:"End",             kind:"end", detail:"Finish branch" }
+        ] }];
 
-    const collectors=[];
+    // Channels preference (LLM or fallback)
+    const channels = Array.isArray(designer?.channels)&&designer.channels.length
+      ? designer.channels.map(s=>String(s||'').toLowerCase())
+      : deriveChannelsFallback(row);
 
-    channels.forEach((ch, i)=>{
-      const channel = String(ch||'email').toLowerCase();
-      const cy = chBaseY + i*LAYOUT.channelGap;
+    // For each branch → a block; inside each block → channels vertical
+    let branchTopY = LAYOUT.baseY - Math.floor((branches.length-1)*LAYOUT.branchGapY/2);
+    const branchBlocks = [];
 
-      const fan = addArrow(wf, `main -> ${channel.toUpperCase()}`, chStartX - Math.floor(LAYOUT.stepX/2), cy);
-      connect(wf, enter, fan);
+    branches.forEach((br, bi)=>{
+      const brY = branchTopY + bi*LAYOUT.branchGapY;
+      const brLabel = addFn(wf, `Branch: ${br.label || br.id || ('branch_'+(bi+1))}`, "return [$json];", LAYOUT.entryX + 3*LAYOUT.stepX, brY);
+      connect(wf, toBranches, brLabel);
 
-      const compose = addFn(wf, `Compose ${channel.toUpperCase()}`, `
-const msg = $json.msg || {};
-let body = '';
-let subject = $json.scenario?.agent_name ? \`\${$json.scenario.agent_name} — \${$json.scenario.scenario_id||''}\` : ($json.scenario?.scenario_id||'AI Workflow');
-if('${channel}'==='email'){ body = msg.email?.body || $json.message || 'Hello from the workflow.'; subject = msg.email?.subject || subject; }
-else if('${channel}'==='sms'){ body = msg.sms || $json.message || 'Quick update.'; }
-else if('${channel}'==='whatsapp'){ body = msg.whatsapp || $json.message || 'Heads up.'; }
-else if('${channel}'==='call'){ body = msg.call || $json.message || 'Talk track.'; }
-return [{...$json, message: body, subject }];`, chStartX, cy);
-      connect(wf, fan, compose);
+      // channels vertical fan
+      const chBaseY = brY - Math.floor((channels.length-1)*LAYOUT.channelGapY/2);
+      const chStartX = LAYOUT.entryX + 4*LAYOUT.stepX;
 
-      const send = addExternalStep(wf, `${channel.toUpperCase()} Send`, chStartX + LAYOUT.stepX, cy); connect(wf, compose, send);
-      const next = addArrow(wf, "→", chStartX + Math.floor(1.5*LAYOUT.stepX), cy); connect(wf, send, next);
+      const collectors=[];
+      channels.forEach((ch, ci)=>{
+        const chY = chBaseY + ci*LAYOUT.channelGapY;
 
-      const listen = addFn(wf, `Listen ${channel.toUpperCase()}`, "return [$json];", chStartX + 2*LAYOUT.stepX, cy); connect(wf, next, listen);
+        const toCh = addArrow(wf, `to ${ch.toUpperCase()}`, chStartX - Math.floor(LAYOUT.stepX/2), chY);
+        connect(wf, brLabel, toCh);
 
-      const route = addFn(wf, `Route Reply ${channel.toUpperCase()}`, `
-const replied = !!($json.reply);
-return replied ? [{...$json,__route:'positive'}] : [{...$json,__route:'neutral'}];`, chStartX + 3*LAYOUT.stepX, cy);
-      connect(wf, listen, route);
+        // Step chain horizontally for this channel
+        // We will map LLM steps -> labeled Function nodes
+        const steps = Array.isArray(br.steps)&&br.steps.length ? br.steps : [{name:"Compose Message",kind:"compose",detail:"Default message"},{name:"Send",kind:"external",detail:"Send via provider"},{name:"Wait",kind:"wait",detail:"Listen for reply"},{name:"Route Outcome",kind:"route",detail:"Positive or Neutral"},{name:"Update",kind:"external",detail:"Log/Update"},{name:"End",kind:"end",detail:"Finish"}];
 
-      const pos = addExternalStep(wf, `${channel.toUpperCase()} OK`, chStartX + 4*LAYOUT.stepX, cy - 60);
-      const neg = addExternalStep(wf, `${channel.toUpperCase()} Nurture`, chStartX + 4*LAYOUT.stepX, cy + 60);
+        let prev = toCh;
+        steps.forEach((st, si)=>{
+          const title = `${(si+1).toString().padStart(2,'0')} ${st.name || 'Step'}`;
+          const detail = st.detail ? `// ${String(st.detail).replace(/\n/g,' ')}` : '';
+          const code = `
+${detail}
+const step = ${JSON.stringify({ kind: st.kind||'step', channel: ch, branch: br.id||('branch_'+(bi+1)) })};
+return [{...$json, __step: step}];`;
+          const node = addFn(wf, `${title} (${ch.toUpperCase()})`, code, chStartX + si*LAYOUT.stepX, chY);
+          connect(wf, prev, node);
+          prev = node;
 
-      const fork = addFn(wf, `Branch ${channel.toUpperCase()}`, `
-if ($json.__route === 'positive') return [ $json, null ];
-return [ null, $json ];`, chStartX + Math.floor(3.5*LAYOUT.stepX), cy);
-      connect(wf, route, fork);
+          // add tiny arrow between steps for readability
+          if (si < steps.length-1) {
+            const arrow = addArrow(wf, "->", chStartX + si*LAYOUT.stepX + Math.floor(LAYOUT.stepX/2), chY);
+            connect(wf, prev, arrow);
+            prev = arrow;
+          }
+        });
 
-      // Emulate two outputs via two sequential arrows:
-      const toPos = addArrow(wf, "pos", chStartX + Math.floor(3.7*LAYOUT.stepX), cy - 30);
-      const toNeg = addArrow(wf, "neg", chStartX + Math.floor(3.7*LAYOUT.stepX), cy + 30);
-      connect(wf, fork, toPos);
-      connect(wf, fork, toNeg);
-      connect(wf, toPos, pos);
-      connect(wf, toNeg, neg);
-
-      const join = addArrow(wf, "→", chStartX + 4.6*LAYOUT.stepX, cy);
-      connect(wf, pos, join);
-      connect(wf, neg, join);
-
-      const col = addFn(wf, "Collector", `
+        const collect = addFn(wf, "Collector", `
 const now=new Date().toISOString();
-return [{...$json, __collected_at:now}];`, chStartX + 5.2*LAYOUT.stepX, cy);
-      connect(wf, join, col);
-      collectors.push(col);
+return [{...$json, __collected_at: now}];`, chStartX + steps.length*LAYOUT.stepX + 80, chY);
+        connect(wf, prev, collect);
+        collectors.push(collect);
+      });
+
+      // join collectors (chain them so importer shows a connected path)
+      for(let i=0;i<collectors.length-1;i++){ connect(wf, collectors[i], collectors[i+1]); }
+
+      branchBlocks.push({ head: brLabel, tail: collectors.at(-1) || brLabel });
     });
 
-    for(let i=0;i<collectors.length-1;i++){ connect(wf, collectors[i], collectors[i+1]); }
+    // Chain branches (visual itinerary across branches)
+    for(let i=0;i<branchBlocks.length-1;i++){
+      connect(wf, branchBlocks[i].tail, branchBlocks[i+1].head);
+    }
+
+    // Errors block (from LLM)
+    if (Array.isArray(designer?.errors) && designer.errors.length){
+      const errHead = addFn(wf, "Errors / Fallbacks", "return [$json];", LAYOUT.entryX + 3*LAYOUT.stepX, LAYOUT.baseY + branches.length*LAYOUT.branchGapY/2 + 240);
+      // link from last branch tail to errors for a clean, readable end
+      connect(wf, (branchBlocks.at(-1)?.tail)||toBranches, errHead);
+
+      let prev = errHead;
+      designer.errors.forEach((er, ei)=>{
+        const eNode = addFn(wf, `On: ${er.when || ('case_'+(ei+1))}`, `// action: ${er.action||'n/a'}\nreturn [$json];`, LAYOUT.entryX + (4+ei)*LAYOUT.stepX, LAYOUT.baseY + branches.length*LAYOUT.branchGapY/2 + 240);
+        connect(wf, prev, eNode);
+        prev = eNode;
+      });
+    }
   });
 }
 
-// sanitizer: ensure every node is a valid Function node, ASCII names, positions, and drop dangling links
+// ---------- sanitizer ----------
 function sanitizeWorkflow(wf){
   const byName = new Map();
-  const safe = (s)=>s; // names already sanitized on addNode
-
   wf.nodes = (wf.nodes||[]).map((n,i)=>{
     const out = {
       id: n.id || `node_${i}_${Math.random().toString(36).slice(2,8)}`,
       name: typeof n.name==='string' ? n.name : `Node ${i+1}`,
       type: "n8n-nodes-base.function",
       typeVersion: 2,
-      position: Array.isArray(n.position)&&n.position.length===2 ? n.position : [-1200, 300+i*80],
+      position: Array.isArray(n.position)&&n.position.length===2 ? n.position : [LAYOUT.leftX, LAYOUT.baseY + i*80],
       parameters: (n.parameters && typeof n.parameters==='object') ? n.parameters : { functionCode: "return [$json];" }
     };
     byName.set(out.name, out);
@@ -282,21 +327,23 @@ function sanitizeWorkflow(wf){
   }
   wf.connections = fixed;
 
-  // workflow name ASCII too
-  wf.name = safe(String(wf.name || 'Workflow'));
+  wf.name = (wf.name||'Workflow').replace(/[^\x20-\x7E]/g,'').trim();
   return wf;
 }
 
-function buildWorkflowJSON(row, industry, designerJSON, messagingJSON){
-  const wf = baseWorkflow(`${row.scenario_id || 'Scenario'} — ${industry?.name || industry?.industry_id || 'Industry'}`);
+// ---------- build ----------
+function buildWorkflowJSON(row, designerJSON, messagingJSON){
+  const wf = baseWorkflow(`${row.scenario_id || 'Scenario'} — ${row.name || 'Industry'}`);
+
   // PROD lane (top)
-  buildLane(wf, row, messagingJSON, designerJSON, { yOffset: 0, isDemo: false });
+  renderLane(wf, row, designerJSON, messagingJSON, { isDemo:false, yStart: 0 });
   // DEMO lane (bottom)
-  buildLane(wf, row, messagingJSON, designerJSON, { yOffset: LAYOUT.laneGap, isDemo: true });
+  renderLane(wf, row, designerJSON, messagingJSON, { isDemo:true,  yStart: LAYOUT.laneGapY });
+
   return sanitizeWorkflow(wf);
 }
 
-// sheets fetch
+// ---------- sheets ----------
 async function fetchScenarioRow({ sheetId, tab, apiKey, wanted }){
   const range = encodeURIComponent(tab || "Scenarios");
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${range}?key=${apiKey}`;
@@ -324,46 +371,7 @@ async function fetchScenarioRow({ sheetId, tab, apiKey, wanted }){
   };
 }
 
-// LLM prompts (optional)
-function makeDesignerPrompt(row){ /* same as above */ 
-  const ctx = JSON.stringify({
-    scenario_id: row.scenario_id, name: row.name,
-    triggers: row.triggers, best_reply_shapes: row.best_reply_shapes,
-    risk_notes: row.risk_notes, how_it_works: row.how_it_works,
-    tool_stack_dev: row.tool_stack_dev, roi_hypothesis: row.roi_hypothesis, tags: row.tags
-  }, null, 2);
-  return {
-    system: "You design bulletproof business workflows for n8n. Output strict JSON only.",
-    user:
-`Given this scenario context (JSON below), propose:
-- trigger: one of ["manual","cron","webhook","imap"] (string)
-- channels: array of any of ["email","sms","whatsapp","call"] in delivery order
-- branches: array of branch objects { id, steps:[{name,kind}] }
-- errors: array of { when, action }
-JSON only.
-
-context:
-${ctx}`
-  };
-}
-function makeMessagingPrompt(row){ /* same as above */ 
-  const ctx = JSON.stringify({
-    scenario_id: row.scenario_id, agent_name: row.agent_name, industry: row.name,
-    triggers: row.triggers, how_it_works: row.how_it_works, roi_hypothesis: row.roi_hypothesis
-  }, null, 2);
-  return {
-    system: "You write natural, human-sounding omni-channel copy. Output strict JSON only.",
-    user:
-`Write short, natural copy for email, sms, whatsapp, and a call talk-track for this context.
-Include keys: { "email": {subject,body}, "sms": body, "whatsapp": body, "call": script }.
-JSON only.
-
-context:
-${ctx}`
-  };
-}
-
-// handler
+// ---------- handler ----------
 module.exports = async (req, res) => {
   Object.entries(HEADERS).forEach(([k,v])=>res.setHeader(k,v));
   if (req.method === "OPTIONS") return res.status(204).end();
@@ -391,14 +399,17 @@ module.exports = async (req, res) => {
     const row = await fetchScenarioRow({ sheetId: SHEET_ID, tab: SHEET_TAB, apiKey: GOOGLE_API_KEY, wanted });
     if(!row) return res.status(404).json({ ok:false, error:`scenario_id not found: ${wanted}` });
 
-    const industry = { name: row.name, industry_id: lower(row.name).replace(/\s+/g,'_') };
+    // LLM calls
+    const [dResp, mResp] = await Promise.all([
+      callOpenAI(makeDesignerPrompt(row)),
+      callOpenAI(makeMessagingPrompt(row)),
+    ]);
 
-    // optional LLM shaping (safe; JSON only)
     let designerJSON=null, messagingJSON=null;
-    const d = await callOpenAI(makeDesignerPrompt(row)); if(d){ try{ designerJSON=JSON.parse(d); }catch{} }
-    const m = await callOpenAI(makeMessagingPrompt(row)); if(m){ try{ messagingJSON=JSON.parse(m); }catch{} }
+    if (dResp) { try { designerJSON = JSON.parse(dResp); } catch {} }
+    if (mResp) { try { messagingJSON = JSON.parse(mResp); } catch {} }
 
-    const wf = buildWorkflowJSON(row, industry, designerJSON, messagingJSON);
+    const wf = buildWorkflowJSON(row, designerJSON, messagingJSON);
     res.status(200).json(wf);
   } catch (err) {
     res.status(500).json({ ok:false, error:String(err?.message||err) });

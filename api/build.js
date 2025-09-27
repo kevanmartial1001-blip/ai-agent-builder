@@ -2,8 +2,9 @@
 // Wide layout, vertical-per-channel branches, no waypoint nodes, fully linked.
 // Adds LLM-driven DECISION steps with explicit outcomes (all paths A→Z).
 // Shared pre-send across channels (orange zone), then shared Decision, then per-outcome steps + per-channel sends.
-// Uses known, conservative n8n node versions (so every node has link handles).
+// Uses known n8n node versions (all nodes have link handles).
 // Env: SHEET_ID, GOOGLE_API_KEY, SHEET_TAB?=Scenarios, OPENAI_API_KEY
+// Optional envs to harden against fallback: NO_SHEETS=1, NO_LLM=1
 
 const HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -67,7 +68,7 @@ const ARCH_RULES = [
   { a:'ACCESS_GOVERNANCE', rx:/\b(access|rbac|sso|entitlements|seats|identity|pii|dlp)\b/i },
   { a:'PRIVACY_DSR', rx:/\b(dsr|data\s*subject|privacy\s*request|gdpr|ccpa)\b/i },
   { a:'RECRUITING_INTAKE', rx:/\b(recruit(ing)?|ats|cv|resume|candidate|interviews?)\b/i },
-};
+];
 
 const TRIGGER_PREF = {
   APPOINTMENT_SCHEDULING: 'cron', CUSTOMER_SUPPORT_INTAKE: 'webhook', FEEDBACK_NPS: 'cron',
@@ -92,6 +93,15 @@ const pos = (x, y) => [x, y];
 function toObj(header, row) { return Object.fromEntries(header.map((h,i)=>[h,(row[i]??"").toString().trim()])); }
 const listify = (v) => Array.isArray(v) ? v.map(x=>String(x).trim()).filter(Boolean) : String(v||'').split(/[;,/|\n]+/).map(x=>x.trim()).filter(Boolean);
 
+// Hardened fetch with timeout
+const TIMEOUT_MS = 7000;
+async function timedFetch(url, opts={}) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+  try { return await fetch(url, { ...opts, signal: ctrl.signal }); }
+  finally { clearTimeout(t); }
+}
+
 function chooseArchetype(row){
   const hay=[row["scenario_id"],row["name"],row["tags"],row["triggers"],row["how_it_works"],row["tool_stack_dev"]].map(x=>String(x||'')).join(' ');
   for(const r of ARCH_RULES) if(r.rx.test(hay)) return r.a;
@@ -100,21 +110,36 @@ function chooseArchetype(row){
 
 // ---------- sheet + llm ----------
 async function fetchSheetRowByScenarioId(scenarioId){
+  if (process.env.NO_SHEETS === '1') {
+    // Minimal stub so the API always returns a workflow (prevents fallback)
+    return {
+      scenario_id: scenarioId,
+      name: "Stub Scenario",
+      agent_name: "Agent",
+      triggers: "webhook",
+      best_reply_shapes: "email; sms; whatsapp; call",
+      how_it_works: "",
+      roi_hypothesis: "",
+      risk_notes: "",
+      tags: "scheduling"
+    };
+  }
   const SHEET_ID=process.env.SHEET_ID; const GOOGLE_API_KEY=process.env.GOOGLE_API_KEY; const TAB=process.env.SHEET_TAB||"Scenarios";
   if(!SHEET_ID||!GOOGLE_API_KEY) throw new Error("Missing SHEET_ID or GOOGLE_API_KEY");
   const url=`https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(TAB)}?key=${GOOGLE_API_KEY}`;
-  const r=await fetch(url,{cache:"no-store"}); if(!r.ok) throw new Error(`Sheets API error: ${r.status} ${r.statusText}`);
+  const r=await timedFetch(url,{cache:"no-store"});
+  if(!r.ok) throw new Error(`Sheets API error: ${r.status} ${r.statusText}`);
   const data=await r.json(); const rows=data.values||[]; if(!rows.length) throw new Error("Sheet has no rows");
   const header=rows[0].map(h=>h.trim()); const obj=rows.slice(1).map(rw=>toObj(header,rw));
   return obj.find(x=>(x["scenario_id"]||"").toString().trim().toLowerCase()===scenarioId.toLowerCase());
 }
 
 async function openaiJSON(prompt, schemaHint){
-  const key=process.env.OPENAI_API_KEY; if(!key) return null;
+  if (process.env.NO_LLM === '1' || !process.env.OPENAI_API_KEY) return null;
   try{
-    const r=await fetch("https://api.openai.com/v1/chat/completions",{
+    const r=await timedFetch("https://api.openai.com/v1/chat/completions",{
       method:"POST",
-      headers:{ "Authorization":`Bearer ${key}`,"Content-Type":"application/json"},
+      headers:{ "Authorization":`Bearer ${process.env.OPENAI_API_KEY}`,"Content-Type":"application/json"},
       body:JSON.stringify({
         model:"gpt-4o-mini",
         temperature:0.35,
@@ -125,6 +150,7 @@ async function openaiJSON(prompt, schemaHint){
         ]
       })
     });
+    if(!r.ok) return null; // fail-soft
     const j=await r.json(); const txt=j.choices?.[0]?.message?.content?.trim(); if(!txt) return null;
     try{ return JSON.parse(txt); }catch{ return null; }
   }catch{ return null; }
@@ -143,13 +169,13 @@ function makeDesignerPrompt(row){
     `TAGS: ${row["tags (;)"]||row.tags||''}`,
   ].join("\n");
   return `
-Design a bullet-proof n8n workflow and enumerate ALL realistic outcomes using industry knowledge + context (TRIGGERS/BEST_REPLY_SHAPES/RISK_NOTES/ROI_HYPOTHESIS).
+Design a bullet-proof n8n workflow and enumerate ALL realistic outcomes using industry knowledge + context.
 
 Rules (chronology A→Z):
 1) Pre-flight/lookups  2) Compose  3) **Send Multi-Channel Reminder (shared)**  4) **Decision (exhaustive outcomes)**
 5) Outcome steps  6) Per-channel sends (confirmations, follow-ups)  7) Final updates/logs.
 
-Step kinds: "compose" | "http" | "update" | "route" | "wait" | "score" | "lookup" | "book" | "ticket" | "notify" | "store" | "decision".
+Step kinds: "compose"|"http"|"update"|"route"|"wait"|"score"|"lookup"|"book"|"ticket"|"notify"|"store"|"decision".
 A "decision" step MUST include "outcomes": [{ "value": "...", "steps": Step[] }].
 
 Return JSON:
@@ -159,10 +185,10 @@ Return JSON:
   "channels": ["email","sms","whatsapp","call"],
   "branches": [
     { "name":"...", "condition":"...", "steps":[
-        { "name":"...", "kind":"compose|http|update|route|wait|score|lookup|book|ticket|notify|store" },
-        { "name":"...", "kind":"decision", "outcomes":[
-          { "value":"...", "steps":[{ "name":"...","kind":"..." }, ...] }, ...
-        ] }
+      { "name":"...", "kind":"compose|http|update|route|wait|score|lookup|book|ticket|notify|store" },
+      { "name":"...", "kind":"decision", "outcomes":[
+        { "value":"...", "steps":[{ "name":"...","kind":"..." }, ...] }, ...
+      ] }
     ] }
   ],
   "errors": [{ "name":"...", "mitigation":"..." }],
@@ -396,7 +422,7 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
         const chCount = Math.max(channels.length,1);
         const firstChY = branchTopY - Math.floor(LAYOUT.channelY * (chCount-1)/2);
 
-        // Split steps: everything before first decision = preSendSteps; use defaults if no decision
+        // Split steps: everything before first decision = preSendSteps; defaults if no decision
         const steps = Array.isArray(b.steps)?b.steps:[];
         const firstDecisionIdx = steps.findIndex(s=>String(s.kind||'').toLowerCase()==='decision');
         const preSendSteps = firstDecisionIdx>=0 ? steps.slice(0, firstDecisionIdx) : steps;
@@ -405,7 +431,7 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
           decisionSpec = (archetype==='APPOINTMENT_SCHEDULING') ? schedulingDefaults() : genericDefaults();
         }
 
-        // We’ll build lanes to a SHARED PRE-SEND node
+        // shared pre-send node (orange zone)
         const sharedSendX = LAYOUT.prodStart.x + (4 + Math.max(preSendSteps.length,0))*LAYOUT.stepX;
         const sharedSend = addFunction(wf, "[2] Send Multi-Channel Reminder", "return [$json];", sharedSendX, branchTopY);
 
@@ -425,7 +451,7 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
           if (chIdx === 0) connect(wf, sw, enter, bIdx);
           if (prevChannelCollector) connect(wf, prevChannelCollector, enter);
 
-          // pre-send steps (lookup/compose etc.)
+          // pre-send steps (lookup/compose/etc.)
           let prev = enter;
           preSendSteps.forEach((st,k)=>{
             const x = LAYOUT.prodStart.x + (4+k)*LAYOUT.stepX;
@@ -495,7 +521,7 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Update'}];`, ox, oy);
             connect(wf, oPrev, node); oPrev = node;
           });
 
-          // Per-outcome, send across all channels (SMS/WA/CALL/EMAIL horizontally)
+          // Per-outcome, send across all channels horizontally
           let sendPrev = oPrev;
           channels.forEach((ch, cIdx)=>{
             const sx = decisionX + Math.floor(LAYOUT.stepX*0.8) + (Math.max(oSteps.length,0)+cIdx+1)*Math.floor(LAYOUT.stepX*0.6);
@@ -551,7 +577,7 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Update'}];`, ox, oy);
   return sanitizeWorkflow(wf);
 }
 
-// ---------- HTTP handler (same signature as your working version) ----------
+// ---------- HTTP handler (unchanged signature) ----------
 module.exports = async (req,res)=>{
   Object.entries(HEADERS).forEach(([k,v])=>res.setHeader(k,v));
   if(req.method==="OPTIONS") return res.status(204).end();

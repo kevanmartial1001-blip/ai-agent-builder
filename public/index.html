@@ -13,7 +13,7 @@
   .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
   label{display:block;font-weight:600;margin:12px 0 6px}
   select,textarea,input,button{width:100%;background:#0f1218;color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
-  textarea{min-height:160px;font-family:ui-monospace,Consolas,Menlo,monospace;font-size:13px}
+  textarea{min-height:200px;font-family:ui-monospace,Consolas,Menlo,monospace;font-size:13px}
   button{cursor:pointer}
   .primary{background:var(--accent);color:#0b0c10;border:none;font-weight:700}
   .hint{color:var(--muted);font-size:13px}
@@ -25,6 +25,9 @@
   .suggest-name{color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .dbg{font:12px/1.4 ui-monospace,Consolas,monospace;color:#aaa;margin-top:8px;word-break:break-word}
   .err{color:#fca5a5}
+  .badges{display:flex;gap:8px;align-items:center;margin-top:8px}
+  .badge{font-size:12px;border:1px solid var(--line);padding:4px 8px;border-radius:999px;color:var(--muted)}
+  details{margin-top:10px}
 </style>
 </head>
 <body>
@@ -52,35 +55,44 @@
     <input id="search" placeholder="Type scenario_id or name…  e.g. tier1_dso_SCHEDULING_NO_SHOWS" autocomplete="off" />
     <div id="suggestions"></div>
 
-    <label for="bp">Preview (JSON)</label>
+    <div class="badges">
+      <span id="archetypeBadge" class="badge">Archetype: —</span>
+      <span id="channelsBadge" class="badge">Channels: —</span>
+      <span id="aiBadge" class="badge">AI: —</span>
+    </div>
+
+    <label for="bp">Preview (JSON from /api/build)</label>
     <textarea id="bp" readonly></textarea>
 
     <div class="row" style="margin-top:10px">
-      <button id="build" class="primary">Download n8n JSON</button>
-      <div class="hint">Imports directly in n8n</div>
+      <button id="create" class="primary">Create workflow</button>
+      <button id="download" disabled>Download n8n JSON</button>
     </div>
+    <div class="hint">Top: PRODUCTION lane. Bottom: DEMO lane with your seeded contacts.</div>
+
+    <details id="planBox" style="display:none">
+      <summary>Show AI plan</summary>
+      <pre id="plan" style="white-space:pre-wrap"></pre>
+    </details>
+
     <div id="dbg" class="dbg"></div>
   </div>
 </div>
 
-<!-- Load builder first (no defer/async); bump version to bust cache -->
-<script src="/builder.js?v=two-lanes-1"></script>
+<!-- Keep builder as a fallback ONLY (no defer/async). Bump version to bust cache if you change it. -->
+<script src="/builder.js?v=server-build-fallback-1"></script>
 
 <script>
 /* ========== Small helpers ========== */
 const $ = id => document.getElementById(id);
 const scenarioSel = $('scenario'), channelSel = $('channel'),
       searchEl = $('search'), suggestWrap = $('suggestions'), bpTA = $('bp'),
-      dbg = $('dbg');
+      dbg = $('dbg'), aiBadge = $('aiBadge'), archetypeBadge=$('archetypeBadge'), channelsBadge=$('channelsBadge'),
+      planBox=$('planBox'), planPre=$('plan');
 
 let ALL = [], MAP = {};
 let INDUSTRIES = [], IND_MAP = {};
-
-function assertBuilder(){
-  if (!window.Builder || typeof window.Builder.buildWorkflowJSON !== 'function') {
-    throw new Error('Builder not loaded (check /public/builder.js and the script tag order).');
-  }
-}
+let lastWorkflow = null, lastScenarioId = null;
 
 function listify(v){ return Array.isArray(v) ? v : String(v ?? '')
   .replace(/^\[|\]$/g,'')
@@ -112,8 +124,11 @@ function matchIndustryForScenario(s){
   const key = (s.name||'').toLowerCase();
   return IND_MAP[key] || null;
 }
+function assertBuilder(){
+  return (window.Builder && typeof window.Builder.buildWorkflowJSON === 'function');
+}
 
-/* ========== Ensure & apply ========== */
+/* ========== Normalize + ensure ========== */
 function normalizeScenarioRecord(m){
   return {
     scenario_id: m.scenario_id||'',
@@ -125,6 +140,7 @@ function normalizeScenarioRecord(m){
     how_it_works: m.how_it_works||'',
     tool_stack_dev: m.tool_stack_dev||'',
     tool_stack_autonomous: m.tool_stack_autonomous||'',
+    roi_hypothesis: m.roi_hypothesis||'',
     tags: listify(m.tags||m['tags (;)']||'')
   };
 }
@@ -133,18 +149,12 @@ async function ensureScenarioLoaded(idOrQuery){
   const id = String(idOrQuery||'').trim();
   if (!id) return null;
   if (MAP[id]) return MAP[id];
-
-  // Try exact fetch: look up by q and pick exact scenario_id first; else first item
   const res = await getJSON(`/api/scenarios?q=${encodeURIComponent(id)}&max=1`);
   const items = (res.ok && res.json && Array.isArray(res.json.items)) ? res.json.items : [];
   if (!items.length) return null;
-
   const rec = normalizeScenarioRecord(items[0]);
   if (!rec.scenario_id) return null;
-
   MAP[rec.scenario_id] = rec;
-
-  // Inject into dropdown if missing
   if (!Array.from(scenarioSel.options).some(o=>o.value===rec.scenario_id)){
     const o=document.createElement('option');
     o.value=rec.scenario_id; o.textContent=rec.scenario_id; o.title=rec.name||rec.scenario_id;
@@ -165,28 +175,15 @@ function populateUI(list){
   if (list.length) applyScenario(list[0].scenario_id);
 }
 
-function previewJSON(s, industry){
-  try {
-    assertBuilder();
-    const wf = window.Builder.buildWorkflowJSON(s, industry, { recommendedChannel: channelSel.value });
-    bpTA.value = JSON.stringify(wf, null, 2);
-    return wf;
-  } catch (e) {
-    bpTA.value = 'Builder not loaded (using YAML fallback previously).';
-    throw e;
-  }
-}
-
 function applyScenario(id){
   const s = MAP[id] || ALL.find(x=>x.scenario_id===id);
   if (!s) return;
-  const industry = matchIndustryForScenario(s);
+  const industry = matchIndustryForScenario(s); // (not used here, reserved)
   scenarioSel.value = s.scenario_id;
   channelSel.value  = recommendedChannel(s);
-  try { previewJSON(s, industry); } catch(e){ dbg.textContent = e.message; }
 }
 
-/* ========== Remote search across 8k+ ========== */
+/* ========== Search / suggestions ========== */
 let searchTimer = null;
 async function remoteSearch(q){
   if (!q || q.trim().length < 2){ suggestWrap.innerHTML=''; return; }
@@ -226,27 +223,47 @@ searchEl.addEventListener('blur', ()=> setTimeout(()=>suggestWrap.innerHTML='',1
 searchEl.addEventListener('keydown', async (e)=>{
   if (e.key==='Enter'){
     const v = e.target.value.trim();
-    // Prefer exact scenario_id load & apply
     const rec = await ensureScenarioLoaded(v);
     if (rec){ applyScenario(rec.scenario_id); suggestWrap.innerHTML=''; return; }
-    // Otherwise show suggestions
     remoteSearch(v);
   }
 });
 scenarioSel.addEventListener('change', ()=> applyScenario(scenarioSel.value));
 channelSel.addEventListener('change', ()=> applyScenario(scenarioSel.value));
 
-/* ========== Download ========== */
-function downloadJSON(obj, filename){
-  const txt=JSON.stringify(obj,null,2);
-  const blob=new Blob([txt],{type:'application/json'});
-  const url=URL.createObjectURL(blob);
-  const a=document.createElement('a'); a.href=url; a.download=filename; document.body.appendChild(a); a.click(); URL.revokeObjectURL(url); a.remove();
+/* ========== Server build flow ========== */
+const createBtn = document.getElementById('create');
+const downloadBtn = document.getElementById('download');
+
+async function buildOnServer(sid){
+  const url = `/api/build?scenario_id=${encodeURIComponent(sid)}`;
+  const r = await fetch(url, { method:'GET', cache:'no-store' });
+  const j = await r.json();
+  if (!j.ok) throw new Error(j.error || 'Build failed');
+  // Update badges
+  aiBadge.textContent = `AI: ${j.usedAI ? 'on' : 'off'}`;
+  try {
+    const wfName = (j.workflow && j.workflow.name) || 'AI Workflow';
+    const nodes = (j.workflow && j.workflow.nodes) ? j.workflow.nodes.length : 0;
+    const chans = [];
+    // quick peek for channel leafs
+    (j.workflow.nodes||[]).forEach(n=>{
+      if (/Demo Send /i.test(n.name)) chans.push(n.name.replace('Demo Send ',''));
+    });
+    channelsBadge.textContent = `Channels: ${Array.from(new Set(chans)).join(', ') || '—'}`;
+    const archGuess = wfName.split('—').pop()?.trim() || '—';
+    archetypeBadge.textContent = `Archetype: ${archGuess}`;
+  } catch {}
+  // Show AI plan if present
+  if (j.plan) { planBox.style.display='block'; planPre.textContent = JSON.stringify(j.plan, null, 2); }
+  else { planBox.style.display='none'; planPre.textContent=''; }
+  return j.workflow;
 }
-$('build').addEventListener('click', async ()=>{
+
+createBtn.addEventListener('click', async ()=>{
   try{
-    assertBuilder();
-    // Resolve from dropdown OR typed value
+    dbg.textContent = '';
+    createBtn.disabled = true; createBtn.textContent = 'Creating…';
     let sid = (scenarioSel.value||'').trim();
     if (!sid){
       const typed = (searchEl.value||'').trim();
@@ -255,31 +272,70 @@ $('build').addEventListener('click', async ()=>{
         if (rec) sid = rec.scenario_id;
       }
     }
-    if(!sid || !MAP[sid]){ dbg.innerHTML='<span class="err">No scenario selected or found. Type a valid <code>scenario_id</code> and press Enter.</span>'; return; }
+    if(!sid || !MAP[sid]) throw new Error('No scenario selected or found. Type a valid scenario_id and press Enter.');
 
-    const s = MAP[sid];
-    const wf = previewJSON(s, matchIndustryForScenario(s));
-    downloadJSON(wf, `${sid}-workflow.n8n.json`);
-    dbg.textContent = '';
-  }catch(e){
-    dbg.innerHTML = '<span class="err">Builder error:</span> ' + (e.message||String(e));
+    lastScenarioId = sid;
+
+    // Prefer the server build; fallback to local builder if server fails
+    let wf = null;
+    try {
+      wf = await buildOnServer(sid);
+    } catch (e) {
+      if (assertBuilder()){
+        const s = MAP[sid];
+        wf = window.Builder.buildWorkflowJSON(s, matchIndustryForScenario(s), { recommendedChannel: channelSel.value });
+        aiBadge.textContent = 'AI: off';
+      } else {
+        throw e;
+      }
+    }
+
+    lastWorkflow = wf;
+    bpTA.value = JSON.stringify(wf, null, 2);
+    downloadBtn.disabled = false;
+    createBtn.textContent = 'Rebuild';
+  } catch (e){
+    dbg.innerHTML = '<span class="err">Build error:</span> ' + (e.message||String(e));
+  } finally {
+    createBtn.disabled = false;
   }
 });
 
-/* ========== Bootstrap (25 initial, search does the rest) ========== */
+downloadBtn.addEventListener('click', async ()=>{
+  try{
+    if (!lastScenarioId) throw new Error('Create a workflow first.');
+    // Stream direct from server so filename is correct, or fallback to local blob
+    const dlUrl = `/api/build?scenario_id=${encodeURIComponent(lastScenarioId)}&download=1`;
+    const r = await fetch(dlUrl, { cache:'no-store' });
+    if (r.ok) {
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a=document.createElement('a'); a.href=url; a.download=`${lastScenarioId}.workflow.n8n.json`;
+      document.body.appendChild(a); a.click(); URL.revokeObjectURL(url); a.remove();
+    } else {
+      if (!lastWorkflow) throw new Error('No workflow in memory.');
+      const txt=JSON.stringify(lastWorkflow, null, 2);
+      const blob=new Blob([txt],{type:'application/json'});
+      const url=URL.createObjectURL(blob);
+      const a=document.createElement('a'); a.href=url; a.download=`${lastScenarioId}.workflow.n8n.json`;
+      document.body.appendChild(a); a.click(); URL.revokeObjectURL(url); a.remove();
+    }
+  } catch (e){
+    dbg.innerHTML = '<span class="err">Download error:</span> ' + (e.message||String(e));
+  }
+});
+
+/* ========== Bootstrap (25 initial + search) ========== */
 async function bootstrap(){
   try{
-    assertBuilder();
     const [sc, ind] = await Promise.all([
       getJSON('/api/scenarios?cursor=0&limit=25'),
       getJSON('/api/industries'),
     ]);
     const sitems = (sc.ok && sc.json && Array.isArray(sc.json.items)) ? sc.json.items : [];
     const iitems = (ind.ok && ind.json && Array.isArray(ind.json.items)) ? ind.json.items : [];
-
     ALL = sitems.map(normalizeScenarioRecord).filter(s=>s.scenario_id);
     MAP = Object.fromEntries(ALL.map(x=>[x.scenario_id,x]));
-
     INDUSTRIES = iitems.map(it=>({
       industry_id:it.industry_id||it.name||'',
       painpoints:it.core_pains||it.painpoints||'',
@@ -288,20 +344,15 @@ async function bootstrap(){
       vocabulary:it.agent_language_prompt||''
     })).filter(i=>i.industry_id);
     IND_MAP = Object.fromEntries(INDUSTRIES.map(it=>[(it.industry_id||'').toLowerCase(), it]));
-
     if (!ALL.length){
       const fallbackS={scenario_id:'tier1_dso_SCHEDULING_NO_SHOWS',name:'tier1_dso',agent_name:'Scheduling Agent',best_reply_shapes:['sms','email'],how_it_works:'Remind, confirm, backfill.',roi_hypothesis:'Reduce no-shows 30%+'};
-      const fallbackI={industry_id:'tier1_dso',painpoints:'no-shows; front-desk overload',kpis:'no-show rate; utilization'};
       ALL=[fallbackS]; MAP={ [fallbackS.scenario_id]: fallbackS };
-      INDUSTRIES=[fallbackI]; IND_MAP={ [fallbackI.industry_id]: fallbackI };
     }
     populateUI(ALL);
   } catch (e){
     dbg.innerHTML = '<span class="err">Bootstrap error:</span> ' + (e.message||String(e));
     const fallbackS={scenario_id:'tier1_dso_SCHEDULING_NO_SHOWS',name:'tier1_dso',agent_name:'Scheduling Agent',best_reply_shapes:['sms','email'],how_it_works:'Remind, confirm, backfill.',roi_hypothesis:'Reduce no-shows 30%+'};
-    const fallbackI={industry_id:'tier1_dso',painpoints:'no-shows; front-desk overload',kpis:'no-show rate; utilization'};
     ALL=[fallbackS]; MAP={ [fallbackS.scenario_id]: fallbackS };
-    INDUSTRIES=[fallbackI]; IND_MAP={ [fallbackI.industry_id]: fallbackI };
     populateUI(ALL);
   }
 }

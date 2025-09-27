@@ -51,7 +51,7 @@
     <input id="search" placeholder="Type scenario_id or name…  e.g. tier1_dso_SCHEDULING_NO_SHOWS" autocomplete="off" />
     <div id="suggestions"></div>
 
-    <label for="bp">Preview</label>
+    <label for="bp">Preview (JSON)</label>
     <textarea id="bp" readonly></textarea>
 
     <div class="row" style="margin-top:10px">
@@ -62,8 +62,8 @@
   </div>
 </div>
 
-<!-- Load the external workflow builder logic -->
-<script src="/builder.js"></script>
+<!-- IMPORTANT: load the builder first (no defer/async) and bump the version to bust cache -->
+<script src="/builder.js?v=10"></script>
 
 <script>
 /* ========== Small helpers ========== */
@@ -74,6 +74,12 @@ const scenarioSel = $('scenario'), channelSel = $('channel'),
 
 let ALL = [], MAP = {};
 let INDUSTRIES = [], IND_MAP = {};
+
+function assertBuilder(){
+  if (!window.Builder || typeof window.Builder.buildWorkflowJSON !== 'function') {
+    throw new Error('Builder not loaded (check /public/builder.js and the script tag order).');
+  }
+}
 
 function listify(v){ return Array.isArray(v) ? v : String(v ?? '')
   .replace(/^\[|\]$/g,'')
@@ -105,26 +111,7 @@ function matchIndustryForScenario(s){
   const key = (s.name||'').toLowerCase();
   return IND_MAP[key] || null;
 }
-function previewYaml(s, industry){
-  const br = v => (v==null || String(v).trim()==='' ? '' : String(v));
-  const brList = arr => `[${listify(arr).join(', ')}]`;
-  const ind = industry ? `
-industry_id: ${industry.industry_id}
-industry_painpoints: ${(industry.painpoints||'').toString().slice(0,220)}...` : '';
-  return `scenario_id: ${s.scenario_id}
-name: ${br(s.name)}
-agent_name: ${br(s.agent_name || 'Agent')}
-best_reply_shapes: ${brList(s.best_reply_shapes)}
-triggers: >
-  ${br(s.triggers || '')}
-how_it_works: >
-  ${br(s.how_it_works || '')}
-roi_hypothesis: >
-  ${br(s.roi_hypothesis || '')}
-tags: [${listify(s.tags).join(', ')}]${ind}`;
-}
 
-/* ========== UI populate + actions ========== */
 function populateUI(list){
   scenarioSel.innerHTML = '';
   const frag = document.createDocumentFragment();
@@ -136,21 +123,33 @@ function populateUI(list){
   scenarioSel.appendChild(frag);
   if (list.length) applyScenario(list[0].scenario_id);
 }
+
+function previewJSON(s, industry){
+  try {
+    assertBuilder();
+    const wf = window.Builder.buildWorkflowJSON(s, industry, { recommendedChannel: channelSel.value });
+    bpTA.value = JSON.stringify(wf, null, 2);
+    return wf;
+  } catch (e) {
+    bpTA.value = 'Builder not loaded (using YAML fallback previously).';
+    throw e;
+  }
+}
+
 function applyScenario(id){
   const s = MAP[id] || ALL.find(x=>x.scenario_id===id);
   if (!s) return;
   const industry = matchIndustryForScenario(s);
   scenarioSel.value = s.scenario_id;
   channelSel.value  = recommendedChannel(s);
-  bpTA.value = previewYaml(s, industry);
+  try { previewJSON(s, industry); } catch(e){ dbg.textContent = e.message; }
 }
 
 /* ========== Remote search across 8k+ ========== */
 let searchTimer = null;
 async function remoteSearch(q){
   if (!q || q.trim().length < 2){ suggestWrap.innerHTML=''; return; }
-  // use max=50 (API expects "max")
-  const url = `/api/scenarios?q=${encodeURIComponent(q)}&max=50`;
+  const url = `/api/scenarios?q=${encodeURIComponent(q)}&limit=50`;
   const res = await getJSON(url);
   const items = (res.ok && res.json && Array.isArray(res.json.items)) ? res.json.items : [];
   renderSuggestions(items);
@@ -169,7 +168,6 @@ function renderSuggestions(matches){
   box.addEventListener('click', (e)=>{
     const el = e.target.closest('.suggest-item'); if(!el) return;
     const id = el.getAttribute('data-id');
-    // If not in the 25 preloaded, stash minimal so preview works
     if (!MAP[id]){
       const m = matches.find(x=>x.scenario_id===id);
       if (m){
@@ -198,7 +196,7 @@ searchEl.addEventListener('input', e=>{
   searchTimer = setTimeout(()=>remoteSearch(e.target.value), 180);
 });
 searchEl.addEventListener('focus', ()=> {
-  if (ALL.length) renderSuggestions(ALL.slice(0,10)); // light suggestions
+  if (ALL.length) renderSuggestions(ALL.slice(0,10));
 });
 searchEl.addEventListener('blur', ()=> setTimeout(()=>suggestWrap.innerHTML='',150));
 searchEl.addEventListener('keydown', e=>{
@@ -209,16 +207,9 @@ searchEl.addEventListener('keydown', e=>{
   }
 });
 scenarioSel.addEventListener('change', ()=> applyScenario(scenarioSel.value));
+channelSel.addEventListener('change', ()=> applyScenario(scenarioSel.value));
 
-/* ========== Workflow builder via external file ========== */
-function buildWorkflowJSON(s){
-  const industry = matchIndustryForScenario(s);
-  // Uses window.Builder from /builder.js
-  return window.Builder?.buildWorkflowJSON(s, industry) || {
-    name: `${s.scenario_id} – ${s.agent_name||'Agent'} (Demo)`,
-    nodes: [], connections: {}, active:false
-  };
-}
+/* ========== Download ========== */
 function downloadJSON(obj, filename){
   const txt=JSON.stringify(obj,null,2);
   const blob=new Blob([txt],{type:'application/json'});
@@ -226,18 +217,23 @@ function downloadJSON(obj, filename){
   const a=document.createElement('a'); a.href=url; a.download=filename; document.body.appendChild(a); a.click(); URL.revokeObjectURL(url); a.remove();
 }
 $('build').addEventListener('click', ()=>{
-  const sid=(scenarioSel.value||'').trim(); const s=MAP[sid];
-  if(!s){ dbg.innerHTML='<span class="err">No scenario selected.</span>'; return; }
-  const wf=buildWorkflowJSON(s);
-  downloadJSON(wf, `${sid}.n8n.json`);
+  try{
+    assertBuilder();
+    const sid=(scenarioSel.value||'').trim(); const s=MAP[sid];
+    if(!s){ dbg.innerHTML='<span class="err">No scenario selected.</span>'; return; }
+    const wf = previewJSON(s, matchIndustryForScenario(s));
+    downloadJSON(wf, `${sid}-workflow.n8n.json`);
+  }catch(e){
+    dbg.innerHTML = '<span class="err">Builder error:</span> ' + (e.message||String(e));
+  }
 });
 
-/* ========== Bootstrap (ONLY 25) ========== */
+/* ========== Bootstrap (25 initial, search does the rest) ========== */
 async function bootstrap(){
   try{
-    // use max=25 (API expects "max")
+    assertBuilder();
     const [sc, ind] = await Promise.all([
-      getJSON('/api/scenarios?cursor=0&max=25'),
+      getJSON('/api/scenarios?cursor=0&limit=25'),
       getJSON('/api/industries'),
     ]);
     const sitems = (sc.ok && sc.json && Array.isArray(sc.json.items)) ? sc.json.items : [];
@@ -272,10 +268,10 @@ async function bootstrap(){
       ALL=[fallbackS]; MAP={ [fallbackS.scenario_id]: fallbackS };
       INDUSTRIES=[fallbackI]; IND_MAP={ [fallbackI.industry_id]: fallbackI };
     }
-
     populateUI(ALL);
   } catch (e){
     dbg.innerHTML = '<span class="err">Bootstrap error:</span> ' + (e.message||String(e));
+    // minimal fallback so the UI still runs
     const fallbackS={scenario_id:'tier1_dso_SCHEDULING_NO_SHOWS',name:'tier1_dso',agent_name:'Scheduling Agent',best_reply_shapes:['sms','email'],how_it_works:'Remind, confirm, backfill.',roi_hypothesis:'Reduce no-shows 30%+'};
     const fallbackI={industry_id:'tier1_dso',painpoints:'no-shows; front-desk overload',kpis:'no-show rate; utilization'};
     ALL=[fallbackS]; MAP={ [fallbackS.scenario_id]: fallbackS };

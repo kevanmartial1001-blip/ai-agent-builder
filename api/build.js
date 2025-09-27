@@ -1,7 +1,8 @@
 // api/build.js
-// Clean horizontal layout: numbered steps flow left→right with ample spacing.
-// Vertical lanes per channel; decision outcomes fan out vertically then converge.
-// Orange band headers kept. No auto-layout, no stage grid.
+// Wide layout, vertical-per-channel branches, strict chronology, fully linked.
+// Adds LLM-driven DECISION steps with explicit outcomes (all paths A→Z).
+// For APPOINTMENT_SCHEDULING, auto-builds a canonical chronological flow if LLM is sparse.
+// Uses conservative n8n node versions (every node has link handles).
 // Env: SHEET_ID, GOOGLE_API_KEY, SHEET_TAB?=Scenarios, OPENAI_API_KEY
 
 const HEADERS = {
@@ -11,24 +12,25 @@ const HEADERS = {
   "Content-Type": "application/json; charset=utf-8",
 };
 
-// ====== Layout (ample spacing to avoid overlap) ======
+// ====== Layout (more air to prevent overlap) ======
 const LAYOUT = {
   laneGap: 2100,
-  stepX: 520,           // horizontal distance between numbered steps
-  branchY: 520,         // distance between branches
-  channelY: 360,        // distance between channels
-  outcomeRowY: 220,     // vertical spacing between decision outcomes
+  stepX: 520,
+  branchY: 520,
+  channelY: 360,
+  outcomeRowY: 200,
   prodHeader: { x: -1520, y: 40 },
   prodStart:  { x: -1380, y: 300 },
   demoHeader: { x: -1520, y: 40 },
   demoStart:  { x: -1380, y: 300 },
-  switchX: -420,        // branch switch a bit left from the main grid
+  switchX: -420,
   errorRowYPad: 460,
 };
 
+// Visual guide options
 const GUIDE = { showWaypoints: false, numberSteps: true };
 
-// Orange band labels (your UI styles these headers as the “orange area”)
+// “Orange band” labels for your UI
 const ZONE = { FLOW: "FLOW AREA", ERR: "ERROR AREA" };
 
 const DEMO = {
@@ -58,7 +60,7 @@ const ARCH_RULES = [
   { a:'AR_FOLLOWUP', rx:/\b(a\/?r|accounts?\s*receivable|invoice|collections?|dso|reconciliation)\b/i },
   { a:'AP_AUTOMATION', rx:/\b(a\/?p|accounts?\s*payable|invoices?|3[-\s]?way|three[-\s]?way|matching|approvals?)\b/i },
   { a:'INVENTORY_MONITOR', rx:/\b(inventory|stock|sku|threshold|warehouse|3pl|wms|backorder)\b/i },
-  { a:'REPLENISHMENT_PO', rx:/\b(replenishment|purchase[-_ ]?order|po|procure|procurement|vendors?)\b/i },
+  { a:'REPLENISHMENT_PO', rx:/\b(replenishment|purchase[-_ ]?order|po|procure|procurement|vendors?|suppliers?)\b/i },
   { a:'FIELD_SERVICE_DISPATCH', rx:/\b(dispatch|work[-_ ]?orders?|technicians?|field|geo|eta|route|yard)\b/i },
   { a:'COMPLIANCE_AUDIT', rx:/\b(compliance|audit|audits|policy|governance|sox|iso|gdpr|hipaa|attestation)\b/i },
   { a:'INCIDENT_MGMT', rx:/\b(incident|sev[: ]?(high|p[12])|major|rca|postmortem|downtime|uptime|slo)\b/i },
@@ -143,31 +145,31 @@ function makeDesignerPrompt(row){
     `TAGS: ${row["tags (;)"]||row.tags||''}`,
   ].join("\n");
   return `
-Design a bullet-proof n8n workflow and enumerate ALL realistic outcomes using industry knowledge + context.
+Design a bullet-proof n8n workflow and enumerate ALL realistic outcomes using industry knowledge + context (TRIGGERS/BEST_REPLY_SHAPES/RISK_NOTES/ROI_HYPOTHESIS).
 
 Rules:
 - "trigger": one of ["cron","webhook","imap","manual"].
 - "channels": ordered subset of ["email","sms","whatsapp","call"].
-- "branches": ≤6.
+- "branches": ≤6. Each branch is a high-level path.
 - Step kinds: "compose" | "http" | "update" | "route" | "wait" | "score" | "lookup" | "book" | "ticket" | "notify" | "store" | "decision".
 - A "decision" step MUST include exhaustive "outcomes". Each outcome: { "value": string, "steps": Step[] }.
-- Keep strict chronology (left → right).
+- Preserve strict chronological order. No ambiguous jumps.
 
 Return JSON:
 {
-  "archetype":"...",
-  "trigger":"cron|webhook|imap|manual",
-  "channels":["email","sms","whatsapp","call"],
-  "branches":[
-    {"name":"...","condition":"...","steps":[
-      {"name":"...","kind":"..."},
-      {"name":"...","kind":"decision","outcomes":[
-        {"value":"...","steps":[{"name":"...","kind":"..."}]}
-      ]}
-    ]}
+  "archetype": "...",
+  "trigger": "cron|webhook|imap|manual",
+  "channels": ["email","sms","whatsapp","call"],
+  "branches": [
+    { "name":"...", "condition":"...", "steps":[
+        { "name":"...", "kind":"compose|http|update|route|wait|score|lookup|book|ticket|notify|store" },
+        { "name":"...", "kind":"decision", "outcomes":[
+          { "value":"...", "steps":[{ "name":"...","kind":"..." }, ...] }, ...
+        ] }
+    ] }
   ],
-  "errors":[{"name":"...","mitigation":"..."}],
-  "systems":["pms","crm","calendar","kb","twilio","email"]
+  "errors": [{ "name":"...", "mitigation":"..." }],
+  "systems": ["pms","crm","calendar","kb","twilio","email"]
 }
 
 Context:
@@ -188,26 +190,62 @@ function makeMessagingPrompt(row, archetype, channels){
 Write concise outreach content for ${JSON.stringify(channels)} for archetype ${archetype}.
 No IVR "press 1". 3–6 short lines each.
 
-Return JSON: { "email": { "subject":"...", "body":"..." }, "sms":{"body":"..."}, "whatsapp":{"body":"..."}, "call":{"script":"..."} }
+Return JSON: { "email": { "subject":"...", "body":"..." }, "sms": {"body":"..."}, "whatsapp":{"body":"..."}, "call":{"script":"..."} }
 
 Context:
 ${ctx}`;
 }
 
-// ---------- workflow primitives ----------
+// ---------- workflow primitives (known versions) ----------
 function baseWorkflow(name){ return { name, nodes:[], connections:{}, active:false, settings:{}, staticData:{}, __yOffset:0 }; }
-function addNode(wf,node){ if(Array.isArray(node.position)){ node.position=[node.position[0], node.position[1]+(wf.__yOffset||0)]; } wf.nodes.push(node); return node.name; }
-function connect(wf,from,to,outputIndex=0){ wf.connections[from]??={}; wf.connections[from].main??=[]; for(let i=wf.connections[from].main.length;i<=outputIndex;i++) wf.connections[from].main[i]=[]; wf.connections[from].main[outputIndex].push({node:to,type:"main",index:0}); }
+
+// ensure unique names BEFORE inserting (prevents breaking connections later)
+function uniqueName(wf, base){
+  const existing = new Set((wf.nodes||[]).map(n=>String(n.name||'').toLowerCase()));
+  if(!base || typeof base!=='string') base = 'Node';
+  let name = base;
+  let i = 1;
+  while(existing.has(name.toLowerCase())){
+    i += 1;
+    name = `${base} #${i}`;
+  }
+  return name;
+}
+
+function addNode(wf,node){
+  node.name = uniqueName(wf, node.name);
+  if(Array.isArray(node.position)){
+    node.position=[node.position[0], node.position[1]+(wf.__yOffset||0)];
+  }
+  wf.nodes.push(node);
+  return node.name;
+}
+
+function connect(wf,from,to,outputIndex=0){
+  wf.connections[from]??={};
+  wf.connections[from].main??=[];
+  for(let i=wf.connections[from].main.length;i<=outputIndex;i++) wf.connections[from].main[i]=[];
+  wf.connections[from].main[outputIndex].push({node:to,type:"main",index:0});
+}
+
 function withYOffset(wf,yOffset,fn){ const prev=wf.__yOffset||0; wf.__yOffset=yOffset; try{ fn(); } finally{ wf.__yOffset=prev; } }
-function addHeader(wf,label,x,y){ return addNode(wf,{ id:uid("label"), name:`=== ${label} ===`, type:"n8n-nodes-base.function", typeVersion:1, position:pos(x,y), parameters:{ functionCode:"return [$json];" } }); }
+
+// Section headers (your UI can render these as “orange bands”)
+function addHeader(wf,label,x,y){
+  return addNode(wf,{ id:uid("label"), name:`=== ${label} ===`, type:"n8n-nodes-base.function", typeVersion:1, position:pos(x,y), parameters:{ functionCode:"return [$json];" } });
+}
+
 function addManual(wf,x,y,label="Manual Trigger"){ return addNode(wf,{ id:uid("manual"), name:label, type:"n8n-nodes-base.manualTrigger", typeVersion:1, position:pos(x,y), parameters:{} }); }
 function addCron(wf,label,x,y,compat){ if(compat==="full"){ return addNode(wf,{ id:uid("cron"), name:label, type:"n8n-nodes-base.cron", typeVersion:1, position:pos(x,y), parameters:{ triggerTimes:{ item:[{ mode:"everyX", everyX:{ hours:0, minutes:15 } }] } } }); } return addNode(wf,{ id:uid("cronph"), name:`${label} (Placeholder)`, type:"n8n-nodes-base.function", typeVersion:1, position:pos(x,y), parameters:{ functionCode:"return [$json];" } }); }
 function addWebhook(wf,label,x,y,compat){ if(compat==="full"){ return addNode(wf,{ id:uid("webhook"), name:label, type:"n8n-nodes-base.webhook", typeVersion:1, position:pos(x,y), parameters:{ path:uid("hook"), methods:["POST"], responseMode:"onReceived" } }); } return addNode(wf,{ id:uid("webph"), name:`${label} (Placeholder)`, type:"n8n-nodes-base.function", typeVersion:1, position:pos(x,y), parameters:{ functionCode:"return [$json];" } }); }
 function addHTTP(wf,name,urlExpr,bodyExpr,x,y,method="POST"){ return addNode(wf,{ id:uid("http"), name, type:"n8n-nodes-base.httpRequest", typeVersion:3, position:pos(x,y), parameters:{ url:urlExpr, method, jsonParameters:true, sendBody:true, bodyParametersJson:bodyExpr } }); }
 function addFunction(wf,name,code,x,y){ return addNode(wf,{ id:uid("func"), name, type:"n8n-nodes-base.function", typeVersion:1, position:pos(x,y), parameters:{ functionCode:code } }); }
+function addIf(wf,name,left,op,right,x,y){ return addNode(wf,{ id:uid("if"), name, type:"n8n-nodes-base.if", typeVersion:2, position:pos(x,y), parameters:{ conditions:{ number:[], string:[{ value1:left, operation:op, value2:right }] } } }); }
 function addSwitch(wf,name,valueExpr,rules,x,y){ return addNode(wf,{ id:uid("switch"), name, type:"n8n-nodes-base.switch", typeVersion:2, position:pos(x,y), parameters:{ value1:valueExpr, rules } }); }
+function addSplit(wf,x,y,size=20){ return addNode(wf,{ id:uid("split"), name:"Split In Batches", type:"n8n-nodes-base.splitInBatches", typeVersion:1, position:pos(x,y), parameters:{ batchSize:size } }); }
 function addCollector(wf,x,y){ return addFunction(wf,"Collector (Inspect)",`const now=new Date().toISOString(); const arr=Array.isArray(items)?items:[{json:$json}]; return arr.map((it,i)=>({json:{...it.json,__collected_at:now, index:i}}));`,x,y); }
 
+// sender nodes
 function makeSenderNode(wf, channel, x, y, compat, demo){
   const friendly = channel.toUpperCase();
   if(compat==='full'){
@@ -233,16 +271,24 @@ function makeSenderNode(wf, channel, x, y, compat, demo){
 
 // ---------- sanitization ----------
 function sanitizeWorkflow(wf){
-  const REQUIRED_TYPE="n8n-nodes-base.function"; const nameCounts={}; const byName=new Map();
+  const REQUIRED_TYPE="n8n-nodes-base.function";
+  const byName=new Map();
+
+  // Do NOT rename nodes here (keeps connections valid)
   wf.nodes=(wf.nodes||[]).map((n,idx)=>{
-    if(!n.name||typeof n.name!=='string') n.name=`Node ${idx+1}`;
-    const k=n.name.toLowerCase(); if(nameCounts[k]==null) nameCounts[k]=0; else nameCounts[k]+=1; if(nameCounts[k]>0) n.name=`${n.name} #${nameCounts[k]}`;
-    if(!n.type||typeof n.type!=='string'||!n.type.trim()){ n.type=REQUIRED_TYPE; n.typeVersion=1; n.parameters||={ functionCode:"return [$json];" }; }
+    if(!n.name||typeof n.name!=='string') n.name=`Node ${idx+1}`; // should not happen thanks to uniqueName
+    if(!n.type||typeof n.type!=='string'||!n.type.trim()){ n.type=REQUIRED_TYPE; n.typeVersion=1; n.parameters={ functionCode:"return [$json];" }; }
     if(typeof n.typeVersion!=='number') n.typeVersion=1;
-    if(!Array.isArray(n.position)||n.position.length!==2){ n.position=[-1000, 300+(idx*40)]; } else { n.position=[Number(n.position[0])||0, Number(n.position[1])||0]; }
+    if(!Array.isArray(n.position)||n.position.length!==2){ n.position=[-1000, 300+(idx*40)]; }
     if(!n.parameters||typeof n.parameters!=='object') n.parameters={};
+    // ensure function nodes have code
+    if(n.type==="n8n-nodes-base.function" && !n.parameters.functionCode){
+      n.parameters.functionCode = "return [$json];";
+    }
     byName.set(n.name,n); return n;
   });
+
+  // prune invalid links; keep existing keys (names) untouched
   const conns=wf.connections||{};
   for(const [from,m] of Object.entries(conns)){
     if(!byName.has(from)){ delete conns[from]; continue; }
@@ -250,7 +296,9 @@ function sanitizeWorkflow(wf){
     if(!Array.isArray(m.main)) m.main=[];
     m.main=m.main.map(arr=>Array.isArray(arr)?arr.filter(link=>byName.has(link?.node)):[]);
   }
-  wf.connections=conns; wf.name=String(wf.name||"AI Agent Workflow"); return wf;
+  wf.connections=conns;
+  wf.name=String(wf.name||"AI Agent Workflow");
+  return wf;
 }
 
 // ---------- LLM orchestration ----------
@@ -274,29 +322,28 @@ function buildCanonicalSchedulingBranches(channelsIn){
 
   const steps = [
     { name:"Lookup: Upcoming Appointments (PMS/CRM)", kind:"lookup" },
-    { name:"Compose: Multi-channel outreach message", kind:"compose" },
-    { name:"Decision: Client response", kind:"decision",
+    { name:"Decision: Do we have an upcoming appointment for this contact?", kind:"decision",
       outcomes:[
-        { value:"yes_attending",
+        { value:"yes_upcoming",
           steps:[
+            { name:"Compose: Confirmation message with business address & reason", kind:"compose" },
             { name:"Book: Confirm in Calendar", kind:"book" },
-            { name:"Notify: Reminder 2h before", kind:"notify" },
+            { name:"Notify: Reminder 2h before appointment", kind:"notify" },
             { name:"Update: CRM visit status → Confirmed", kind:"update" },
-            { name:"Store: Audit trail", kind:"store" },
           ]
         },
-        { value:"cannot_attend",
+        { value:"no_or_cannot_attend",
           steps:[
             { name:"Lookup: Next available time slots", kind:"lookup" },
-            { name:"Compose: Offer 3 reschedule options", kind:"compose" },
-            { name:"Decision: Client picked a new slot?", kind:"decision",
+            { name:"Compose: Offer reschedule options (3 choices)", kind:"compose" },
+            { name:"Decision: Client chose a new slot?", kind:"decision",
               outcomes:[
                 { value:"reschedule_yes",
                   steps:[
                     { name:"Book: New slot in Calendar", kind:"book" },
-                    { name:"Notify: Reminder 2h before (new slot)", kind:"notify" },
+                    { name:"Compose: New confirmation with date/time/address/reason", kind:"compose" },
+                    { name:"Notify: Reminder 2h before new appointment", kind:"notify" },
                     { name:"Update: CRM visit status → Rescheduled", kind:"update" },
-                    { name:"Store: Audit trail", kind:"store" },
                   ]
                 },
                 { value:"reschedule_no",
@@ -310,7 +357,8 @@ function buildCanonicalSchedulingBranches(channelsIn){
           ]
         }
       ]
-    }
+    },
+    { name:"Store: Audit trail & timeline event", kind:"store" }
   ];
 
   return {
@@ -324,16 +372,13 @@ async function buildWorkflowFromRow(row, opts){
   const compat=(opts.compat||'safe')==='full'?'full':'safe';
   const includeDemo=opts.includeDemo!==false;
 
-  // channels from best_reply_shapes
   const channels=[]; const shapes=listify(row.best_reply_shapes);
   for(const sh of shapes){ for(const norm of CHANNEL_NORMALIZE){ if(norm.rx.test(sh) && !channels.includes(norm.k)) channels.push(norm.k); } }
   if(!channels.length) channels.push('email');
 
-  // choose archetype/trigger
   let archetype=chooseArchetype(row);
   let prodTrigger=TRIGGER_PREF[archetype]||'manual';
 
-  // LLM design + messages
   const design=(await makeDesigner(row))||{};
   if(Array.isArray(design.channels)&&design.channels.length){
     const allowed=['email','sms','whatsapp','call'];
@@ -346,19 +391,26 @@ async function buildWorkflowFromRow(row, opts){
   if(typeof design.archetype==='string' && design.archetype.trim()){
     archetype=design.archetype.trim().toUpperCase();
   }
-  const systems=Array.isArray(design.systems)?design.systems.map(s=>String(s).toLowerCase()):[];
-  const branches=Array.isArray(design.branches)?design.branches:[];
+  let systems=Array.isArray(design.systems)?design.systems.map(s=>String(s).toLowerCase()):[];
+  let branches=Array.isArray(design.branches)?design.branches:[];
+
+  if(archetype==='APPOINTMENT_SCHEDULING'){
+    const sparse = !branches.length || !branches.some(b=>Array.isArray(b.steps)&&b.steps.length);
+    if(sparse){
+      const built = buildCanonicalSchedulingBranches(channels);
+      branches = built.branches;
+      const wanted = built.channels;
+      channels.splice(0, channels.length, ...wanted);
+      if(!systems.includes('calendar')) systems.push('calendar');
+      if(!systems.includes('crm')) systems.push('crm');
+      if(!systems.includes('pms')) systems.push('pms');
+      if(!systems.includes('email')) systems.push('email');
+      if(!systems.includes('twilio')) systems.push('twilio');
+    }
+  }
 
   const errors=Array.isArray(design.errors)?design.errors:[];
   const msg=(await makeMessages(row, archetype, channels))||{};
-
-  // If scheduling & sparse, plug in canonical sequence
-  let branchesFinal = branches;
-  if(archetype==='APPOINTMENT_SCHEDULING' && (!branches.length || !branches.some(b=>Array.isArray(b.steps)&&b.steps.length))){
-    const built = buildCanonicalSchedulingBranches(channels);
-    branchesFinal = built.branches;
-    channels.splice(0, channels.length, ...built.channels);
-  }
 
   const title=`${row.scenario_id||'Scenario'} — ${row.name||''}`.trim();
   const wf=baseWorkflow(title);
@@ -404,15 +456,15 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
       }
 
       const sw = addSwitch(wf, "Branch (LLM/Canonical)", "={{$json.__branch || 'main'}}",
-        (branchesFinal.length?branchesFinal:[{name:"main"}]).map(b=>({operation:'equal', value2:String(b.name||'main').slice(0,48)})),
+        (branches.length?branches:[{name:"main"}]).map(b=>({operation:'equal', value2:String(b.name||'main').slice(0,48)})),
         LAYOUT.switchX, LAYOUT.prodStart.y);
       connect(wf, cursor, sw);
 
-      // VERTICAL CHANNELS PER BRANCH with DECISION support
+      // VERTICAL CHANNELS PER BRANCH with DECISION support (extra spacing)
       let lastCollectorOfLastBranch = null;
-      const baseBranchY = LAYOUT.prodStart.y - Math.floor(LAYOUT.branchY * (Math.max(branchesFinal.length,1)-1)/2);
+      const baseBranchY = LAYOUT.prodStart.y - Math.floor(LAYOUT.branchY * (Math.max(branches.length,1)-1)/2);
 
-      (branchesFinal.length?branchesFinal:[{name:"main",steps:[]}]).forEach((b, bIdx)=>{
+      (branches.length?branches:[{name:"main",steps:[]}]).forEach((b, bIdx)=>{
         const branchTopY = baseBranchY + bIdx*LAYOUT.branchY;
         const chCount = Math.max(channels.length,1);
         const firstChY = branchTopY - Math.floor(LAYOUT.channelY * (chCount-1)/2);
@@ -438,12 +490,12 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
 
           for (let k=0; k<steps.length; k++){
             const st = steps[k];
-            const x = LAYOUT.prodStart.x + (5+k)*LAYOUT.stepX;     // <- strictly left→right by order
+            const x = LAYOUT.prodStart.x + (5+k)*LAYOUT.stepX;
             const title = GUIDE.numberSteps ? `[${++stepNo}] ${st.name||'Step'}` : (st.name||'Step');
             const kind=String(st.kind||'').toLowerCase();
 
             if(kind==='decision' && Array.isArray(st.outcomes) && st.outcomes.length){
-              // Decision: outcomes fan out vertically, then converge
+              // Decision: fan out lanes per outcome with more vertical spacing
               const rulz = st.outcomes.map(o=>({operation:'equal', value2:String(o.value||'outcome').slice(0,64)}));
               const dSwitch = addSwitch(wf, `${title} (Decision)`, "={{$json.__decision || 'default'}}", rulz, x, rowY);
               connect(wf, prev, dSwitch);
@@ -475,6 +527,8 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, ox, oy);
                     node = addHTTP(wf, ot, `={{'${DEFAULT_HTTP.calendar_book}'}}`, "={{$json}}", ox, oy);
                   } else if(okind==='ticket'){
                     node = addHTTP(wf, ot, `={{'${DEFAULT_HTTP.ticket_create}'}}`, "={{$json}}", ox, oy);
+                  } else if(okind==='wait'){
+                    node = addFunction(wf, ot, "return [$json];", ox, oy);
                   } else {
                     node = addFunction(wf, ot, "return [$json];", ox, oy);
                   }
@@ -514,6 +568,8 @@ return [{...m, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
               node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.calendar_book}'}}`, "={{$json}}", x, rowY);
             } else if(kind==='ticket'){
               node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.ticket_create}'}}`, "={{$json}}", x, rowY);
+            } else if(kind==='wait'){
+              node = addFunction(wf, title, "return [$json];", x, rowY);
             } else{
               node = addFunction(wf, title, "return [$json];", x, rowY);
             }
@@ -535,16 +591,17 @@ return [{...m, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
             prevChannelCollector = collector;
           }
 
-          if (bIdx === (Math.max(branchesFinal.length,1)-1) && chIdx === (chCount-1)) {
+          if (bIdx === (Math.max(branches.length,1)-1) && chIdx === (chCount-1)) {
             lastCollectorOfLastBranch = prevChannelCollector;
           }
         });
       });
 
       if(Array.isArray(errors) && errors.length && lastCollectorOfLastBranch){
-        const bottomOfBranches = baseBranchY + (Math.max(branchesFinal.length,1)-1)*LAYOUT.branchY;
+        const bottomOfBranches = baseBranchY + (Math.max(branches.length,1)-1)*LAYOUT.branchY;
         const errY = bottomOfBranches + LAYOUT.errorRowYPad;
 
+        // Error “orange band”
         addHeader(wf, `${ZONE.ERR} · ${laneLabel}`, LAYOUT.prodStart.x + 3*LAYOUT.stepX, errY - 120);
 
         let prev = addFunction(wf, "Error Monitor (LLM List)", "return [$json];", LAYOUT.prodStart.x + 4*LAYOUT.stepX, errY);
@@ -562,14 +619,14 @@ return [{...m, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
   }
 
   // build lanes
-  buildLane({ laneLabel:"PRODUCTION LANE", yOffset:0, triggerKind:TRIGGER_PREF[archetype]||'manual', isDemo:false });
+  buildLane({ laneLabel:"PRODUCTION LANE", yOffset:0, triggerKind:prodTrigger, isDemo:false });
   if(includeDemo){
     buildLane({ laneLabel:"DEMO LANE (Manual Trigger + Seeded Contacts)", yOffset:LAYOUT.laneGap, triggerKind:'manual', isDemo:true });
   }
 
   wf.staticData=wf.staticData||{};
-  wf.staticData.__design={ 
-    archetype, prodTrigger: TRIGGER_PREF[archetype]||'manual', channels, systems, branches: branchesFinal, errors,
+  wf.staticData.__design={
+    archetype, prodTrigger, channels, systems, branches, errors,
     guide: GUIDE,
     layout: { verticalChannels: true, decisions: "switch+lanes", spacing: LAYOUT },
     zones: ZONE
@@ -578,7 +635,7 @@ return [{...m, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
   return sanitizeWorkflow(wf);
 }
 
-// ---------- HTTP handler ----------
+// ---------- HTTP handler (unchanged signature) ----------
 module.exports = async (req,res)=>{
   Object.entries(HEADERS).forEach(([k,v])=>res.setHeader(k,v));
   if(req.method==="OPTIONS") return res.status(204).end();
@@ -608,4 +665,5 @@ module.exports = async (req,res)=>{
   }
 };
 
+// Force Node runtime on Vercel (same as before)
 module.exports.config = { runtime: 'nodejs20.x' };

@@ -1,6 +1,6 @@
 // public/builder.js
 // Plain script (NOT a module). Exposes: window.Builder = { buildWorkflowJSON }.
-// Generates an n8n workflow JSON from a scenario + industry (+opts).
+// n8n-compat version: avoids brittle params and uses Delay instead of Wait.
 
 (function () {
   "use strict";
@@ -15,15 +15,14 @@
       nodes: [],
       connections: {},
       active: false,
-      settings: { saveExecutionProgress: true },
-      staticData: {},
-      meta: { templateCredsSetup: true },
+      settings: {},          // keep minimal for version compatibility
+      staticData: {},        // optional, harmless
     };
   }
 
   function addNode(wf, node) {
     wf.nodes.push(node);
-    return node.name; // name is used as the connection key
+    return node.name; // return key used in connections
   }
 
   function connect(wf, from, to, outputIndex = 0) {
@@ -78,7 +77,7 @@ return [{ message: text, channel }];`;
       name: "Manual Trigger",
       type: "n8n-nodes-base.manualTrigger",
       typeVersion: 1,
-      position: pos(-500, 300),
+      position: pos(-520, 300),
       parameters: {},
     });
 
@@ -88,7 +87,7 @@ return [{ message: text, channel }];`;
       name: "Set Config",
       type: "n8n-nodes-base.set",
       typeVersion: 2,
-      position: pos(-240, 300),
+      position: pos(-260, 300),
       parameters: {
         keepOnlySet: true,
         values: {
@@ -96,13 +95,15 @@ return [{ message: text, channel }];`;
             { name: "recommendedChannel", value: channel },
             { name: "scenario_id", value: scenario?.scenario_id || "" },
             { name: "industry_id", value: industry?.industry_id || "" },
+            { name: "to", value: "recipient@example.com" },
+            { name: "from", value: "+10000000000" },
+            { name: "callWebhook", value: "https://example.com/call" },
           ],
           json: [
             { name: "scenario", value: scenario || {} },
             { name: "industry", value: industry || {} },
           ],
         },
-        options: {},
       },
     });
 
@@ -113,9 +114,7 @@ return [{ message: text, channel }];`;
       type: "n8n-nodes-base.function",
       typeVersion: 2,
       position: pos(20, 300),
-      parameters: {
-        functionCode: composeMessageFunctionBody(),
-      },
+      parameters: { functionCode: composeMessageFunctionBody() },
     });
 
     // 4) Choose Channel (Switch)
@@ -124,8 +123,9 @@ return [{ message: text, channel }];`;
       name: "Choose Channel",
       type: "n8n-nodes-base.switch",
       typeVersion: 2,
-      position: pos(320, 300),
+      position: pos(300, 300),
       parameters: {
+        // evaluate: $json.channel from Compose Message
         value1: "={{$json.channel}}",
         rules: [
           { operation: "equal", value2: "email" },
@@ -136,7 +136,7 @@ return [{ message: text, channel }];`;
       },
     });
 
-    // 5) Send Email
+    // 5) Send Email (use simple, widely-compatible fields)
     const nEmail = addNode(wf, {
       id: uid("email"),
       name: "Send Email",
@@ -144,11 +144,12 @@ return [{ message: text, channel }];`;
       typeVersion: 3,
       position: pos(620, 160),
       parameters: {
+        to: "={{$json.to}}",
         subject: "={{$json.scenario?.agent_name || 'AI Outreach'}}",
-        toList: "={{$json.to || 'recipient@example.com'}}",
         text: "={{$json.message}}",
       },
-      credentials: {}, // set in n8n UI
+      // credentials configured in n8n after import
+      credentials: {},
     });
 
     // 6) Send SMS (Twilio)
@@ -161,11 +162,11 @@ return [{ message: text, channel }];`;
       parameters: {
         resource: "message",
         operation: "create",
-        from: "={{$json.from || '+10000000000'}}",
-        to: "={{$json.to || '+10000000001'}}",
+        from: "={{$json.from}}",
+        to: "={{$json.to}}",
         message: "={{$json.message}}",
       },
-      credentials: {}, // set in n8n UI
+      credentials: {},
     });
 
     // 7) Send WhatsApp (Twilio)
@@ -178,14 +179,14 @@ return [{ message: text, channel }];`;
       parameters: {
         resource: "message",
         operation: "create",
-        from: "={{$json.from || 'whatsapp:+10000000000'}}",
-        to: "={{$json.to || 'whatsapp:+10000000001'}}",
+        from: "={{'whatsapp:' + ($json.from || '+10000000000')}}",
+        to: "={{'whatsapp:' + ($json.to || '+10000000001')}}",
         message: "={{$json.message}}",
       },
-      credentials: {}, // set in n8n UI
+      credentials: {},
     });
 
-    // 8) Place Call (HTTP Request placeholder)
+    // 8) Place Call (HTTP Request placeholder, simple POST body)
     const nCall = addNode(wf, {
       id: uid("call"),
       name: "Place Call (Webhook/Provider)",
@@ -193,27 +194,25 @@ return [{ message: text, channel }];`;
       typeVersion: 4,
       position: pos(620, 580),
       parameters: {
-        url: "={{$json.callWebhook || 'https://example.com/call'}}",
+        url: "={{$json.callWebhook}}",
+        method: "POST",
         jsonParameters: true,
         sendBody: true,
-        bodyParametersJson: "={{ { to: $json.to || '+10000000001', text: $json.message } }}",
-        options: {},
+        // Build a tiny body without exotic features
+        bodyParametersJson: "={{ { to: $json.to, from: $json.from, text: $json.message } }}",
       },
     });
 
-    // 9) Wait for Reply (simple fixed wait)
-    const nWait = addNode(wf, {
-      id: uid("wait"),
-      name: "Wait for Reply",
-      type: "n8n-nodes-base.wait",
+    // 9) Delay (compat instead of Wait)
+    const nDelay = addNode(wf, {
+      id: uid("delay"),
+      name: "Delay",
+      type: "n8n-nodes-base.delay",
       typeVersion: 1,
       position: pos(920, 300),
       parameters: {
-        options: {
-          waitTill: "timeInterval",
-          timeUnit: "minutes",
-          value: 30,
-        },
+        amount: 30,
+        unit: "minutes",
       },
     });
 
@@ -228,15 +227,15 @@ return [{ message: text, channel }];`;
     connect(wf, nSwitch, nWA, 2);
     connect(wf, nSwitch, nCall, 3);
 
-    // each channel → Wait for Reply
-    connect(wf, nEmail, nWait);
-    connect(wf, nSMS, nWait);
-    connect(wf, nWA, nWait);
-    connect(wf, nCall, nWait);
+    // each channel → Delay
+    connect(wf, nEmail, nDelay);
+    connect(wf, nSMS, nDelay);
+    connect(wf, nWA, nDelay);
+    connect(wf, nCall, nDelay);
 
     return wf;
   }
 
-  // Expose global (critical). Do NOT convert this file to a module.
+  // Expose global
   window.Builder = { buildWorkflowJSON };
 })();

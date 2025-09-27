@@ -1,63 +1,53 @@
-// Plain script (NOT a module). Must attach a global for index.html to call.
-// Final line exposes: window.Builder = { buildWorkflowJSON }.
+// public/builder.js
+// Plain script (NOT a module). Exposes: window.Builder = { buildWorkflowJSON }.
+// Generates an n8n workflow JSON from a scenario + industry (+opts).
 
 (function () {
   "use strict";
 
-  // Small helpers
-  const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
-  const toPos = (x, y) => [x, y];
+  // --- helpers ---------------------------------------------------------------
   const uid = (p) => `${p}_${Math.random().toString(36).slice(2, 10)}`;
+  const pos = (x, y) => [x, y];
 
-  // n8n requires: { name, nodes: [], connections: {} } at minimum.
-  // We'll add a few standard fields for nicer importing.
-  function baseWorkflowMeta(name) {
+  function baseWorkflow(name) {
     return {
       name: name || "AI Agent Workflow",
       nodes: [],
       connections: {},
       active: false,
-      settings: {
-        saveExecutionProgress: true,
-      },
+      settings: { saveExecutionProgress: true },
       staticData: {},
-      meta: {
-        templateCredsSetup: true,
-      },
+      meta: { templateCredsSetup: true },
     };
   }
 
-  // Convenience to push a node and return its name (key for connections)
   function addNode(wf, node) {
     wf.nodes.push(node);
-    return node.name;
+    return node.name; // name is used as the connection key
   }
 
-  // Connect: fromNode --(outputIndex=0)--> toNode
   function connect(wf, from, to, outputIndex = 0) {
     wf.connections[from] ??= {};
     wf.connections[from].main ??= [];
-    // Ensure there is an array slot for this output index
     for (let i = wf.connections[from].main.length; i <= outputIndex; i++) {
       wf.connections[from].main[i] = [];
     }
     wf.connections[from].main[outputIndex].push({ node: to, type: "main", index: 0 });
   }
 
-  // Build the message text inside a Function node
   function composeMessageFunctionBody() {
-    return `// Build a message based on scenario + industry + channel
+    return `// Compose outreach text from scenario + industry + channel
 const s = $json.scenario || {};
 const ind = $json.industry || {};
 const channel = ($json.recommendedChannel || 'email').toLowerCase();
 
-const headline = s.agent_name ? \`\${s.agent_name} — \${s.scenario_id || ''}\` : (s.title || 'Scenario');
-const body = [
-  'Industry: ' + (ind.name || ind.industry_id || 'N/A'),
-  'Problem: ' + (s.problem || 'N/A'),
-  'Narrative: ' + (s.narrative || 'N/A'),
-  'How it works: ' + (s.how_it_works || 'N/A')
-].join('\\n');
+const headline = s.agent_name ? \`\${s.agent_name} — \${s.scenario_id || ''}\` : (s.title || s.scenario_id || 'Scenario');
+const lines = [];
+if (ind.industry_id || ind.name) lines.push('Industry: ' + (ind.name || ind.industry_id));
+if (s.problem)         lines.push('Problem: ' + s.problem);
+if (s.narrative)       lines.push('Narrative: ' + s.narrative);
+if (s.how_it_works)    lines.push('How it works: ' + s.how_it_works);
+if (s.roi_hypothesis)  lines.push('ROI: ' + s.roi_hypothesis);
 
 const channelPrefix = {
   email: '📧 Email',
@@ -66,21 +56,21 @@ const channelPrefix = {
   call: '📞 Call'
 }[channel] || 'Message';
 
-const text = \`\${channelPrefix} — \${headline}\\n\\n\${body}\`;
+const text = \`\${channelPrefix} — \${headline}\\n\\n\${lines.join('\\n')}\`;
 
 return [{ message: text, channel }];`;
   }
 
-  // The main builder
+  // --- main builder ----------------------------------------------------------
   function buildWorkflowJSON(scenario, industry, opts = {}) {
-    const recommendedChannel = (opts.recommendedChannel || 'email').toLowerCase();
+    const channel = String((opts.recommendedChannel || 'email')).toLowerCase();
 
-    const name =
-      (scenario?.scenario_id || scenario?.title || "AI Agent Workflow")
-      + " — "
-      + (industry?.name || industry?.industry_id || "Industry");
+    const wfName =
+      (scenario?.scenario_id || scenario?.title || "AI Agent Workflow") +
+      " — " +
+      (industry?.name || industry?.industry_id || "Industry");
 
-    const wf = baseWorkflowMeta(name);
+    const wf = baseWorkflow(wfName);
 
     // 1) Manual Trigger
     const nManual = addNode(wf, {
@@ -88,22 +78,22 @@ return [{ message: text, channel }];`;
       name: "Manual Trigger",
       type: "n8n-nodes-base.manualTrigger",
       typeVersion: 1,
-      position: toPos(-420, 300),
+      position: pos(-500, 300),
       parameters: {},
     });
 
-    // 2) Set Config (inject scenario/industry/channel into the JSON)
+    // 2) Set Config (inject scenario/industry/channel)
     const nSet = addNode(wf, {
       id: uid("set"),
       name: "Set Config",
       type: "n8n-nodes-base.set",
       typeVersion: 2,
-      position: toPos(-160, 300),
+      position: pos(-240, 300),
       parameters: {
         keepOnlySet: true,
         values: {
           string: [
-            { name: "recommendedChannel", value: recommendedChannel },
+            { name: "recommendedChannel", value: channel },
             { name: "scenario_id", value: scenario?.scenario_id || "" },
             { name: "industry_id", value: industry?.industry_id || "" },
           ],
@@ -122,19 +112,19 @@ return [{ message: text, channel }];`;
       name: "Compose Message",
       type: "n8n-nodes-base.function",
       typeVersion: 2,
-      position: toPos(120, 300),
+      position: pos(20, 300),
       parameters: {
         functionCode: composeMessageFunctionBody(),
       },
     });
 
-    // 4) Switch by channel
+    // 4) Choose Channel (Switch)
     const nSwitch = addNode(wf, {
       id: uid("switch"),
       name: "Choose Channel",
       type: "n8n-nodes-base.switch",
       typeVersion: 2,
-      position: toPos(420, 300),
+      position: pos(320, 300),
       parameters: {
         value1: "={{$json.channel}}",
         rules: [
@@ -146,29 +136,28 @@ return [{ message: text, channel }];`;
       },
     });
 
-    // 5) Email
+    // 5) Send Email
     const nEmail = addNode(wf, {
       id: uid("email"),
       name: "Send Email",
       type: "n8n-nodes-base.emailSend",
       typeVersion: 3,
-      position: toPos(720, 140),
+      position: pos(620, 160),
       parameters: {
         subject: "={{$json.scenario?.agent_name || 'AI Outreach'}}",
         toList: "={{$json.to || 'recipient@example.com'}}",
         text: "={{$json.message}}",
       },
-      // credentials will be set in n8n UI
-      credentials: {},
+      credentials: {}, // set in n8n UI
     });
 
-    // 6) SMS (Twilio)
+    // 6) Send SMS (Twilio)
     const nSMS = addNode(wf, {
       id: uid("sms"),
       name: "Send SMS",
       type: "n8n-nodes-base.twilio",
       typeVersion: 3,
-      position: toPos(720, 300),
+      position: pos(620, 300),
       parameters: {
         resource: "message",
         operation: "create",
@@ -176,16 +165,16 @@ return [{ message: text, channel }];`;
         to: "={{$json.to || '+10000000001'}}",
         message: "={{$json.message}}",
       },
-      credentials: {},
+      credentials: {}, // set in n8n UI
     });
 
-    // 7) WhatsApp (Twilio)
+    // 7) Send WhatsApp (Twilio)
     const nWA = addNode(wf, {
       id: uid("wa"),
       name: "Send WhatsApp (Twilio)",
       type: "n8n-nodes-base.twilio",
       typeVersion: 3,
-      position: toPos(720, 460),
+      position: pos(620, 440),
       parameters: {
         resource: "message",
         operation: "create",
@@ -193,35 +182,34 @@ return [{ message: text, channel }];`;
         to: "={{$json.to || 'whatsapp:+10000000001'}}",
         message: "={{$json.message}}",
       },
-      credentials: {},
+      credentials: {}, // set in n8n UI
     });
 
-    // 8) Call (placeholder via HTTP Request)
+    // 8) Place Call (HTTP Request placeholder)
     const nCall = addNode(wf, {
       id: uid("call"),
       name: "Place Call (Webhook/Provider)",
       type: "n8n-nodes-base.httpRequest",
       typeVersion: 4,
-      position: toPos(720, 620),
+      position: pos(620, 580),
       parameters: {
         url: "={{$json.callWebhook || 'https://example.com/call'}}",
-        options: {},
-        sendBody: true,
         jsonParameters: true,
+        sendBody: true,
         bodyParametersJson: "={{ { to: $json.to || '+10000000001', text: $json.message } }}",
+        options: {},
       },
     });
 
-    // 9) Wait for Reply
+    // 9) Wait for Reply (simple fixed wait)
     const nWait = addNode(wf, {
       id: uid("wait"),
       name: "Wait for Reply",
       type: "n8n-nodes-base.wait",
       typeVersion: 1,
-      position: toPos(1020, 300),
+      position: pos(920, 300),
       parameters: {
         options: {
-          // Basic fixed wait; adapt later to webhook/resume if you wish
           waitTill: "timeInterval",
           timeUnit: "minutes",
           value: 30,
@@ -229,27 +217,26 @@ return [{ message: text, channel }];`;
       },
     });
 
-    // Wire connections
+    // wiring
     connect(wf, nManual, nSet);
     connect(wf, nSet, nCompose);
     connect(wf, nCompose, nSwitch);
 
-    // Switch outputs: 0=email, 1=sms, 2=whatsapp, 3=call
+    // switch outputs: 0=email, 1=sms, 2=whatsapp, 3=call
     connect(wf, nSwitch, nEmail, 0);
     connect(wf, nSwitch, nSMS, 1);
     connect(wf, nSwitch, nWA, 2);
     connect(wf, nSwitch, nCall, 3);
 
-    // Route all channels to Wait for Reply (each from its own output 0)
-    connect(wf, nEmail, nWait, 0);
-    connect(wf, nSMS, nWait, 0);
-    connect(wf, nWA, nWait, 0);
-    connect(wf, nCall, nWait, 0);
+    // each channel → Wait for Reply
+    connect(wf, nEmail, nWait);
+    connect(wf, nSMS, nWait);
+    connect(wf, nWA, nWait);
+    connect(wf, nCall, nWait);
 
     return wf;
   }
 
-  // EXPOSE GLOBAL (critical for non-module script usage)
-  // Do this synchronously so index.html can call it right away after the <script> tag.
+  // Expose global (critical). Do NOT convert this file to a module.
   window.Builder = { buildWorkflowJSON };
 })();

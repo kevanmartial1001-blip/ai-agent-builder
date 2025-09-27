@@ -1,10 +1,10 @@
 // api/build.js
 // Wide layout, vertical-per-channel branches, no waypoint nodes, fully linked.
-// Adds LLM-driven DECISION steps with explicit outcomes (all paths A→Z).
-// Shared pre-send across channels (orange zone), then shared Decision, then per-outcome steps + per-channel sends.
-// Uses known n8n node versions (all nodes have link handles).
+// LLM-driven DECISION with exhaustive outcomes (A→Z).
+// Shared pre-send (orange zone) → shared Decision → per-outcome steps → per-channel sends.
+// Known n8n node versions so every node has link handles.
 // Env: SHEET_ID, GOOGLE_API_KEY, SHEET_TAB?=Scenarios, OPENAI_API_KEY
-// Optional envs to harden against fallback: NO_SHEETS=1, NO_LLM=1
+// Optional: NO_SHEETS=1, NO_LLM=1 (bypass externals for debugging)
 
 const HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -16,9 +16,9 @@ const HEADERS = {
 // ====== Layout (more space) ======
 const LAYOUT = {
   laneGap: 1900,
-  stepX: 540,     // was 460
-  branchY: 520,   // was 440
-  channelY: 360,  // was 280
+  stepX: 540,     // more horizontal space
+  branchY: 520,   // more vertical space between branches
+  channelY: 360,  // more vertical space between channels
   prodHeader: { x: -1520, y: 40 },
   prodStart:  { x: -1380, y: 300 },
   demoHeader: { x: -1520, y: 40 },
@@ -111,7 +111,7 @@ function chooseArchetype(row){
 // ---------- sheet + llm ----------
 async function fetchSheetRowByScenarioId(scenarioId){
   if (process.env.NO_SHEETS === '1') {
-    // Minimal stub so the API always returns a workflow (prevents fallback)
+    // minimal stub (prevents UI fallback)
     return {
       scenario_id: scenarioId,
       name: "Stub Scenario",
@@ -150,7 +150,7 @@ async function openaiJSON(prompt, schemaHint){
         ]
       })
     });
-    if(!r.ok) return null; // fail-soft
+    if(!r.ok) return null;
     const j=await r.json(); const txt=j.choices?.[0]?.message?.content?.trim(); if(!txt) return null;
     try{ return JSON.parse(txt); }catch{ return null; }
   }catch{ return null; }
@@ -219,7 +219,7 @@ Context:
 ${ctx}`;
 }
 
-// ---------- workflow primitives (known versions) ----------
+// ---------- workflow primitives ----------
 function baseWorkflow(name){ return { name, nodes:[], connections:{}, active:false, settings:{}, staticData:{}, __yOffset:0 }; }
 function addNode(wf,node){ if(Array.isArray(node.position)){ node.position=[node.position[0], node.position[1]+(wf.__yOffset||0)]; } wf.nodes.push(node); return node.name; }
 function connect(wf,from,to,outputIndex=0){ wf.connections[from]??={}; wf.connections[from].main??=[]; for(let i=wf.connections[from].main.length;i<=outputIndex;i++) wf.connections[from].main[i]=[]; wf.connections[from].main[outputIndex].push({node:to,type:"main",index:0}); }
@@ -281,7 +281,7 @@ function sanitizeWorkflow(wf){
   wf.connections=conns; wf.name=String(wf.name||"AI Agent Workflow"); return wf;
 }
 
-// ---------- default decisions for chronology ----------
+// ---------- default decisions ----------
 function schedulingDefaults(){
   return {
     name: "Confirm Appointment",
@@ -422,7 +422,6 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
         const chCount = Math.max(channels.length,1);
         const firstChY = branchTopY - Math.floor(LAYOUT.channelY * (chCount-1)/2);
 
-        // Split steps: everything before first decision = preSendSteps; defaults if no decision
         const steps = Array.isArray(b.steps)?b.steps:[];
         const firstDecisionIdx = steps.findIndex(s=>String(s.kind||'').toLowerCase()==='decision');
         const preSendSteps = firstDecisionIdx>=0 ? steps.slice(0, firstDecisionIdx) : steps;
@@ -431,7 +430,6 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
           decisionSpec = (archetype==='APPOINTMENT_SCHEDULING') ? schedulingDefaults() : genericDefaults();
         }
 
-        // shared pre-send node (orange zone)
         const sharedSendX = LAYOUT.prodStart.x + (4 + Math.max(preSendSteps.length,0))*LAYOUT.stepX;
         const sharedSend = addFunction(wf, "[2] Send Multi-Channel Reminder", "return [$json];", sharedSendX, branchTopY);
 
@@ -451,7 +449,7 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
           if (chIdx === 0) connect(wf, sw, enter, bIdx);
           if (prevChannelCollector) connect(wf, prevChannelCollector, enter);
 
-          // pre-send steps (lookup/compose/etc.)
+          // pre-send steps
           let prev = enter;
           preSendSteps.forEach((st,k)=>{
             const x = LAYOUT.prodStart.x + (4+k)*LAYOUT.stepX;
@@ -476,7 +474,6 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
             connect(wf, prev, node); prev = node;
           });
 
-          // converge into shared pre-send
           connect(wf, prev, sharedSend);
           prevChannelCollector = sharedSend;
         });
@@ -487,7 +484,7 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
         const dSwitch = addSwitch(wf, `[3] Decision · ${decisionSpec.name}`, "={{$json.__decision || 'default'}}", dRules, decisionX, branchTopY);
         connect(wf, sharedSend, dSwitch);
 
-        // Fan-out outcomes horizontally; each outcome: steps → per-channel sends → collector
+        // Outcomes: steps → per-channel sends → final update → collector
         let lastOutcomeCollector = null;
         decisionSpec.outcomes.forEach((o, oIdx)=>{
           const oy = branchTopY - Math.floor(140*decisionSpec.outcomes.length/2) + oIdx*140;
@@ -521,9 +518,9 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Update'}];`, ox, oy);
             connect(wf, oPrev, node); oPrev = node;
           });
 
-          // Per-outcome, send across all channels horizontally
           let sendPrev = oPrev;
-          channels.forEach((ch, cIdx)=>{
+          const channelsToSend = channels; // send on all channels for outcome
+          channelsToSend.forEach((ch, cIdx)=>{
             const sx = decisionX + Math.floor(LAYOUT.stepX*0.8) + (Math.max(oSteps.length,0)+cIdx+1)*Math.floor(LAYOUT.stepX*0.6);
             const s = makeSenderNode(wf, ch, sx, oy, compat, isDemo);
             try{ wf.nodes[wf.nodes.findIndex(n=>n.name===s)].name = `[6.${oIdx+1}.${cIdx+1}] Send: ${ch.toUpperCase()}`; }catch{}
@@ -531,8 +528,7 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Update'}];`, ox, oy);
             sendPrev = s;
           });
 
-          // Final update & collector (calendar/CRM)
-          const updX = (decisionX + Math.floor(LAYOUT.stepX*0.8)) + (Math.max(oSteps.length,0)+channels.length+1)*Math.floor(LAYOUT.stepX*0.6);
+          const updX = (decisionX + Math.floor(LAYOUT.stepX*0.8)) + (Math.max(oSteps.length,0)+channelsToSend.length+1)*Math.floor(LAYOUT.stepX*0.6);
           const upd = addHTTP(wf, `[7.${oIdx+1}] Final Update (CRM/Calendar)`,
             "={{$json.__decision==='confirm' ? '"+DEFAULT_HTTP.crm_upsert+"' : '"+DEFAULT_HTTP.crm_log+"'}}",
             "={{$json}}", updX, oy);
@@ -577,35 +573,82 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Update'}];`, ox, oy);
   return sanitizeWorkflow(wf);
 }
 
-// ---------- HTTP handler (unchanged signature) ----------
+// ---------- HTTP handler (adds GET debug/dry, POST unchanged) ----------
 module.exports = async (req,res)=>{
   Object.entries(HEADERS).forEach(([k,v])=>res.setHeader(k,v));
   if(req.method==="OPTIONS") return res.status(204).end();
 
+  // New: debug via query (GET cliquable)
+  const urlObj = new URL(req.url, `http://${req.headers.host}`);
+  const qScenario = urlObj.searchParams.get('scenario_id');
+  const qDebug    = urlObj.searchParams.get('debug') === '1';
+  const qDry      = urlObj.searchParams.get('dry') === '1';
+
   try{
     if(req.method!=="POST"){
+      if (qScenario) {
+        const compat = (urlObj.searchParams.get('compat')||'safe').toLowerCase()==='full'?'full':'safe';
+        const includeDemo = urlObj.searchParams.get('includeDemo')!=='false';
+
+        const savedNO_SHEETS = process.env.NO_SHEETS;
+        const savedNO_LLM    = process.env.NO_LLM;
+        if (qDry) { process.env.NO_SHEETS='1'; process.env.NO_LLM='1'; }
+
+        const row = await fetchSheetRowByScenarioId(qScenario);
+        if(!row) {
+          res.status(404).json({ ok:false, error:`scenario_id not found: ${qScenario}` });
+          if (qDry) { process.env.NO_SHEETS=savedNO_SHEETS; process.env.NO_LLM=savedNO_LLM; }
+          return;
+        }
+        const t0 = Date.now();
+        const wf = await buildWorkflowFromRow(row,{ compat, includeDemo });
+        const tookMs = Date.now()-t0;
+
+        if (qDry) { process.env.NO_SHEETS=savedNO_SHEETS; process.env.NO_LLM=savedNO_LLM; }
+
+        if (qDebug) {
+          res.status(200).json({ ok:true, debug:true, took_ms:tookMs, node_count:wf.nodes.length, conn_from:Object.keys(wf.connections).length, wf });
+          return;
+        }
+        res.status(200);
+        res.setHeader("Content-Type","application/json; charset=utf-8");
+        res.setHeader("Content-Disposition",`attachment; filename="${(row.scenario_id||'workflow')}.n8n.json"`);
+        res.end(JSON.stringify(wf,null,2));
+        return;
+      }
+      // GET without scenario_id => usage
       return res.status(200).json({ ok:true, usage:'POST {"scenario_id":"<id>", "compat":"safe|full", "includeDemo": true }' });
     }
+
+    // POST flow (unchanged)
     const body=await new Promise(resolve=>{
-      const chunks=[]; req.on("data",c=>chunks.push(c)); req.on("end",()=>{ try{ resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); }catch{ resolve({}); } });
+      const chunks=[]; req.on("data",c=>chunks.push(c));
+      req.on("end",()=>{ try{ resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); }catch{ resolve({}); } });
     });
     const wanted=(body.scenario_id||"").toString().trim(); if(!wanted) throw new Error("Missing scenario_id");
     const compat=(body.compat||'safe').toLowerCase()==='full'?'full':'safe';
     const includeDemo=body.includeDemo!==false;
 
+    const t0 = Date.now();
     const row=await fetchSheetRowByScenarioId(wanted);
     if(!row) return res.status(404).json({ ok:false, error:`scenario_id not found: ${wanted}` });
 
     const wf=await buildWorkflowFromRow(row,{ compat, includeDemo });
+    const tookMs = Date.now()-t0;
+
+    if (body.debug === true) {
+      return res.status(200).json({ ok:true, debug:true, took_ms:tookMs, node_count:wf.nodes.length, conn_from:Object.keys(wf.connections).length, wf });
+    }
 
     res.status(200);
     res.setHeader("Content-Type","application/json; charset=utf-8");
     res.setHeader("Content-Disposition",`attachment; filename="${(row.scenario_id||'workflow')}.n8n.json"`);
     res.end(JSON.stringify(wf,null,2));
   }catch(err){
+    console.error('BUILD_ERROR', err);
     res.status(500).json({ ok:false, error:String(err?.message||err) });
   }
 };
 
-// Force Node runtime on Vercel (same as before)
+// Force Node runtime on Vercel
 module.exports.config = { runtime: 'nodejs20.x' };

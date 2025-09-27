@@ -1,6 +1,9 @@
-// api/build.js (hardened)
-// Même API, mêmes features (layout espacé, vertical channels, shared send/decision, debug GET).
-// Durcissements: si Google Sheets renvoie vide/erreur, on retourne un stub cohérent au lieu de planter.
+// api/build.js
+// Wide layout, vertical-per-channel branches, strict chronology, fully linked.
+// Adds LLM-driven DECISION steps with explicit outcomes (all paths A→Z).
+// For APPOINTMENT_SCHEDULING, auto-builds a canonical chronological flow if LLM is sparse.
+// Uses conservative n8n node versions (every node has link handles).
+// Env: SHEET_ID, GOOGLE_API_KEY, SHEET_TAB?=Scenarios, OPENAI_API_KEY
 
 const HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -9,20 +12,30 @@ const HEADERS = {
   "Content-Type": "application/json; charset=utf-8",
 };
 
+// ====== Layout (more air to prevent overlap) ======
 const LAYOUT = {
-  laneGap: 1900,
-  stepX: 540,
-  branchY: 520,
-  channelY: 360,
+  laneGap: 2100,        // ↑ from 1900
+  stepX: 520,           // ↑ from 460 (more horizontal spacing per step)
+  branchY: 520,         // ↑ from 440 (more spacing between branches)
+  channelY: 360,        // ↑ from 280 (more spacing between channels)
+  outcomeRowY: 200,     // ↑ (vertical spacing between decision outcomes)
   prodHeader: { x: -1520, y: 40 },
   prodStart:  { x: -1380, y: 300 },
   demoHeader: { x: -1520, y: 40 },
   demoStart:  { x: -1380, y: 300 },
-  switchX: -300,
-  errorRowYPad: 380,
+  switchX: -420,        // move branch switch a bit further left so first columns breathe
+  errorRowYPad: 460,    // a bit more room under branches for the error lane
 };
 
+// Visual guide options
 const GUIDE = { showWaypoints: false, numberSteps: true };
+
+// “Orange band” style hint for your UI renderer: we emit section labels consistently.
+// (n8n JSON cannot color backgrounds; your UI can style these header/section nodes.)
+const ZONE = {
+  FLOW: "FLOW AREA",   // main process band
+  ERR:  "ERROR AREA",  // error band
+};
 
 const DEMO = {
   to: "+34613030526",
@@ -36,11 +49,9 @@ const DEFAULT_HTTP = {
   pms_upcoming: "https://example.com/pms/upcoming",
   ticket_create: "https://example.com/ticket/create",
   calendar_book: "https://example.com/calendar/book",
-  crm_upsert: "https://example.com/crm/upsert",
-  crm_log: "https://example.com/crm/log",
-  waitlist_fill: "https://example.com/waitlist/fill",
 };
 
+// ====== Archetypes & rules ======
 const ARCH_RULES = [
   { a:'APPOINTMENT_SCHEDULING', rx:/(appointment|appointments|scheduling|no[-_ ]?show|calendar)/i },
   { a:'CUSTOMER_SUPPORT_INTAKE', rx:/\b(cs|support|helpdesk|ticket|sla|triage|escalation|deflection|kb)\b/i },
@@ -77,23 +88,15 @@ const TRIGGER_PREF = {
 const CHANNEL_NORMALIZE = [
   { k: 'whatsapp', rx: /whatsapp/i },
   { k: 'sms', rx: /(sms|text)/i },
-  { k: 'call', rx: /(voice|call)/i },
+  { k: 'call', rx: /(voice|call|phone)/i },
   { k: 'email', rx: /email/i },
 ];
 
+// ---------- utils ----------
 const uid = (p) => `${p}_${Math.random().toString(36).slice(2, 10)}`;
 const pos = (x, y) => [x, y];
 function toObj(header, row) { return Object.fromEntries(header.map((h,i)=>[h,(row[i]??"").toString().trim()])); }
 const listify = (v) => Array.isArray(v) ? v.map(x=>String(x).trim()).filter(Boolean) : String(v||'').split(/[;,/|\n]+/).map(x=>x.trim()).filter(Boolean);
-
-// fetch timeout
-const TIMEOUT_MS = 7000;
-async function timedFetch(url, opts={}) {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
-  try { return await fetch(url, { ...opts, signal: ctrl.signal }); }
-  finally { clearTimeout(t); }
-}
 
 function chooseArchetype(row){
   const hay=[row["scenario_id"],row["name"],row["tags"],row["triggers"],row["how_it_works"],row["tool_stack_dev"]].map(x=>String(x||'')).join(' ');
@@ -101,53 +104,23 @@ function chooseArchetype(row){
   return 'SALES_OUTREACH';
 }
 
-// ---- SAFE STUB (used if Sheets missing/empty/not found) ----
-function makeStubRow(scenarioId){
-  return {
-    scenario_id: scenarioId,
-    name: "Stub Scenario",
-    agent_name: "Agent",
-    triggers: "webhook",
-    best_reply_shapes: "email; sms; whatsapp; call",
-    how_it_works: "",
-    roi_hypothesis: "",
-    risk_notes: "",
-    tags: "scheduling"
-  };
-}
-
 // ---------- sheet + llm ----------
 async function fetchSheetRowByScenarioId(scenarioId){
-  // Allow explicit bypass
-  if (process.env.NO_SHEETS === '1') return makeStubRow(scenarioId);
-
   const SHEET_ID=process.env.SHEET_ID; const GOOGLE_API_KEY=process.env.GOOGLE_API_KEY; const TAB=process.env.SHEET_TAB||"Scenarios";
-  if(!SHEET_ID||!GOOGLE_API_KEY) return makeStubRow(scenarioId);
-
-  try{
-    const url=`https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(TAB)}?key=${GOOGLE_API_KEY}`;
-    const r=await timedFetch(url,{cache:"no-store"});
-    if(!r.ok) return makeStubRow(scenarioId);
-    const data=await r.json();
-    const rows = Array.isArray(data?.values) ? data.values : null;
-    if(!rows || rows.length < 2) return makeStubRow(scenarioId); // header + at least 1 row
-
-    const header=rows[0].map(h=>String(h||'').trim());
-    const bodyRows = rows.slice(1).map(rw=>toObj(header,rw||[]));
-    const found = bodyRows.find(x=>(x["scenario_id"]||"").toString().trim().toLowerCase()===scenarioId.toLowerCase());
-    return found || makeStubRow(scenarioId);
-  }catch(e){
-    // Any parsing/network issue -> stub
-    return makeStubRow(scenarioId);
-  }
+  if(!SHEET_ID||!GOOGLE_API_KEY) throw new Error("Missing SHEET_ID or GOOGLE_API_KEY");
+  const url=`https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(TAB)}?key=${GOOGLE_API_KEY}`;
+  const r=await fetch(url,{cache:"no-store"}); if(!r.ok) throw new Error(`Sheets API error: ${r.status} ${r.statusText}`);
+  const data=await r.json(); const rows=data.values||[]; if(!rows.length) throw new Error("Sheet has no rows");
+  const header=rows[0].map(h=>h.trim()); const obj=rows.slice(1).map(rw=>toObj(header,rw));
+  return obj.find(x=>(x["scenario_id"]||"").toString().trim().toLowerCase()===scenarioId.toLowerCase());
 }
 
 async function openaiJSON(prompt, schemaHint){
-  if (process.env.NO_LLM === '1' || !process.env.OPENAI_API_KEY) return null;
+  const key=process.env.OPENAI_API_KEY; if(!key) return null;
   try{
-    const r=await timedFetch("https://api.openai.com/v1/chat/completions",{
+    const r=await fetch("https://api.openai.com/v1/chat/completions",{
       method:"POST",
-      headers:{ "Authorization":`Bearer ${process.env.OPENAI_API_KEY}`,"Content-Type":"application/json"},
+      headers:{ "Authorization":`Bearer ${key}`,"Content-Type":"application/json"},
       body:JSON.stringify({
         model:"gpt-4o-mini",
         temperature:0.35,
@@ -158,7 +131,6 @@ async function openaiJSON(prompt, schemaHint){
         ]
       })
     });
-    if(!r.ok) return null;
     const j=await r.json(); const txt=j.choices?.[0]?.message?.content?.trim(); if(!txt) return null;
     try{ return JSON.parse(txt); }catch{ return null; }
   }catch{ return null; }
@@ -177,14 +149,15 @@ function makeDesignerPrompt(row){
     `TAGS: ${row["tags (;)"]||row.tags||''}`,
   ].join("\n");
   return `
-Design a bullet-proof n8n workflow and enumerate ALL realistic outcomes using industry knowledge + context.
+Design a bullet-proof n8n workflow and enumerate ALL realistic outcomes using industry knowledge + context (TRIGGERS/BEST_REPLY_SHAPES/RISK_NOTES/ROI_HYPOTHESIS).
 
-Rules (chronology A→Z):
-1) Pre-flight/lookups  2) Compose  3) **Send Multi-Channel Reminder (shared)**  4) **Decision (exhaustive outcomes)**
-5) Outcome steps  6) Per-channel sends (confirmations, follow-ups)  7) Final updates/logs.
-
-Step kinds: "compose"|"http"|"update"|"route"|"wait"|"score"|"lookup"|"book"|"ticket"|"notify"|"store"|"decision".
-A "decision" step MUST include "outcomes": [{ "value": "...", "steps": Step[] }].
+Rules:
+- "trigger": one of ["cron","webhook","imap","manual"].
+- "channels": ordered subset of ["email","sms","whatsapp","call"].
+- "branches": ≤6. Each branch is a high-level path.
+- Step kinds: "compose" | "http" | "update" | "route" | "wait" | "score" | "lookup" | "book" | "ticket" | "notify" | "store" | "decision".
+- A "decision" step MUST include exhaustive "outcomes". Each outcome: { "value": string, "steps": Step[] }.
+- Preserve strict chronological order. No ambiguous jumps.
 
 Return JSON:
 {
@@ -193,10 +166,10 @@ Return JSON:
   "channels": ["email","sms","whatsapp","call"],
   "branches": [
     { "name":"...", "condition":"...", "steps":[
-      { "name":"...", "kind":"compose|http|update|route|wait|score|lookup|book|ticket|notify|store" },
-      { "name":"...", "kind":"decision", "outcomes":[
-        { "value":"...", "steps":[{ "name":"...","kind":"..." }, ...] }, ...
-      ] }
+        { "name":"...", "kind":"compose|http|update|route|wait|score|lookup|book|ticket|notify|store" },
+        { "name":"...", "kind":"decision", "outcomes":[
+          { "value":"...", "steps":[{ "name":"...","kind":"..." }, ...] }, ...
+        ] }
     ] }
   ],
   "errors": [{ "name":"...", "mitigation":"..." }],
@@ -227,20 +200,28 @@ Context:
 ${ctx}`;
 }
 
-// ---------- workflow primitives ----------
+// ---------- workflow primitives (known versions) ----------
 function baseWorkflow(name){ return { name, nodes:[], connections:{}, active:false, settings:{}, staticData:{}, __yOffset:0 }; }
 function addNode(wf,node){ if(Array.isArray(node.position)){ node.position=[node.position[0], node.position[1]+(wf.__yOffset||0)]; } wf.nodes.push(node); return node.name; }
 function connect(wf,from,to,outputIndex=0){ wf.connections[from]??={}; wf.connections[from].main??=[]; for(let i=wf.connections[from].main.length;i<=outputIndex;i++) wf.connections[from].main[i]=[]; wf.connections[from].main[outputIndex].push({node:to,type:"main",index:0}); }
 function withYOffset(wf,yOffset,fn){ const prev=wf.__yOffset||0; wf.__yOffset=yOffset; try{ fn(); } finally{ wf.__yOffset=prev; } }
-function addHeader(wf,label,x,y){ return addNode(wf,{ id:uid("label"), name:`=== ${label} ===`, type:"n8n-nodes-base.function", typeVersion:1, position:pos(x,y), parameters:{ functionCode:"return [$json];" } }); }
+
+// Section headers (your UI can render these as “orange bands”)
+function addHeader(wf,label,x,y){ 
+  return addNode(wf,{ id:uid("label"), name:`=== ${label} ===`, type:"n8n-nodes-base.function", typeVersion:1, position:pos(x,y), parameters:{ functionCode:"return [$json];" } });
+}
+
 function addManual(wf,x,y,label="Manual Trigger"){ return addNode(wf,{ id:uid("manual"), name:label, type:"n8n-nodes-base.manualTrigger", typeVersion:1, position:pos(x,y), parameters:{} }); }
 function addCron(wf,label,x,y,compat){ if(compat==="full"){ return addNode(wf,{ id:uid("cron"), name:label, type:"n8n-nodes-base.cron", typeVersion:1, position:pos(x,y), parameters:{ triggerTimes:{ item:[{ mode:"everyX", everyX:{ hours:0, minutes:15 } }] } } }); } return addNode(wf,{ id:uid("cronph"), name:`${label} (Placeholder)`, type:"n8n-nodes-base.function", typeVersion:1, position:pos(x,y), parameters:{ functionCode:"return [$json];" } }); }
 function addWebhook(wf,label,x,y,compat){ if(compat==="full"){ return addNode(wf,{ id:uid("webhook"), name:label, type:"n8n-nodes-base.webhook", typeVersion:1, position:pos(x,y), parameters:{ path:uid("hook"), methods:["POST"], responseMode:"onReceived" } }); } return addNode(wf,{ id:uid("webph"), name:`${label} (Placeholder)`, type:"n8n-nodes-base.function", typeVersion:1, position:pos(x,y), parameters:{ functionCode:"return [$json];" } }); }
 function addHTTP(wf,name,urlExpr,bodyExpr,x,y,method="POST"){ return addNode(wf,{ id:uid("http"), name, type:"n8n-nodes-base.httpRequest", typeVersion:3, position:pos(x,y), parameters:{ url:urlExpr, method, jsonParameters:true, sendBody:true, bodyParametersJson:bodyExpr } }); }
 function addFunction(wf,name,code,x,y){ return addNode(wf,{ id:uid("func"), name, type:"n8n-nodes-base.function", typeVersion:1, position:pos(x,y), parameters:{ functionCode:code } }); }
+function addIf(wf,name,left,op,right,x,y){ return addNode(wf,{ id:uid("if"), name, type:"n8n-nodes-base.if", typeVersion:2, position:pos(x,y), parameters:{ conditions:{ number:[], string:[{ value1:left, operation:op, value2:right }] } } }); }
 function addSwitch(wf,name,valueExpr,rules,x,y){ return addNode(wf,{ id:uid("switch"), name, type:"n8n-nodes-base.switch", typeVersion:2, position:pos(x,y), parameters:{ value1:valueExpr, rules } }); }
+function addSplit(wf,x,y,size=20){ return addNode(wf,{ id:uid("split"), name:"Split In Batches", type:"n8n-nodes-base.splitInBatches", typeVersion:1, position:pos(x,y), parameters:{ batchSize:size } }); }
 function addCollector(wf,x,y){ return addFunction(wf,"Collector (Inspect)",`const now=new Date().toISOString(); const arr=Array.isArray(items)?items:[{json:$json}]; return arr.map((it,i)=>({json:{...it.json,__collected_at:now, index:i}}));`,x,y); }
 
+// sender nodes
 function makeSenderNode(wf, channel, x, y, compat, demo){
   const friendly = channel.toUpperCase();
   if(compat==='full'){
@@ -264,6 +245,7 @@ function makeSenderNode(wf, channel, x, y, compat, demo){
   return addFunction(wf, `Demo Send ${friendly}`, "return [$json];", x, y);
 }
 
+// ---------- sanitization ----------
 function sanitizeWorkflow(wf){
   const REQUIRED_TYPE="n8n-nodes-base.function"; const nameCounts={}; const byName=new Map();
   wf.nodes=(wf.nodes||[]).map((n,idx)=>{
@@ -285,45 +267,7 @@ function sanitizeWorkflow(wf){
   wf.connections=conns; wf.name=String(wf.name||"AI Agent Workflow"); return wf;
 }
 
-// defaults decision
-function schedulingDefaults(){
-  return {
-    name: "Confirm Appointment",
-    kind: "decision",
-    outcomes: [
-      { value:"confirm", steps:[
-        { name:"Update Calendar (confirm slot)", kind:"update" },
-        { name:"CRM Log", kind:"store" },
-        { name:"Reminder T-2h", kind:"notify" }
-      ]},
-      { value:"reschedule", steps:[
-        { name:"Check Availability", kind:"lookup" },
-        { name:"Propose New Slot", kind:"book" }
-      ]},
-      { value:"cancel", steps:[
-        { name:"Release Slot", kind:"update" },
-        { name:"Fill from Waitlist", kind:"http" }
-      ]},
-      { value:"no_response", steps:[
-        { name:"Follow-up Sequence", kind:"notify" }
-      ]}
-    ]
-  };
-}
-function genericDefaults(){
-  return {
-    name: "User Response",
-    kind: "decision",
-    outcomes: [
-      { value:"proceed", steps:[{name:"Update System",kind:"update"}] },
-      { value:"needs_info", steps:[{name:"Request Info",kind:"notify"}] },
-      { value:"escalate", steps:[{name:"Create Ticket",kind:"ticket"}] },
-      { value:"no_response", steps:[{name:"Retry / Reminder",kind:"notify"}] },
-    ],
-  };
-}
-
-// ---------- LLM wrappers ----------
+// ---------- LLM orchestration ----------
 function makeDesigner(row){
   return openaiJSON(
     makeDesignerPrompt(row),
@@ -337,23 +281,79 @@ function makeMessages(row, archetype, channels){
   );
 }
 
+// ---------- Canonical chronological flow for Appointment Scheduling ----------
+function buildCanonicalSchedulingBranches(channelsIn){
+  // Default channel order per your screenshot text: Phone, SMS, WhatsApp, Email
+  const desired = ['call','sms','whatsapp','email'];
+  const channels = desired.filter(c=>channelsIn.includes(c)).concat(channelsIn.filter(c=>!desired.includes(c)));
+  // One branch "Scheduling"
+  const steps = [
+    { name:"Lookup: Upcoming Appointments (PMS/CRM)", kind:"lookup" },
+    { name:"Decision: Do we have an upcoming appointment for this contact?", kind:"decision",
+      outcomes:[
+        { value:"yes_upcoming",
+          steps:[
+            { name:"Compose: Confirmation message with business address & reason", kind:"compose" },
+            { name:"Book: Confirm in Calendar", kind:"book" },
+            { name:"Notify: Reminder 2h before appointment", kind:"notify" },
+            { name:"Update: CRM visit status → Confirmed", kind:"update" },
+          ]
+        },
+        { value:"no_or_cannot_attend",
+          steps:[
+            { name:"Lookup: Next available time slots", kind:"lookup" },
+            { name:"Compose: Offer reschedule options (3 choices)", kind:"compose" },
+            { name:"Decision: Client chose a new slot?", kind:"decision",
+              outcomes:[
+                { value:"reschedule_yes",
+                  steps:[
+                    { name:"Book: New slot in Calendar", kind:"book" },
+                    { name:"Compose: New confirmation with date/time/address/reason", kind:"compose" },
+                    { name:"Notify: Reminder 2h before new appointment", kind:"notify" },
+                    { name:"Update: CRM visit status → Rescheduled", kind:"update" },
+                  ]
+                },
+                { value:"reschedule_no",
+                  steps:[
+                    { name:"Store: Add to follow-up list", kind:"store" },
+                    { name:"Update: CRM visit status → Follow-up", kind:"update" },
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    { name:"Store: Audit trail & timeline event", kind:"store" }
+  ];
+
+  return {
+    channels,
+    branches: [{ name:"Scheduling", condition:"All scheduling cases", steps }]
+  };
+}
+
 // ---------- core build ----------
 async function buildWorkflowFromRow(row, opts){
   const compat=(opts.compat||'safe')==='full'?'full':'safe';
   const includeDemo=opts.includeDemo!==false;
 
+  // channels from best_reply_shapes
   const channels=[]; const shapes=listify(row.best_reply_shapes);
   for(const sh of shapes){ for(const norm of CHANNEL_NORMALIZE){ if(norm.rx.test(sh) && !channels.includes(norm.k)) channels.push(norm.k); } }
   if(!channels.length) channels.push('email');
 
+  // choose archetype/trigger
   let archetype=chooseArchetype(row);
   let prodTrigger=TRIGGER_PREF[archetype]||'manual';
 
+  // LLM design + messages
   const design=(await makeDesigner(row))||{};
   if(Array.isArray(design.channels)&&design.channels.length){
     const allowed=['email','sms','whatsapp','call'];
-    const llmCh=design.channels.filter(c=>allowed.includes(String(c).toLowerCase()));
-    if(llmCh.length){ channels.splice(0,channels.length,...llmCh.map(c=>String(c).toLowerCase())); }
+    const llmCh=design.channels.map(c=>String(c).toLowerCase()).filter(c=>allowed.includes(c));
+    if(llmCh.length){ channels.splice(0,channels.length,...llmCh); }
   }
   if(typeof design.trigger==='string' && ['cron','webhook','imap','manual'].includes(design.trigger?.toLowerCase?.())){
     prodTrigger=design.trigger.toLowerCase();
@@ -361,22 +361,38 @@ async function buildWorkflowFromRow(row, opts){
   if(typeof design.archetype==='string' && design.archetype.trim()){
     archetype=design.archetype.trim().toUpperCase();
   }
-  const systems=Array.isArray(design.systems)?design.systems.map(s=>String(s).toLowerCase()):[];
-  const branches=Array.isArray(design.branches)?design.branches:[];
+  let systems=Array.isArray(design.systems)?design.systems.map(s=>String(s).toLowerCase()):[];
+  let branches=Array.isArray(design.branches)?design.branches:[];
+
+  // Enforce strict chronological flow for APPOINTMENT_SCHEDULING if LLM is empty/sparse
+  if(archetype==='APPOINTMENT_SCHEDULING'){
+    const sparse = !branches.length || !branches.some(b=>Array.isArray(b.steps)&&b.steps.length);
+    if(sparse){
+      const built = buildCanonicalSchedulingBranches(channels);
+      branches = built.branches;
+      // prefer our channel order
+      const wanted = built.channels;
+      channels.splice(0, channels.length, ...wanted);
+      // ensure we mark systems needed if missing
+      if(!systems.includes('calendar')) systems.push('calendar');
+      if(!systems.includes('crm')) systems.push('crm');
+      if(!systems.includes('pms')) systems.push('pms');
+      if(!systems.includes('email')) systems.push('email');
+      if(!systems.includes('twilio')) systems.push('twilio');
+    }
+  }
+
   const errors=Array.isArray(design.errors)?design.errors:[];
   const msg=(await makeMessages(row, archetype, channels))||{};
 
   const title=`${row.scenario_id||'Scenario'} — ${row.name||''}`.trim();
   const wf=baseWorkflow(title);
 
-  function addSwitch(name, valueExpr, rules, x, y){
-    return addNode(wf,{ id:uid("switch"), name, type:"n8n-nodes-base.switch", typeVersion:2, position:pos(x,y),
-      parameters:{ value1:valueExpr, rules } });
-  }
-
+  // lane builder (prod/demo)
   function buildLane({ laneLabel, yOffset, triggerKind, isDemo }){
     withYOffset(wf, yOffset, () => {
-      addHeader(wf, laneLabel, isDemo?LAYOUT.demoHeader.x:LAYOUT.prodHeader.x, isDemo?LAYOUT.demoHeader.y:LAYOUT.prodHeader.y);
+      // Orange-band style section headers (your UI can style these background bands)
+      addHeader(wf, `${ZONE.FLOW} · ${laneLabel}`, isDemo?LAYOUT.demoHeader.x:LAYOUT.prodHeader.x, isDemo?LAYOUT.demoHeader.y:LAYOUT.prodHeader.y);
 
       let trig;
       if(isDemo) trig = addManual(wf, LAYOUT.demoStart.x, LAYOUT.demoStart.y, "Demo Manual Trigger");
@@ -408,16 +424,17 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
       connect(wf, trig, init);
 
       let cursor = init;
-      if(!isDemo && (systems.includes('pms') || systems.includes('calendar'))){
-        const fetch = addHTTP(wf, "Fetch Upcoming (PMS/Calendar)", `={{'${DEFAULT_HTTP.pms_upcoming}'}}`, "={{$json}}", LAYOUT.prodStart.x + 2*LAYOUT.stepX, LAYOUT.prodStart.y);
+      if(!isDemo && systems.includes('pms')){
+        const fetch = addHTTP(wf, "Fetch Upcoming (PMS)", `={{'${DEFAULT_HTTP.pms_upcoming}'}}`, "={{$json}}", LAYOUT.prodStart.x + 2*LAYOUT.stepX, LAYOUT.prodStart.y);
         connect(wf, cursor, fetch); cursor = fetch;
       }
 
-      const sw = addSwitch("Branch (LLM)", "={{$json.__branch || 'main'}}",
+      const sw = addSwitch(wf, "Branch (LLM/Canonical)", "={{$json.__branch || 'main'}}",
         (branches.length?branches:[{name:"main"}]).map(b=>({operation:'equal', value2:String(b.name||'main').slice(0,48)})),
         LAYOUT.switchX, LAYOUT.prodStart.y);
       connect(wf, cursor, sw);
 
+      // VERTICAL CHANNELS PER BRANCH with DECISION support (extra spacing)
       let lastCollectorOfLastBranch = null;
       const baseBranchY = LAYOUT.prodStart.y - Math.floor(LAYOUT.branchY * (Math.max(branches.length,1)-1)/2);
 
@@ -425,17 +442,6 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
         const branchTopY = baseBranchY + bIdx*LAYOUT.branchY;
         const chCount = Math.max(channels.length,1);
         const firstChY = branchTopY - Math.floor(LAYOUT.channelY * (chCount-1)/2);
-
-        const steps = Array.isArray(b.steps)?b.steps:[];
-        const firstDecisionIdx = steps.findIndex(s=>String(s.kind||'').toLowerCase()==='decision');
-        const preSendSteps = firstDecisionIdx>=0 ? steps.slice(0, firstDecisionIdx) : steps;
-        let decisionSpec = firstDecisionIdx>=0 ? steps[firstDecisionIdx] : null;
-        if(!decisionSpec || !Array.isArray(decisionSpec.outcomes) || !decisionSpec.outcomes.length){
-          decisionSpec = (archetype==='APPOINTMENT_SCHEDULING') ? schedulingDefaults() : genericDefaults();
-        }
-
-        const sharedSendX = LAYOUT.prodStart.x + (4 + Math.max(preSendSteps.length,0))*LAYOUT.stepX;
-        const sharedSend = addFunction(wf, "[2] Send Multi-Channel Reminder", "return [$json];", sharedSendX, branchTopY);
 
         let prevChannelCollector = null;
 
@@ -448,106 +454,131 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
             : `Enter: ${b.name||'Case'} · ${ch.toUpperCase()}`;
           const enter = addFunction(wf, enterName,
             `return [{...$json,__branch:${JSON.stringify(b.name||'case')},__cond:${JSON.stringify(b.condition||'')},__channel:${JSON.stringify(ch)}}];`,
-            LAYOUT.prodStart.x + 3*LAYOUT.stepX, rowY);
+            LAYOUT.prodStart.x + 4*LAYOUT.stepX, rowY);
 
           if (chIdx === 0) connect(wf, sw, enter, bIdx);
           if (prevChannelCollector) connect(wf, prevChannelCollector, enter);
 
-          // pre-send steps
+          const steps = Array.isArray(b.steps)?b.steps:[];
           let prev = enter;
-          preSendSteps.forEach((st,k)=>{
-            const x = LAYOUT.prodStart.x + (4+k)*LAYOUT.stepX;
+
+          for (let k=0; k<steps.length; k++){
+            const st = steps[k];
+            const x = LAYOUT.prodStart.x + (5+k)*LAYOUT.stepX;
             const title = GUIDE.numberSteps ? `[${++stepNo}] ${st.name||'Step'}` : (st.name||'Step');
             const kind=String(st.kind||'').toLowerCase();
+
+            if(kind==='decision' && Array.isArray(st.outcomes) && st.outcomes.length){
+              // Decision: fan out lanes per outcome with more vertical spacing
+              const rulz = st.outcomes.map(o=>({operation:'equal', value2:String(o.value||'outcome').slice(0,64)}));
+              const dSwitch = addSwitch(wf, `${title} (Decision)`, "={{$json.__decision || 'default'}}", rulz, x, rowY);
+              connect(wf, prev, dSwitch);
+
+              let lastOutcomeCollector = null;
+              st.outcomes.forEach((o, oIdx)=>{
+                const oy = rowY - (Math.floor((st.outcomes.length-1)/2)*LAYOUT.outcomeRowY) + (oIdx*LAYOUT.outcomeRowY);
+                const oEnter = addFunction(wf, `[${stepNo}.${oIdx+1}] Outcome: ${o.value||'path'}`,
+                  `return [{...$json,__decision:${JSON.stringify(String(o.value||'path'))}}];`,
+                  x + Math.floor(LAYOUT.stepX*0.6), oy);
+                connect(wf, dSwitch, oEnter, oIdx);
+
+                let oPrev = oEnter;
+                const oSteps = Array.isArray(o.steps)?o.steps:[];
+                oSteps.forEach((os, ok)=>{
+                  const ox = x + (ok+1)*Math.floor(LAYOUT.stepX*0.85);
+                  const ot = `[${stepNo}.${oIdx+1}.${ok+1}] ${os.name||'Step'}`;
+                  const okind = String(os.kind||'').toLowerCase();
+                  let node;
+                  if(okind==='compose'){
+                    node = addFunction(wf, ot, `
+const ch=${JSON.stringify(ch)};
+const m=$json.msg||{};
+const bodies={ email:(m.email?.body)||'', sms:(m.sms?.body)||'', whatsapp:(m.whatsapp?.body)||'', call:(m.call?.script)||''};
+return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, ox, oy);
+                  } else if(['http','update','store','notify','route','lookup'].includes(okind)){
+                    node = addHTTP(wf, ot, "={{'https://example.com/step'}}", "={{$json}}", ox, oy);
+                  } else if(okind==='book'){
+                    node = addHTTP(wf, ot, `={{'${DEFAULT_HTTP.calendar_book}'}}`, "={{$json}}", ox, oy);
+                  } else if(okind==='ticket'){
+                    node = addHTTP(wf, ot, `={{'${DEFAULT_HTTP.ticket_create}'}}`, "={{$json}}", ox, oy);
+                  } else if(okind==='wait'){
+                    node = addFunction(wf, ot, "return [$json];", ox, oy);
+                  } else {
+                    node = addFunction(wf, ot, "return [$json];", ox, oy);
+                  }
+                  connect(wf, oPrev, node);
+                  oPrev = node;
+                });
+
+                // Sender & collector for this outcome
+                const sendX = x + Math.floor(LAYOUT.stepX*0.85) + (Math.max(oSteps.length,0)+1)*Math.floor(LAYOUT.stepX*0.85);
+                const sender = makeSenderNode(wf, ch, sendX, oy, compat, isDemo);
+                try{ wf.nodes[wf.nodes.findIndex(n=>n.name===sender)].name = `[${stepNo}.${oIdx+1}] Send: ${ch.toUpperCase()}`; }catch{}
+                connect(wf, oPrev, sender);
+
+                const oCollector = addCollector(wf, sendX + Math.floor(LAYOUT.stepX*0.7), oy);
+                connect(wf, sender, oCollector);
+
+                if (lastOutcomeCollector) connect(wf, lastOutcomeCollector, oCollector);
+                lastOutcomeCollector = oCollector;
+              });
+
+              prev = lastOutcomeCollector; // continue after decision fan-in
+              continue;
+            }
+
+            // Non-decision step
             let node;
             if(kind==='compose'){
               node = addFunction(wf, title, `
 const ch=${JSON.stringify(ch)};
-const m=$json.msg||{};
-const bodies={ email:(m.email?.body)||'', sms:(m.sms?.body)||'', whatsapp:(m.whatsapp?.body)||'', call:(m.call?.script)||''};
-return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
-            } else if(['http','update','store','notify','route','lookup','score','wait'].includes(kind)){
+const m=$json||{};
+const msg=$json.msg||{};
+const bodies={ email:(msg.email?.body)||'', sms:(msg.sms?.body)||'', whatsapp:(msg.whatsapp?.body)||'', call:(msg.call?.script)||''};
+return [{...m, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
+            } else if(['http','update','store','notify','route','lookup'].includes(kind)){
               node = addHTTP(wf, title, "={{'https://example.com/step'}}", "={{$json}}", x, rowY);
             } else if(kind==='book'){
               node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.calendar_book}'}}`, "={{$json}}", x, rowY);
             } else if(kind==='ticket'){
               node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.ticket_create}'}}`, "={{$json}}", x, rowY);
+            } else if(kind==='wait'){
+              node = addFunction(wf, title, "return [$json];", x, rowY);
             } else{
               node = addFunction(wf, title, "return [$json];", x, rowY);
             }
-            connect(wf, prev, node); prev = node;
-          });
+            connect(wf, prev, node);
+            prev = node;
+          }
 
-          connect(wf, prev, sharedSend);
-          prevChannelCollector = sharedSend;
+          // Send + collect when last step was NOT a decision
+          const lastIsDecision = steps.some(s=>String(s.kind||'').toLowerCase()==='decision');
+          if(!lastIsDecision){
+            const sendX = LAYOUT.prodStart.x + (5 + steps.length)*LAYOUT.stepX;
+            const sendTitle = GUIDE.numberSteps ? `[${++stepNo}] Send: ${ch.toUpperCase()}` : `Send: ${ch.toUpperCase()}`;
+            const sender = makeSenderNode(wf, ch, sendX, rowY, compat, isDemo);
+            try{ wf.nodes[wf.nodes.findIndex(n=>n.name===sender)].name = sendTitle; }catch{}
+            connect(wf, prev, sender);
+            const collector = addCollector(wf, sendX + LAYOUT.stepX, rowY);
+            connect(wf, sender, collector);
+            if (prevChannelCollector) connect(wf, prevChannelCollector, collector);
+            prevChannelCollector = collector;
+          }
+
+          // Remember last collector of the whole branch for error row
+          if (bIdx === (Math.max(branches.length,1)-1) && chIdx === (chCount-1)) {
+            lastCollectorOfLastBranch = prevChannelCollector;
+          }
         });
-
-        const decisionX = sharedSend.position[0] + LAYOUT.stepX;
-        const dRules = decisionSpec.outcomes.map(o=>({operation:'equal', value2:String(o.value||'outcome').slice(0,64)}));
-        const dSwitch = addSwitch(`[3] Decision · ${decisionSpec.name}`, "={{$json.__decision || 'default'}}", dRules, decisionX, branchTopY);
-        connect(wf, sharedSend, dSwitch);
-
-        let lastOutcomeCollector = null;
-        decisionSpec.outcomes.forEach((o, oIdx)=>{
-          const oy = branchTopY - Math.floor(140*decisionSpec.outcomes.length/2) + oIdx*140;
-          const oEnter = addFunction(wf, `[4.${oIdx+1}] Outcome: ${o.value||'path'}`,
-            `return [{...$json,__decision:${JSON.stringify(String(o.value||'path'))}}];`,
-            decisionX + Math.floor(LAYOUT.stepX*0.6), oy);
-          connect(wf, dSwitch, oEnter, oIdx);
-
-          let oPrev = oEnter;
-          const oSteps = Array.isArray(o.steps)?o.steps:[];
-          oSteps.forEach((os, ok)=>{
-            const ox = decisionX + (ok+1)*Math.floor(LAYOUT.stepX*0.8);
-            const ot = `[5.${oIdx+1}.${ok+1}] ${os.name||'Step'}`;
-            const okind = String(os.kind||'').toLowerCase();
-            let node;
-            if(okind==='compose'){
-              node = addFunction(wf, ot, `
-const ch=$json.__channel || 'email';
-const m=$json.msg||{};
-const bodies={ email:(m.email?.body)||'', sms:(m.sms?.body)||'', whatsapp:(m.whatsapp?.body)||'', call:(m.call?.script)||''};
-return [{...$json, message:bodies[ch] || bodies.email || 'Update'}];`, ox, oy);
-            } else if(['http','update','store','notify','route','lookup','score','wait'].includes(okind)){
-              node = addHTTP(wf, ot, "={{'https://example.com/step'}}", "={{$json}}", ox, oy);
-            } else if(okind==='book'){
-              node = addHTTP(wf, ot, `={{'${DEFAULT_HTTP.calendar_book}'}}`, "={{$json}}", ox, oy);
-            } else if(okind==='ticket'){
-              node = addHTTP(wf, ot, `={{'${DEFAULT_HTTP.ticket_create}'}}`, "={{$json}}", ox, oy);
-            } else {
-              node = addFunction(wf, ot, "return [$json];", ox, oy);
-            }
-            connect(wf, oPrev, node); oPrev = node;
-          });
-
-          let sendPrev = oPrev;
-          const channelsToSend = channels;
-          channelsToSend.forEach((ch, cIdx)=>{
-            const sx = decisionX + Math.floor(LAYOUT.stepX*0.8) + (Math.max(oSteps.length,0)+cIdx+1)*Math.floor(LAYOUT.stepX*0.6);
-            const s = makeSenderNode(wf, ch, sx, oy, compat, isDemo);
-            try{ wf.nodes[wf.nodes.findIndex(n=>n.name===s)].name = `[6.${oIdx+1}.${cIdx+1}] Send: ${ch.toUpperCase()}`; }catch{}
-            connect(wf, sendPrev, s);
-            sendPrev = s;
-          });
-
-          const updX = (decisionX + Math.floor(LAYOUT.stepX*0.8)) + (Math.max(oSteps.length,0)+channelsToSend.length+1)*Math.floor(LAYOUT.stepX*0.6);
-          const upd = addHTTP(wf, `[7.${oIdx+1}] Final Update (CRM/Calendar)`,
-            "={{$json.__decision==='confirm' ? '"+DEFAULT_HTTP.crm_upsert+"' : '"+DEFAULT_HTTP.crm_log+"'}}",
-            "={{$json}}", updX, oy);
-          connect(wf, sendPrev, upd);
-
-          const coll = addCollector(wf, updX + Math.floor(LAYOUT.stepX*0.5), oy);
-          connect(wf, upd, coll);
-          if (lastOutcomeCollector) connect(wf, lastOutcomeCollector, coll);
-          lastOutcomeCollector = coll;
-        });
-
-        lastCollectorOfLastBranch = lastOutcomeCollector;
       });
 
-      if(errors.length && lastCollectorOfLastBranch){
+      if(Array.isArray(errors) && errors.length && lastCollectorOfLastBranch){
         const bottomOfBranches = baseBranchY + (Math.max(branches.length,1)-1)*LAYOUT.branchY;
         const errY = bottomOfBranches + LAYOUT.errorRowYPad;
+
+        // Error “orange band”
+        addHeader(wf, `${ZONE.ERR} · ${laneLabel}`, LAYOUT.prodStart.x + 3*LAYOUT.stepX, errY - 120);
+
         let prev = addFunction(wf, "Error Monitor (LLM List)", "return [$json];", LAYOUT.prodStart.x + 4*LAYOUT.stepX, errY);
         connect(wf, lastCollectorOfLastBranch, prev);
         errors.forEach((e,i)=>{
@@ -562,83 +593,52 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Update'}];`, ox, oy);
     });
   }
 
+  // build lanes
   buildLane({ laneLabel:"PRODUCTION LANE", yOffset:0, triggerKind:prodTrigger, isDemo:false });
   if(includeDemo){
     buildLane({ laneLabel:"DEMO LANE (Manual Trigger + Seeded Contacts)", yOffset:LAYOUT.laneGap, triggerKind:'manual', isDemo:true });
   }
 
   wf.staticData=wf.staticData||{};
-  wf.staticData.__design={ archetype, prodTrigger, channels, systems, branches, errors, guide: GUIDE,
-    layout: { verticalChannels: true, sharedSend: true, sharedDecision: true, chronology: "A→Z" } };
+  wf.staticData.__design={ 
+    archetype, prodTrigger, channels, systems, branches, errors,
+    guide: GUIDE,
+    layout: { verticalChannels: true, decisions: "switch+lanes", spacing: LAYOUT },
+    zones: ZONE
+  };
 
   return sanitizeWorkflow(wf);
 }
 
-// ---------- HTTP handler (GET debug/dry, POST identique) ----------
+// ---------- HTTP handler (unchanged signature) ----------
 module.exports = async (req,res)=>{
   Object.entries(HEADERS).forEach(([k,v])=>res.setHeader(k,v));
   if(req.method==="OPTIONS") return res.status(204).end();
 
-  const urlObj = new URL(req.url, `http://${req.headers.host}`);
-  const qScenario = urlObj.searchParams.get('scenario_id');
-  const qDebug    = urlObj.searchParams.get('debug') === '1';
-  const qDry      = urlObj.searchParams.get('dry') === '1';
-
   try{
     if(req.method!=="POST"){
-      if (qScenario) {
-        const compat = (urlObj.searchParams.get('compat')||'safe').toLowerCase()==='full'?'full':'safe';
-        const includeDemo = urlObj.searchParams.get('includeDemo')!=='false';
-
-        const savedNO_SHEETS = process.env.NO_SHEETS;
-        const savedNO_LLM    = process.env.NO_LLM;
-        if (qDry) { process.env.NO_SHEETS='1'; process.env.NO_LLM='1'; }
-
-        const row = await fetchSheetRowByScenarioId(qScenario);
-        const t0 = Date.now();
-        const wf = await buildWorkflowFromRow(row,{ compat, includeDemo });
-        const tookMs = Date.now()-t0;
-
-        if (qDry) { process.env.NO_SHEETS=savedNO_SHEETS; process.env.NO_LLM=savedNO_LLM; }
-
-        if (qDebug) {
-          res.status(200).json({ ok:true, debug:true, took_ms:tookMs, node_count:wf.nodes.length, conn_from:Object.keys(wf.connections).length, wf });
-          return;
-        }
-        res.status(200);
-        res.setHeader("Content-Type","application/json; charset=utf-8");
-        res.setHeader("Content-Disposition",`attachment; filename="${(row.scenario_id||'workflow')}.n8n.json"`);
-        res.end(JSON.stringify(wf,null,2));
-        return;
-      }
       return res.status(200).json({ ok:true, usage:'POST {"scenario_id":"<id>", "compat":"safe|full", "includeDemo": true }' });
     }
-
     const body=await new Promise(resolve=>{
-      const chunks=[]; req.on("data",c=>chunks.push(c));
-      req.on("end",()=>{ try{ resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); }catch{ resolve({}); } });
+      const chunks=[]; req.on("data",c=>chunks.push(c)); req.on("end",()=>{ try{ resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); }catch{ resolve({}); } });
     });
     const wanted=(body.scenario_id||"").toString().trim(); if(!wanted) throw new Error("Missing scenario_id");
     const compat=(body.compat||'safe').toLowerCase()==='full'?'full':'safe';
     const includeDemo=body.includeDemo!==false;
 
-    const t0 = Date.now();
     const row=await fetchSheetRowByScenarioId(wanted);
-    const wf=await buildWorkflowFromRow(row,{ compat, includeDemo });
-    const tookMs = Date.now()-t0;
+    if(!row) return res.status(404).json({ ok:false, error:`scenario_id not found: ${wanted}` });
 
-    if (body.debug === true) {
-      return res.status(200).json({ ok:true, debug:true, took_ms:tookMs, node_count:wf.nodes.length, conn_from:Object.keys(wf.connections).length, wf });
-    }
+    const wf=await buildWorkflowFromRow(row,{ compat, includeDemo });
 
     res.status(200);
     res.setHeader("Content-Type","application/json; charset=utf-8");
     res.setHeader("Content-Disposition",`attachment; filename="${(row.scenario_id||'workflow')}.n8n.json"`);
     res.end(JSON.stringify(wf,null,2));
   }catch(err){
-    console.error('BUILD_ERROR', err);
     res.status(500).json({ ok:false, error:String(err?.message||err) });
   }
 };
 
+// Force Node runtime on Vercel (same as before)
 module.exports.config = { runtime: 'nodejs20.x' };

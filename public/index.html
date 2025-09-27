@@ -13,7 +13,7 @@
   .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
   label{display:block;font-weight:600;margin:12px 0 6px}
   select,textarea,input,button{width:100%;background:#0f1218;color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
-  textarea{min-height:220px;font-family:ui-monospace,Consolas,Menlo,monospace;font-size:13px}
+  textarea{min-height:260px;font-family:ui-monospace,Consolas,Menlo,monospace;font-size:13px}
   button{cursor:pointer} .primary{background:var(--accent);color:#0b0c10;border:none;font-weight:700}
   .hint{color:var(--muted);font-size:13px}
   #suggestions{position:relative}
@@ -24,12 +24,7 @@
   .suggest-name{color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .dbg{font:12px/1.4 ui-monospace,Consolas,monospace;color:#aaa;margin-top:8px;word-break:break-word}
   .err{color:#fca5a5}
-  .ok{color:#5eead4}
-  .row-actions{display:flex;gap:12px;align-items:center;margin-top:10px}
-  .btn{display:inline-flex;align-items:center;justify-content:center;padding:10px 14px;border-radius:10px;border:1px solid var(--line);background:#0f1218}
-  .btn.primary{background:var(--accent);border:none;color:#0b0c10;font-weight:700}
-  .btn:disabled{opacity:.6;cursor:not-allowed}
-  .inline{display:inline-block;margin-left:8px;color:var(--muted);font-size:12px}
+  .ok{color:#34d399}
 </style>
 </head>
 <body>
@@ -60,33 +55,26 @@
     <label for="bp">Preview (JSON)</label>
     <textarea id="bp" readonly></textarea>
 
-    <div class="row-actions">
-      <button id="create" class="btn primary">Create Workflow (AI)</button>
-      <button id="download" class="btn" disabled>Download n8n JSON</button>
-      <span class="inline" id="modeNote">Builder: <b>Server /api/build</b> (<code>compat=safe</code>)</span>
+    <div class="row" style="margin-top:10px">
+      <button id="build" class="primary">Download n8n JSON</button>
+      <div class="hint">Imports directly in n8n (Prod + Demo lanes)</div>
     </div>
-    <div class="hint">Imports directly in n8n. Tip: toggle full nodes with <code>?compat=full</code> or force local builder with <code>?local=1</code>.</div>
     <div id="dbg" class="dbg"></div>
   </div>
 </div>
 
-<!-- Load local builder as fallback (no defer/async). Keep version bump for cache busting. -->
-<script src="/builder.js?v=24-finalize-sanitize"></script>
+<!-- Keep the client builder as fallback only; no defer/async; bump v= to bust cache. -->
+<script src="/builder.js?v=23-api-preview-fallback"></script>
 
 <script>
 /* ========== Small helpers ========== */
 const $ = id => document.getElementById(id);
 const scenarioSel = $('scenario'), channelSel = $('channel'),
       searchEl = $('search'), suggestWrap = $('suggestions'), bpTA = $('bp'),
-      dbg = $('dbg'), btnCreate = $('create'), btnDownload = $('download'), modeNote = $('modeNote');
+      dbg = $('dbg');
 
-let ALL = [], MAP = {}, LAST_WF = null, LAST_SID = '';
+let ALL = [], MAP = {};
 let INDUSTRIES = [], IND_MAP = {};
-
-const QS = new URLSearchParams(location.search);
-const compat = (QS.get('compat') || 'safe').toLowerCase() === 'full' ? 'full' : 'safe';
-const forceLocal = (QS.get('local') || '0') === '1';
-modeNote.innerHTML = `Builder: <b>${forceLocal?'Local /builder.js':'Server /api/build'}</b> (<code>compat=${compat}</code>)`;
 
 function listify(v){ return Array.isArray(v) ? v : String(v ?? '')
   .replace(/^\[|\]$/g,'')
@@ -99,17 +87,6 @@ async function getJSON(url){
   const raw = await r.text();
   try { return { ok:r.ok, status:r.status, json: JSON.parse(raw), raw }; }
   catch { return { ok:r.ok, status:r.status, json:null, raw }; }
-}
-async function postJSON(url, body){
-  const r = await fetch(url, {
-    method:'POST',
-    headers:{ 'Content-Type':'application/json' },
-    body: JSON.stringify(body||{}),
-  });
-  const text = await r.text();
-  let json = null;
-  try { json = JSON.parse(text); } catch {}
-  return { ok:r.ok, status:r.status, json, raw:text, headers:r.headers };
 }
 
 function recommendedChannel(row){
@@ -130,6 +107,67 @@ function matchIndustryForScenario(s){
   return IND_MAP[key] || null;
 }
 
+/* ========= /api/build driver (LLM) with local fallback ========= */
+async function buildViaApi(scenarioId, compat = 'safe', includeDemo = true) {
+  const res = await fetch(`/api/build?preview=1`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Preview': '1',
+      'Cache-Control': 'no-store'
+    },
+    body: JSON.stringify({ scenario_id: scenarioId, compat, includeDemo })
+  });
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(`api/build failed: ${res.status} ${res.statusText} — ${t}`);
+  }
+  return res.json();
+}
+
+function assertBuilder(){
+  if (!window.Builder || typeof window.Builder.buildWorkflowJSON !== 'function') {
+    throw new Error('Builder not loaded (check /public/builder.js and the script tag order).');
+  }
+}
+
+async function rebuildPreview() {
+  const sid = (scenarioSel.value || '').trim();
+  // We can call /api/build even if MAP doesn't have the row (the API hits Sheets directly).
+  if (!sid) {
+    dbg.innerHTML = '<span class="err">No scenario selected.</span>';
+    return;
+  }
+
+  try {
+    // Prefer the API (LLM) result for preview
+    const wf = await buildViaApi(sid, 'safe', true);
+    bpTA.value = JSON.stringify(wf, null, 2);
+    dbg.innerHTML = '<span class="ok">Preview: using /api/build (LLM)</span>';
+    window.__lastWorkflow = wf;
+    window.__lastScenarioId = sid;
+  } catch (e) {
+    // Fallback to local builder
+    try {
+      assertBuilder();
+      const s = MAP[sid] || { scenario_id: sid, name: sid, agent_name: 'Agent' };
+      const wf = window.Builder.buildWorkflowJSON(s, matchIndustryForScenario(s), {
+        recommendedChannel: channelSel.value
+      });
+      bpTA.value = JSON.stringify(wf, null, 2);
+      window.__lastWorkflow = wf;
+      window.__lastScenarioId = sid;
+      dbg.innerHTML =
+        '<span class="err">/api/build failed, using local builder fallback.</span><br/>' +
+        (e && e.message ? e.message : String(e));
+    } catch (e2) {
+      dbg.innerHTML =
+        '<span class="err">Both /api/build and local builder failed.</span><br/>' +
+        (e2 && e2.message ? e2.message : String(e2));
+    }
+  }
+}
+
 /* ========== UI populate + actions ========== */
 function populateUI(list){
   scenarioSel.innerHTML = '';
@@ -140,20 +178,13 @@ function populateUI(list){
     frag.appendChild(o);
   });
   scenarioSel.appendChild(frag);
-  if (list.length) applyScenario(list[0].scenario_id);
-}
-function applyScenario(id){
-  const s = MAP[id] || ALL.find(x=>x.scenario_id===id) || null;
-  if (!s) return;
-  const industry = matchIndustryForScenario(s);
-  scenarioSel.value = s.scenario_id;
-  channelSel.value  = recommendedChannel(s);
-  LAST_WF = null; LAST_SID = s.scenario_id;
-  bpTA.value = JSON.stringify({ note:"Click 'Create Workflow (AI)' to build a per-scenario workflow on the server.", scenario_id:s.scenario_id }, null, 2);
-  btnDownload.disabled = true;
+  if (list.length) {
+    scenarioSel.value = list[0].scenario_id;
+    channelSel.value  = recommendedChannel(list[0]);
+    rebuildPreview();
+  }
 }
 
-/* ========== Remote search across 8k+ ========== */
 let searchTimer = null;
 async function remoteSearch(q){
   if (!q || q.trim().length < 2){ suggestWrap.innerHTML=''; return; }
@@ -194,8 +225,10 @@ function renderSuggestions(matches){
       }
     }
     $('search').value = id;
-    applyScenario(id);
+    scenarioSel.value = id;
+    channelSel.value = recommendedChannel(MAP[id] || {});
     suggestWrap.innerHTML='';
+    rebuildPreview();
   });
   suggestWrap.innerHTML=''; suggestWrap.appendChild(box);
 }
@@ -210,96 +243,29 @@ searchEl.addEventListener('blur', ()=> setTimeout(()=>suggestWrap.innerHTML='',1
 searchEl.addEventListener('keydown', e=>{
   if (e.key==='Enter'){
     const v = e.target.value.trim();
-    if (MAP[v]){ applyScenario(v); suggestWrap.innerHTML=''; return; }
-    // If user typed an exact scenario_id not in cache, still allow selection
-    scenarioSel.value = v; LAST_SID = v; LAST_WF = null; btnDownload.disabled = true;
-    bpTA.value = JSON.stringify({ note:"Press 'Create Workflow (AI)' to build on the server.", scenario_id:v }, null, 2);
-    remoteSearch(v);
+    // Let the API handle unknown IDs too
+    scenarioSel.value = v;
+    rebuildPreview();
   }
 });
-scenarioSel.addEventListener('change', ()=> applyScenario(scenarioSel.value));
-channelSel.addEventListener('change', ()=> {/* keep for future live preview */});
+scenarioSel.addEventListener('change', rebuildPreview);
+channelSel.addEventListener('change', rebuildPreview);
 
-/* ========== Create via /api/build (primary) ========== */
-async function createViaServer(sid){
-  dbg.innerHTML = 'Building on server…';
-  btnCreate.disabled = true;
-  const payload = {
-    scenario_id: sid,
-    compat,               // 'safe' | 'full'
-    includeDemo: true,    // always include the demo lane
-    forceArchetype: null, // leave null; server will choose from rules unless you pass one
-  };
-  const r = await postJSON('/api/build', payload);
-  btnCreate.disabled = false;
-
-  if (!r.ok) {
-    dbg.innerHTML = `<span class="err">Server build error (${r.status}):</span> ${r.raw || 'unknown'}`;
-    return null;
-  }
-  // Some setups return the JSON as raw text (attachment). Try json then fallback parse.
-  let wf = r.json;
-  if (!wf) {
-    try { wf = JSON.parse(r.raw); } catch (e) {}
-  }
-  if (!wf || !wf.nodes) {
-    dbg.innerHTML = `<span class="err">Build returned no workflow JSON.</span>`;
-    return null;
-  }
-  dbg.innerHTML = `<span class="ok">Built on server.</span> Nodes: ${wf.nodes.length}`;
-  return wf;
-}
-
-/* ========== Local fallback (optional) ========== */
-function hasLocalBuilder(){
-  return window.Builder && typeof window.Builder.buildWorkflowJSON === 'function';
-}
-function buildLocal(sid){
-  const s = MAP[sid] || { scenario_id: sid, name: sid, agent_name: 'Agent', best_reply_shapes: ['email'] };
-  const ind = matchIndustryForScenario(s);
-  try {
-    const wf = window.Builder.buildWorkflowJSON(s, ind, { recommendedChannel: channelSel.value });
-    dbg.innerHTML = `<span class="ok">Built locally.</span> Nodes: ${wf.nodes?.length||0}`;
-    return wf;
-  } catch (e) {
-    dbg.innerHTML = `<span class="err">Local builder error:</span> ${e.message||String(e)}`;
-    return null;
-  }
-}
-
-/* ========== Buttons ========== */
-btnCreate.addEventListener('click', async ()=>{
-  const sid = (scenarioSel.value || searchEl.value || '').trim();
-  if (!sid){ dbg.innerHTML = '<span class="err">Select or type a scenario_id first.</span>'; return; }
-  LAST_SID = sid;
-
-  let wf = null;
-  if (!forceLocal){
-    wf = await createViaServer(sid);
-  }
-  if (!wf && hasLocalBuilder()){
-    wf = buildLocal(sid);
-  }
-  if (!wf){
-    bpTA.value = '// Build failed. See debug below.';
-    btnDownload.disabled = true;
-    return;
-  }
-  LAST_WF = wf;
-  bpTA.value = JSON.stringify(wf, null, 2);
-  btnDownload.disabled = false;
-});
-
-btnDownload.addEventListener('click', ()=>{
-  if (!LAST_WF){ dbg.innerHTML = '<span class="err">Nothing to download. Click Create first.</span>'; return; }
-  const txt=JSON.stringify(LAST_WF,null,2);
+/* ========== Download uses last previewed workflow ========== */
+function downloadJSON(obj, filename){
+  const txt=JSON.stringify(obj,null,2);
   const blob=new Blob([txt],{type:'application/json'});
   const url=URL.createObjectURL(blob);
-  const a=document.createElement('a'); a.href=url; a.download=`${(LAST_SID||'workflow')}.n8n.json`;
-  document.body.appendChild(a); a.click(); URL.revokeObjectURL(url); a.remove();
+  const a=document.createElement('a'); a.href=url; a.download=filename; document.body.appendChild(a); a.click(); URL.revokeObjectURL(url); a.remove();
+}
+$('build').addEventListener('click', ()=>{
+  const wf = window.__lastWorkflow;
+  const sid = window.__lastScenarioId || (scenarioSel.value||'workflow');
+  if (!wf) { dbg.innerHTML = '<span class="err">Nothing to download. Build failed?</span>'; return; }
+  downloadJSON(wf, `${sid}.n8n.json`);
 });
 
-/* ========== Bootstrap (25 initial + industries) ========== */
+/* ========== Bootstrap (25 initial, search does the rest) ========== */
 async function bootstrap(){
   try{
     const [sc, ind] = await Promise.all([
@@ -325,7 +291,6 @@ async function bootstrap(){
 
     INDUSTRIES = iitems.map(it=>({
       industry_id:it.industry_id||it.name||'',
-      name: it.name || it.industry_id || '',
       painpoints:it.core_pains||it.painpoints||'',
       kpis:it.success_metrics||it.kpi_examples||'',
       channels:it.channels||it.core_channels||'',
@@ -333,18 +298,12 @@ async function bootstrap(){
     })).filter(i=>i.industry_id);
     IND_MAP = Object.fromEntries(INDUSTRIES.map(it=>[(it.industry_id||'').toLowerCase(), it]));
 
-    if (!ALL.length){
-      const fallbackS={scenario_id:'tier1_dso_SCHEDULING_NO_SHOWS',name:'tier1_dso',agent_name:'Scheduling Agent',best_reply_shapes:['sms','email'],how_it_works:'Remind, confirm, backfill.',roi_hypothesis:'Reduce no-shows 30%+'};
-      const fallbackI={industry_id:'tier1_dso',name:'tier1_dso',painpoints:'no-shows; front-desk overload',kpis:'no-show rate; utilization'};
-      ALL=[fallbackS]; MAP={ [fallbackS.scenario_id]: fallbackS };
-      INDUSTRIES=[fallbackI]; IND_MAP={ [fallbackI.industry_id]: fallbackI };
-    }
     populateUI(ALL);
-    dbg.textContent = 'Ready.';
   } catch (e){
     dbg.innerHTML = '<span class="err">Bootstrap error:</span> ' + (e.message||String(e));
-    const fallbackS={scenario_id:'tier1_dso_SCHEDULING_NO_SHOWS',name:'tier1_dso',agent_name:'Scheduling Agent',best_reply_shapes:['sms','email']};
-    const fallbackI={industry_id:'tier1_dso',name:'tier1_dso'};
+    // Minimal fallback so the UI still runs
+    const fallbackS={scenario_id:'tier1_dso_SCHEDULING_NO_SHOWS',name:'tier1_dso',agent_name:'Scheduling Agent',best_reply_shapes:['sms','email'],how_it_works:'Remind, confirm, backfill.',roi_hypothesis:'Reduce no-shows 30%+'};
+    const fallbackI={industry_id:'tier1_dso',painpoints:'no-shows; front-desk overload',kpis:'no-show rate; utilization'};
     ALL=[fallbackS]; MAP={ [fallbackS.scenario_id]: fallbackS };
     INDUSTRIES=[fallbackI]; IND_MAP={ [fallbackI.industry_id]: fallbackI };
     populateUI(ALL);

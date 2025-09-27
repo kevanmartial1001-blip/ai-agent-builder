@@ -14,7 +14,8 @@
   label{display:block;font-weight:600;margin:12px 0 6px}
   select,textarea,input,button{width:100%;background:#0f1218;color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
   textarea{min-height:160px;font-family:ui-monospace,Consolas,Menlo,monospace;font-size:13px}
-  button{cursor:pointer} .primary{background:var(--accent);color:#0b0c10;border:none;font-weight:700}
+  button{cursor:pointer}
+  .primary{background:var(--accent);color:#0b0c10;border:none;font-weight:700}
   .hint{color:var(--muted);font-size:13px}
   #suggestions{position:relative}
   .suggest-box{position:absolute;left:0;right:0;background:#0f1218;border:1px solid var(--line);border-radius:10px;margin-top:6px;max-height:260px;overflow:auto;z-index:10}
@@ -62,8 +63,8 @@
   </div>
 </div>
 
-<!-- IMPORTANT: load the builder first (no defer/async) and bump the version to bust cache -->
-<script src="/builder.js?v=20-demo-archetypes-msgs"></script>
+<!-- Load builder first (no defer/async); bump version to bust cache -->
+<script src="/builder.js?v=20-demo-archetypes-msgs-2"></script>
 
 <script>
 /* ========== Small helpers ========== */
@@ -110,6 +111,46 @@ function recommendedChannel(row){
 function matchIndustryForScenario(s){
   const key = (s.name||'').toLowerCase();
   return IND_MAP[key] || null;
+}
+
+/* ========== Ensure & apply ========== */
+function normalizeScenarioRecord(m){
+  return {
+    scenario_id: m.scenario_id||'',
+    name: m.name||'',
+    triggers: m.triggers||'',
+    best_reply_shapes: listify(m.best_reply_shapes),
+    risk_notes: m.risk_notes||'',
+    agent_name: m.agent_name||'',
+    how_it_works: m.how_it_works||'',
+    tool_stack_dev: m.tool_stack_dev||'',
+    tool_stack_autonomous: m.tool_stack_autonomous||'',
+    tags: listify(m.tags||m['tags (;)']||'')
+  };
+}
+
+async function ensureScenarioLoaded(idOrQuery){
+  const id = String(idOrQuery||'').trim();
+  if (!id) return null;
+  if (MAP[id]) return MAP[id];
+
+  // Try exact fetch: look up by q and pick exact scenario_id first; else first item
+  const res = await getJSON(`/api/scenarios?q=${encodeURIComponent(id)}&max=1`);
+  const items = (res.ok && res.json && Array.isArray(res.json.items)) ? res.json.items : [];
+  if (!items.length) return null;
+
+  const rec = normalizeScenarioRecord(items[0]);
+  if (!rec.scenario_id) return null;
+
+  MAP[rec.scenario_id] = rec;
+
+  // Inject into dropdown if missing
+  if (!Array.from(scenarioSel.options).some(o=>o.value===rec.scenario_id)){
+    const o=document.createElement('option');
+    o.value=rec.scenario_id; o.textContent=rec.scenario_id; o.title=rec.name||rec.scenario_id;
+    scenarioSel.appendChild(o);
+  }
+  return rec;
 }
 
 function populateUI(list){
@@ -165,28 +206,11 @@ function renderSuggestions(matches){
         <span class="suggest-name">${nm}</span>
       </div>`;
   }).join('');
-  box.addEventListener('click', (e)=>{
+  box.addEventListener('click', async (e)=>{
     const el = e.target.closest('.suggest-item'); if(!el) return;
     const id = el.getAttribute('data-id');
-    if (!MAP[id]){
-      const m = matches.find(x=>x.scenario_id===id);
-      if (m){
-        MAP[id] = {
-          scenario_id: m.scenario_id||'',
-          name: m.name||'',
-          triggers: m.triggers||'',
-          best_reply_shapes: listify(m.best_reply_shapes),
-          risk_notes: m.risk_notes||'',
-          agent_name: m.agent_name||'',
-          how_it_works: m.how_it_works||'',
-          tool_stack_dev: m.tool_stack_dev||'',
-          tool_stack_autonomous: m.tool_stack_autonomous||'',
-          tags: listify(m.tags||m['tags (;)']||'')
-        };
-      }
-    }
-    $('search').value = id;
-    applyScenario(id);
+    const rec = await ensureScenarioLoaded(id);
+    if (rec){ $('search').value = id; applyScenario(id); }
     suggestWrap.innerHTML='';
   });
   suggestWrap.innerHTML=''; suggestWrap.appendChild(box);
@@ -199,10 +223,13 @@ searchEl.addEventListener('focus', ()=> {
   if (ALL.length) renderSuggestions(ALL.slice(0,10));
 });
 searchEl.addEventListener('blur', ()=> setTimeout(()=>suggestWrap.innerHTML='',150));
-searchEl.addEventListener('keydown', e=>{
+searchEl.addEventListener('keydown', async (e)=>{
   if (e.key==='Enter'){
     const v = e.target.value.trim();
-    if (MAP[v]){ applyScenario(v); suggestWrap.innerHTML=''; return; }
+    // Prefer exact scenario_id load & apply
+    const rec = await ensureScenarioLoaded(v);
+    if (rec){ applyScenario(rec.scenario_id); suggestWrap.innerHTML=''; return; }
+    // Otherwise show suggestions
     remoteSearch(v);
   }
 });
@@ -216,13 +243,24 @@ function downloadJSON(obj, filename){
   const url=URL.createObjectURL(blob);
   const a=document.createElement('a'); a.href=url; a.download=filename; document.body.appendChild(a); a.click(); URL.revokeObjectURL(url); a.remove();
 }
-$('build').addEventListener('click', ()=>{
+$('build').addEventListener('click', async ()=>{
   try{
     assertBuilder();
-    const sid=(scenarioSel.value||'').trim(); const s=MAP[sid];
-    if(!s){ dbg.innerHTML='<span class="err">No scenario selected.</span>'; return; }
+    // Resolve from dropdown OR typed value
+    let sid = (scenarioSel.value||'').trim();
+    if (!sid){
+      const typed = (searchEl.value||'').trim();
+      if (typed) {
+        const rec = await ensureScenarioLoaded(typed);
+        if (rec) sid = rec.scenario_id;
+      }
+    }
+    if(!sid || !MAP[sid]){ dbg.innerHTML='<span class="err">No scenario selected or found. Type a valid <code>scenario_id</code> and press Enter.</span>'; return; }
+
+    const s = MAP[sid];
     const wf = previewJSON(s, matchIndustryForScenario(s));
     downloadJSON(wf, `${sid}-workflow.n8n.json`);
+    dbg.textContent = '';
   }catch(e){
     dbg.innerHTML = '<span class="err">Builder error:</span> ' + (e.message||String(e));
   }
@@ -239,18 +277,7 @@ async function bootstrap(){
     const sitems = (sc.ok && sc.json && Array.isArray(sc.json.items)) ? sc.json.items : [];
     const iitems = (ind.ok && ind.json && Array.isArray(ind.json.items)) ? ind.json.items : [];
 
-    ALL = sitems.map(x=>({
-      scenario_id:x.scenario_id||'',
-      name:x.name||'',
-      triggers:x.triggers||'',
-      best_reply_shapes:listify(x.best_reply_shapes),
-      risk_notes:x.risk_notes||'',
-      agent_name:x.agent_name||'',
-      how_it_works:x.how_it_works||'',
-      tool_stack_dev:x.tool_stack_dev||'',
-      tool_stack_autonomous:x.tool_stack_autonomous||'',
-      tags:listify(x.tags||x['tags (;)']||'')
-    })).filter(s=>s.scenario_id);
+    ALL = sitems.map(normalizeScenarioRecord).filter(s=>s.scenario_id);
     MAP = Object.fromEntries(ALL.map(x=>[x.scenario_id,x]));
 
     INDUSTRIES = iitems.map(it=>({
@@ -271,7 +298,6 @@ async function bootstrap(){
     populateUI(ALL);
   } catch (e){
     dbg.innerHTML = '<span class="err">Bootstrap error:</span> ' + (e.message||String(e));
-    // minimal fallback so the UI still runs
     const fallbackS={scenario_id:'tier1_dso_SCHEDULING_NO_SHOWS',name:'tier1_dso',agent_name:'Scheduling Agent',best_reply_shapes:['sms','email'],how_it_works:'Remind, confirm, backfill.',roi_hypothesis:'Reduce no-shows 30%+'};
     const fallbackI={industry_id:'tier1_dso',painpoints:'no-shows; front-desk overload',kpis:'no-show rate; utilization'};
     ALL=[fallbackS]; MAP={ [fallbackS.scenario_id]: fallbackS };

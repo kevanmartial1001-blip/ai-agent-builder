@@ -1,186 +1,289 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>AI Agent Builder</title>
-  <style>
-    :root{--bg:#0b0c10;--card:#141824;--ink:#e9edf1;--muted:#9aa6b2;--accent:#5eead4;--line:#232735}
-    html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);font:15px/1.55 system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial,sans-serif}
-    .wrap{max-width:1080px;margin:28px auto;padding:0 20px}
-    h1{font-size:26px;margin:0 0 8px}
-    .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin:14px 0}
-    .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
-    select,input,button,textarea{background:#0f1320;color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
-    button{background:var(--accent);color:#051016;border:none;cursor:pointer;font-weight:600}
-    button[disabled]{opacity:.6;cursor:not-allowed}
-    label{color:var(--muted);font-size:13px}
-    pre{white-space:pre-wrap;word-break:break-word;max-height:60vh;overflow:auto;margin:0}
-    .muted{color:var(--muted)}
-    .badge{display:inline-block;background:#0f1320;border:1px solid var(--line);padding:4px 8px;border-radius:999px;font-size:12px;color:var(--muted)}
-  </style>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>AI Agent Builder</title>
+<style>
+  :root{--bg:#0b0c10;--card:#141824;--ink:#e9edf1;--muted:#9aa6b2;--accent:#5eead4;--line:#232735}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial,sans-serif}
+  .wrap{max-width:980px;margin:32px auto;padding:0 20px}
+  h1{margin:0 0 16px;font-size:26px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin-top:12px}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  label{display:block;font-weight:600;margin:12px 0 6px}
+  select,textarea,input,button{width:100%;background:#0f1218;color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+  textarea{min-height:160px;font-family:ui-monospace,Consolas,Menlo,monospace;font-size:13px}
+  button{cursor:pointer} .primary{background:var(--accent);color:#0b0c10;border:none;font-weight:700}
+  .hint{color:var(--muted);font-size:13px}
+  #suggestions{position:relative}
+  .suggest-box{position:absolute;left:0;right:0;background:#0f1218;border:1px solid var(--line);border-radius:10px;margin-top:6px;max-height:260px;overflow:auto;z-index:10}
+  .suggest-item{padding:8px 10px;cursor:pointer;display:flex;gap:8px;align-items:baseline}
+  .suggest-item:hover{background:#121826}
+  .suggest-id{font-family:ui-monospace,Consolas,Menlo,monospace;font-size:12px}
+  .suggest-name{color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .dbg{font:12px/1.4 ui-monospace,Consolas,monospace;color:#aaa;margin-top:8px;word-break:break-word}
+  .err{color:#fca5a5}
+</style>
 </head>
 <body>
-  <div class="wrap">
-    <h1>AI Agent → n8n Workflow Builder <span class="badge">v9</span></h1>
-    <div class="card">
-      <div class="row">
-        <div>
-          <label>Industry</label><br/>
-          <select id="industrySelect"></select>
-        </div>
-        <div>
-          <label>Scenario</label><br/>
-          <select id="scenarioSelect" style="min-width:320px"></select>
-        </div>
-        <div>
-          <label>Recommended channel</label><br/>
-          <select id="channelSelect">
-            <option value="email">Email</option>
-            <option value="sms">SMS</option>
-            <option value="whatsapp">WhatsApp</option>
-            <option value="call">Call</option>
-          </select>
-        </div>
-        <div style="align-self:end; margin-bottom: -2px;">
-          <button id="btnBuild">Build JSON</button>
-          <button id="btnDownload" disabled>Download n8n JSON</button>
-        </div>
+<div class="wrap">
+  <h1>AI Agent Builder</h1>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <label for="scenario">Scenario (<code>scenario_id</code>)</label>
+        <select id="scenario"><option value="">Loading…</option></select>
+      </div>
+      <div>
+        <label for="channel">Channel (auto)</label>
+        <select id="channel">
+          <option value="email">Email</option>
+          <option value="sms">SMS (Twilio)</option>
+          <option value="whatsapp">WhatsApp (Twilio)</option>
+          <option value="call">Voice Call (Twilio)</option>
+        </select>
       </div>
     </div>
 
-    <div class="card">
-      <div class="row" style="justify-content:space-between">
-        <div><strong>Preview</strong> (JSON)</div>
-        <div class="muted">If you see YAML here, the Builder didn’t load.</div>
-      </div>
-      <pre id="preview">Loading…</pre>
-    </div>
+    <label for="search">Search the full catalog (8k+)</label>
+    <input id="search" placeholder="Type scenario_id or name…  e.g. tier1_dso_SCHEDULING_NO_SHOWS" autocomplete="off" />
+    <div id="suggestions"></div>
 
-    <p class="muted">
-      Tip: If you ever see “Builder not loaded…”, force a cache bust by changing the query in the script tag (e.g. <code>?v=10</code>) and do a hard refresh (Ctrl/Cmd+Shift+R).
-    </p>
+    <label for="bp">Preview</label>
+    <textarea id="bp" readonly></textarea>
+
+    <div class="row" style="margin-top:10px">
+      <button id="build" class="primary">Download n8n JSON</button>
+      <div class="hint">Imports directly in n8n</div>
+    </div>
+    <div id="dbg" class="dbg"></div>
   </div>
+</div>
 
-  <!-- Load the builder with cache-busting; no defer/async so it executes before the inline script below -->
-  <script src="/builder.js?v=9"></script>
+<!-- Load the external workflow builder logic -->
+<script src="/builder.js"></script>
 
-  <script>
-    (function () {
-      const $industry = document.getElementById('industrySelect');
-      const $scenario = document.getElementById('scenarioSelect');
-      const $channel  = document.getElementById('channelSelect');
-      const $preview  = document.getElementById('preview');
-      const $btnBuild = document.getElementById('btnBuild');
-      const $btnDl    = document.getElementById('btnDownload');
+<script>
+/* ========== Small helpers ========== */
+const $ = id => document.getElementById(id);
+const scenarioSel = $('scenario'), channelSel = $('channel'),
+      searchEl = $('search'), suggestWrap = $('suggestions'), bpTA = $('bp'),
+      dbg = $('dbg');
 
-      // Guard: verify global is present synchronously
-      function assertBuilder() {
-        if (!window.Builder || typeof window.Builder.buildWorkflowJSON !== 'function') {
-          throw new Error('Builder not loaded (using YAML in preview only). Check /public/builder.js and the script tag order.');
-        }
+let ALL = [], MAP = {};
+let INDUSTRIES = [], IND_MAP = {};
+
+function listify(v){ return Array.isArray(v) ? v : String(v ?? '')
+  .replace(/^\[|\]$/g,'')
+  .split(/[;,|\n|\|,]+/)
+  .map(x=>x.replace(/^['"]|['"]$/g,'').trim())
+  .filter(Boolean); }
+
+async function getJSON(url){
+  const r = await fetch(url, { cache:'no-store' });
+  const raw = await r.text();
+  try { return { ok:r.ok, status:r.status, json: JSON.parse(raw), raw }; }
+  catch { return { ok:r.ok, status:r.status, json:null, raw }; }
+}
+
+function recommendedChannel(row){
+  const shapes = listify(row.best_reply_shapes).map(x=>x.toLowerCase());
+  const set = new Set(shapes.map(s =>
+    s.includes('whatsapp')?'whatsapp':
+    (s.includes('sms')||s.includes('text'))?'sms':
+    (s.includes('voice')||s.includes('call'))?'call':
+    s.includes('email')?'email':s));
+  if (set.has('sms')) return 'sms';
+  if (set.has('whatsapp')) return 'whatsapp';
+  if (set.has('email')) return 'email';
+  if (set.has('call')) return 'call';
+  return 'email';
+}
+function matchIndustryForScenario(s){
+  const key = (s.name||'').toLowerCase();
+  return IND_MAP[key] || null;
+}
+function previewYaml(s, industry){
+  const br = v => (v==null || String(v).trim()==='' ? '' : String(v));
+  const brList = arr => `[${listify(arr).join(', ')}]`;
+  const ind = industry ? `
+industry_id: ${industry.industry_id}
+industry_painpoints: ${(industry.painpoints||'').toString().slice(0,220)}...` : '';
+  return `scenario_id: ${s.scenario_id}
+name: ${br(s.name)}
+agent_name: ${br(s.agent_name || 'Agent')}
+best_reply_shapes: ${brList(s.best_reply_shapes)}
+triggers: >
+  ${br(s.triggers || '')}
+how_it_works: >
+  ${br(s.how_it_works || '')}
+roi_hypothesis: >
+  ${br(s.roi_hypothesis || '')}
+tags: [${listify(s.tags).join(', ')}]${ind}`;
+}
+
+/* ========== UI populate + actions ========== */
+function populateUI(list){
+  scenarioSel.innerHTML = '';
+  const frag = document.createDocumentFragment();
+  list.forEach(s=>{
+    const o=document.createElement('option');
+    o.value=s.scenario_id; o.textContent=s.scenario_id; o.title=s.name||s.scenario_id;
+    frag.appendChild(o);
+  });
+  scenarioSel.appendChild(frag);
+  if (list.length) applyScenario(list[0].scenario_id);
+}
+function applyScenario(id){
+  const s = MAP[id] || ALL.find(x=>x.scenario_id===id);
+  if (!s) return;
+  const industry = matchIndustryForScenario(s);
+  scenarioSel.value = s.scenario_id;
+  channelSel.value  = recommendedChannel(s);
+  bpTA.value = previewYaml(s, industry);
+}
+
+/* ========== Remote search across 8k+ ========== */
+let searchTimer = null;
+async function remoteSearch(q){
+  if (!q || q.trim().length < 2){ suggestWrap.innerHTML=''; return; }
+  // use max=50 (API expects "max")
+  const url = `/api/scenarios?q=${encodeURIComponent(q)}&max=50`;
+  const res = await getJSON(url);
+  const items = (res.ok && res.json && Array.isArray(res.json.items)) ? res.json.items : [];
+  renderSuggestions(items);
+}
+function renderSuggestions(matches){
+  if (!matches || !matches.length){ suggestWrap.innerHTML=''; return; }
+  const box = document.createElement('div'); box.className='suggest-box';
+  box.innerHTML = matches.map(m=>{
+    const id=(m.scenario_id||'').replace(/</g,'&lt;');
+    const nm=(m.name||'').replace(/</g,'&lt;');
+    return `<div class="suggest-item" data-id="${id}">
+        <span class="suggest-id">${id}</span>
+        <span class="suggest-name">${nm}</span>
+      </div>`;
+  }).join('');
+  box.addEventListener('click', (e)=>{
+    const el = e.target.closest('.suggest-item'); if(!el) return;
+    const id = el.getAttribute('data-id');
+    // If not in the 25 preloaded, stash minimal so preview works
+    if (!MAP[id]){
+      const m = matches.find(x=>x.scenario_id===id);
+      if (m){
+        MAP[id] = {
+          scenario_id: m.scenario_id||'',
+          name: m.name||'',
+          triggers: m.triggers||'',
+          best_reply_shapes: listify(m.best_reply_shapes),
+          risk_notes: m.risk_notes||'',
+          agent_name: m.agent_name||'',
+          how_it_works: m.how_it_works||'',
+          tool_stack_dev: m.tool_stack_dev||'',
+          tool_stack_autonomous: m.tool_stack_autonomous||'',
+          tags: listify(m.tags||m['tags (;)']||'')
+        };
       }
+    }
+    $('search').value = id;
+    applyScenario(id);
+    suggestWrap.innerHTML='';
+  });
+  suggestWrap.innerHTML=''; suggestWrap.appendChild(box);
+}
+searchEl.addEventListener('input', e=>{
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(()=>remoteSearch(e.target.value), 180);
+});
+searchEl.addEventListener('focus', ()=> {
+  if (ALL.length) renderSuggestions(ALL.slice(0,10)); // light suggestions
+});
+searchEl.addEventListener('blur', ()=> setTimeout(()=>suggestWrap.innerHTML='',150));
+searchEl.addEventListener('keydown', e=>{
+  if (e.key==='Enter'){
+    const v = e.target.value.trim();
+    if (MAP[v]){ applyScenario(v); suggestWrap.innerHTML=''; return; }
+    remoteSearch(v);
+  }
+});
+scenarioSel.addEventListener('change', ()=> applyScenario(scenarioSel.value));
 
-      async function fetchJSON(path) {
-        const res = await fetch(path, { cache: 'no-store' });
-        if (!res.ok) throw new Error(`Failed to fetch ${path}: ${res.status}`);
-        return res.json();
-      }
+/* ========== Workflow builder via external file ========== */
+function buildWorkflowJSON(s){
+  const industry = matchIndustryForScenario(s);
+  // Uses window.Builder from /builder.js
+  return window.Builder?.buildWorkflowJSON(s, industry) || {
+    name: `${s.scenario_id} – ${s.agent_name||'Agent'} (Demo)`,
+    nodes: [], connections: {}, active:false
+  };
+}
+function downloadJSON(obj, filename){
+  const txt=JSON.stringify(obj,null,2);
+  const blob=new Blob([txt],{type:'application/json'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a'); a.href=url; a.download=filename; document.body.appendChild(a); a.click(); URL.revokeObjectURL(url); a.remove();
+}
+$('build').addEventListener('click', ()=>{
+  const sid=(scenarioSel.value||'').trim(); const s=MAP[sid];
+  if(!s){ dbg.innerHTML='<span class="err">No scenario selected.</span>'; return; }
+  const wf=buildWorkflowJSON(s);
+  downloadJSON(wf, `${sid}.n8n.json`);
+});
 
-      function populateIndustries(list) {
-        $industry.innerHTML = '';
-        list.forEach((ind, i) => {
-          const opt = document.createElement('option');
-          opt.value = ind.industry_id || ind.id || ind.slug || String(i);
-          opt.textContent = ind.name || ind.title || opt.value;
-          opt.dataset.payload = JSON.stringify(ind);
-          $industry.appendChild(opt);
-        });
-      }
+/* ========== Bootstrap (ONLY 25) ========== */
+async function bootstrap(){
+  try{
+    // use max=25 (API expects "max")
+    const [sc, ind] = await Promise.all([
+      getJSON('/api/scenarios?cursor=0&max=25'),
+      getJSON('/api/industries'),
+    ]);
+    const sitems = (sc.ok && sc.json && Array.isArray(sc.json.items)) ? sc.json.items : [];
+    const iitems = (ind.ok && ind.json && Array.isArray(ind.json.items)) ? ind.json.items : [];
 
-      function populateScenarios(list) {
-        $scenario.innerHTML = '';
-        list.forEach((s, i) => {
-          const opt = document.createElement('option');
-          opt.value = s.scenario_id || s.id || String(i);
-          opt.textContent = s.agent_name ? `${s.agent_name} — ${s.scenario_id || s.id}` : (s.title || opt.value);
-          opt.dataset.payload = JSON.stringify(s);
-          $scenario.appendChild(opt);
-        });
-      }
+    ALL = sitems.map(x=>({
+      scenario_id:x.scenario_id||'',
+      name:x.name||'',
+      triggers:x.triggers||'',
+      best_reply_shapes:listify(x.best_reply_shapes),
+      risk_notes:x.risk_notes||'',
+      agent_name:x.agent_name||'',
+      how_it_works:x.how_it_works||'',
+      tool_stack_dev:x.tool_stack_dev||'',
+      tool_stack_autonomous:x.tool_stack_autonomous||'',
+      tags:listify(x.tags||x['tags (;)']||'')
+    })).filter(s=>s.scenario_id);
+    MAP = Object.fromEntries(ALL.map(x=>[x.scenario_id,x]));
 
-      function currentIndustry() {
-        const opt = $industry.selectedOptions[0];
-        return opt ? JSON.parse(opt.dataset.payload) : null;
-      }
-      function currentScenario() {
-        const opt = $scenario.selectedOptions[0];
-        return opt ? JSON.parse(opt.dataset.payload) : null;
-      }
+    INDUSTRIES = iitems.map(it=>({
+      industry_id:it.industry_id||it.name||'',
+      painpoints:it.core_pains||it.painpoints||'',
+      kpis:it.success_metrics||it.kpi_examples||'',
+      channels:it.channels||it.core_channels||'',
+      vocabulary:it.agent_language_prompt||''
+    })).filter(i=>i.industry_id);
+    IND_MAP = Object.fromEntries(INDUSTRIES.map(it=>[(it.industry_id||'').toLowerCase(), it]));
 
-      async function init() {
-        try {
-          assertBuilder();
-        } catch (e) {
-          // Show YAML fallback only if builder truly missing
-          $preview.textContent = 'Builder not loaded (using YAML in preview only). Check /builder.js.';
-          console.warn(e);
-        }
+    if (!ALL.length){
+      const fallbackS={scenario_id:'tier1_dso_SCHEDULING_NO_SHOWS',name:'tier1_dso',agent_name:'Scheduling Agent',best_reply_shapes:['sms','email'],how_it_works:'Remind, confirm, backfill.',roi_hypothesis:'Reduce no-shows 30%+'};
+      const fallbackI={industry_id:'tier1_dso',painpoints:'no-shows; front-desk overload',kpis:'no-show rate; utilization'};
+      ALL=[fallbackS]; MAP={ [fallbackS.scenario_id]: fallbackS };
+      INDUSTRIES=[fallbackI]; IND_MAP={ [fallbackI.industry_id]: fallbackI };
+    }
 
-        const [industries, scenarios] = await Promise.all([
-          fetchJSON('/api/industries'),
-          fetchJSON('/api/scenarios')
-        ]);
-
-        populateIndustries(industries);
-        populateScenarios(scenarios);
-
-        // Initial preview
-        buildAndPreview();
-      }
-
-      function buildAndPreview() {
-        try {
-          assertBuilder();
-          const s = currentScenario();
-          const ind = currentIndustry();
-          const channel = $channel.value;
-          const wf = window.Builder.buildWorkflowJSON(s, ind, { recommendedChannel: channel });
-
-          const pretty = JSON.stringify(wf, null, 2);
-          $preview.textContent = pretty;
-          $btnDl.disabled = false;
-
-          // Bind download
-          $btnDl.onclick = () => {
-            const blob = new Blob([pretty], { type: 'application/json' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            const name = (s?.scenario_id || 'workflow').replace(/[^a-z0-9_\-]+/gi,'_');
-            a.href = url;
-            a.download = `${name}.n8n.json`;
-            document.body.appendChild(a);
-            a.click();
-            a.remove();
-            URL.revokeObjectURL(url);
-          };
-        } catch (err) {
-          // Fallback message
-          $preview.textContent = 'Builder not loaded (using YAML in preview only). Check /builder.js.';
-          $btnDl.disabled = true;
-          console.error(err);
-        }
-      }
-
-      $btnBuild.addEventListener('click', buildAndPreview);
-      $industry.addEventListener('change', buildAndPreview);
-      $scenario.addEventListener('change', buildAndPreview);
-      $channel.addEventListener('change', buildAndPreview);
-
-      init().catch(err => {
-        $preview.textContent = String(err);
-      });
-    })();
-  </script>
+    populateUI(ALL);
+  } catch (e){
+    dbg.innerHTML = '<span class="err">Bootstrap error:</span> ' + (e.message||String(e));
+    const fallbackS={scenario_id:'tier1_dso_SCHEDULING_NO_SHOWS',name:'tier1_dso',agent_name:'Scheduling Agent',best_reply_shapes:['sms','email'],how_it_works:'Remind, confirm, backfill.',roi_hypothesis:'Reduce no-shows 30%+'};
+    const fallbackI={industry_id:'tier1_dso',painpoints:'no-shows; front-desk overload',kpis:'no-show rate; utilization'};
+    ALL=[fallbackS]; MAP={ [fallbackS.scenario_id]: fallbackS };
+    INDUSTRIES=[fallbackI]; IND_MAP={ [fallbackI.industry_id]: fallbackI };
+    populateUI(ALL);
+  }
+}
+bootstrap();
+</script>
 </body>
 </html>

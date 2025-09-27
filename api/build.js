@@ -1,7 +1,6 @@
 // api/build.js
-// Deep per-scenario builder with: wide layout, mirrored demo lane, numbered steps.
-// Channels are stacked vertically per branch; each channel has its own horizontal chain.
-// EXTRA: Wider spacing, explicit links between nodes (and between channels), NO waypoint nodes.
+// Wide layout, vertical-per-channel branches, no waypoint nodes, fully linked.
+// All nodes use known, conservative n8n node types/versions to keep connection handles visible.
 // Env: SHEET_ID, GOOGLE_API_KEY, SHEET_TAB?=Scenarios, OPENAI_API_KEY
 
 const HEADERS = {
@@ -13,10 +12,10 @@ const HEADERS = {
 
 // ====== Layout & Guide ======
 const LAYOUT = {
-  laneGap: 1900,   // distance between PROD and DEMO lanes (vertical)
-  stepX: 460,      // horizontal spacing (more room for labels)
-  branchY: 440,    // vertical spacing between branches
-  channelY: 280,   // vertical spacing between channels inside a branch
+  laneGap: 1900,
+  stepX: 460,
+  branchY: 440,
+  channelY: 280,
   prodHeader: { x: -1520, y: 40 },
   prodStart:  { x: -1380, y: 300 },
   demoHeader: { x: -1520, y: 40 },
@@ -25,10 +24,7 @@ const LAYOUT = {
   errorRowYPad: 380,
 };
 
-const GUIDE = {
-  showWaypoints: false,  // removed visually confusing arrow waypoint nodes
-  numberSteps:   true,   // keep numbering for clarity
-};
+const GUIDE = { showWaypoints: false, numberSteps: true };
 
 const DEMO = {
   to: "+34613030526",
@@ -207,17 +203,17 @@ Context:
 ${ctx}`;
 }
 
-// ---------- workflow primitives ----------
+// ---------- workflow primitives (KNOWN NODE VERSIONS) ----------
 function baseWorkflow(name){ return { name, nodes:[], connections:{}, active:false, settings:{}, staticData:{}, __yOffset:0 }; }
 function addNode(wf,node){ if(Array.isArray(node.position)){ node.position=[node.position[0], node.position[1]+(wf.__yOffset||0)]; } wf.nodes.push(node); return node.name; }
 function connect(wf,from,to,outputIndex=0){ wf.connections[from]??={}; wf.connections[from].main??=[]; for(let i=wf.connections[from].main.length;i<=outputIndex;i++) wf.connections[from].main[i]=[]; wf.connections[from].main[outputIndex].push({node:to,type:"main",index:0}); }
 function withYOffset(wf,yOffset,fn){ const prev=wf.__yOffset||0; wf.__yOffset=yOffset; try{ fn(); } finally{ wf.__yOffset=prev; } }
-function addHeader(wf,label,x,y){ return addNode(wf,{ id:uid("label"), name:`=== ${label} ===`, type:"n8n-nodes-base.function", typeVersion:2, position:pos(x,y), parameters:{ functionCode:"return [$json];" } }); }
+function addHeader(wf,label,x,y){ return addNode(wf,{ id:uid("label"), name:`=== ${label} ===`, type:"n8n-nodes-base.function", typeVersion:1, position:pos(x,y), parameters:{ functionCode:"return [$json];" } }); }
 function addManual(wf,x,y,label="Manual Trigger"){ return addNode(wf,{ id:uid("manual"), name:label, type:"n8n-nodes-base.manualTrigger", typeVersion:1, position:pos(x,y), parameters:{} }); }
-function addCron(wf,label,x,y,compat){ if(compat==="full"){ return addNode(wf,{ id:uid("cron"), name:label, type:"n8n-nodes-base.cron", typeVersion:1, position:pos(x,y), parameters:{ triggerTimes:{ item:[{ mode:"everyX", everyX:{ hours:0, minutes:15 } }] } } }); } return addNode(wf,{ id:uid("cronph"), name:`${label} (Placeholder)`, type:"n8n-nodes-base.function", typeVersion:2, position:pos(x,y), parameters:{ functionCode:"return [$json];" } }); }
-function addWebhook(wf,label,x,y,compat){ if(compat==="full"){ return addNode(wf,{ id:uid("webhook"), name:label, type:"n8n-nodes-base.webhook", typeVersion:1, position:pos(x,y), parameters:{ path:uid("hook"), methods:["POST"], responseMode:"onReceived" } }); } return addNode(wf,{ id:uid("webph"), name:`${label} (Placeholder)`, type:"n8n-nodes-base.function", typeVersion:2, position:pos(x,y), parameters:{ functionCode:"return [$json];" } }); }
-function addHTTP(wf,name,urlExpr,bodyExpr,x,y,method="POST"){ return addNode(wf,{ id:uid("http"), name, type:"n8n-nodes-base.httpRequest", typeVersion:4, position:pos(x,y), parameters:{ url:urlExpr, method, jsonParameters:true, sendBody:true, bodyParametersJson:bodyExpr } }); }
-function addFunction(wf,name,code,x,y){ return addNode(wf,{ id:uid("func"), name, type:"n8n-nodes-base.function", typeVersion:2, position:pos(x,y), parameters:{ functionCode:code } }); }
+function addCron(wf,label,x,y,compat){ if(compat==="full"){ return addNode(wf,{ id:uid("cron"), name:label, type:"n8n-nodes-base.cron", typeVersion:1, position:pos(x,y), parameters:{ triggerTimes:{ item:[{ mode:"everyX", everyX:{ hours:0, minutes:15 } }] } } }); } return addNode(wf,{ id:uid("cronph"), name:`${label} (Placeholder)`, type:"n8n-nodes-base.function", typeVersion:1, position:pos(x,y), parameters:{ functionCode:"return [$json];" } }); }
+function addWebhook(wf,label,x,y,compat){ if(compat==="full"){ return addNode(wf,{ id:uid("webhook"), name:label, type:"n8n-nodes-base.webhook", typeVersion:1, position:pos(x,y), parameters:{ path:uid("hook"), methods:["POST"], responseMode:"onReceived" } }); } return addNode(wf,{ id:uid("webph"), name:`${label} (Placeholder)`, type:"n8n-nodes-base.function", typeVersion:1, position:pos(x,y), parameters:{ functionCode:"return [$json];" } }); }
+function addHTTP(wf,name,urlExpr,bodyExpr,x,y,method="POST"){ return addNode(wf,{ id:uid("http"), name, type:"n8n-nodes-base.httpRequest", typeVersion:3, position:pos(x,y), parameters:{ url:urlExpr, method, jsonParameters:true, sendBody:true, bodyParametersJson:bodyExpr } }); }
+function addFunction(wf,name,code,x,y){ return addNode(wf,{ id:uid("func"), name, type:"n8n-nodes-base.function", typeVersion:1, position:pos(x,y), parameters:{ functionCode:code } }); }
 function addIf(wf,name,left,op,right,x,y){ return addNode(wf,{ id:uid("if"), name, type:"n8n-nodes-base.if", typeVersion:2, position:pos(x,y), parameters:{ conditions:{ number:[], string:[{ value1:left, operation:op, value2:right }] } } }); }
 function addSwitch(wf,name,valueExpr,rules,x,y){ return addNode(wf,{ id:uid("switch"), name, type:"n8n-nodes-base.switch", typeVersion:2, position:pos(x,y), parameters:{ value1:valueExpr, rules } }); }
 function addSplit(wf,x,y,size=20){ return addNode(wf,{ id:uid("split"), name:"Split In Batches", type:"n8n-nodes-base.splitInBatches", typeVersion:1, position:pos(x,y), parameters:{ batchSize:size } }); }
@@ -253,7 +249,7 @@ function sanitizeWorkflow(wf){
   wf.nodes=(wf.nodes||[]).map((n,idx)=>{
     if(!n.name||typeof n.name!=='string') n.name=`Node ${idx+1}`;
     const k=n.name.toLowerCase(); if(nameCounts[k]==null) nameCounts[k]=0; else nameCounts[k]+=1; if(nameCounts[k]>0) n.name=`${n.name} #${nameCounts[k]}`;
-    if(!n.type||typeof n.type!=='string'||!n.type.trim()){ n.type=REQUIRED_TYPE; n.typeVersion=typeof n.typeVersion==='number'?n.typeVersion:2; n.parameters||={ functionCode:"return [$json];" }; }
+    if(!n.type||typeof n.type!=='string'||!n.type.trim()){ n.type=REQUIRED_TYPE; n.typeVersion=1; n.parameters||={ functionCode:"return [$json];" }; }
     if(typeof n.typeVersion!=='number') n.typeVersion=1;
     if(!Array.isArray(n.position)||n.position.length!==2){ n.position=[-1000, 300+(idx*40)]; } else { n.position=[Number(n.position[0])||0, Number(n.position[1])||0]; }
     if(!n.parameters||typeof n.parameters!=='object') n.parameters={};
@@ -321,10 +317,8 @@ async function buildWorkflowFromRow(row, opts){
   // lane builder (prod/demo)
   function buildLane({ laneLabel, yOffset, triggerKind, isDemo }){
     withYOffset(wf, yOffset, () => {
-      // header
       addHeader(wf, laneLabel, isDemo?LAYOUT.demoHeader.x:LAYOUT.prodHeader.x, isDemo?LAYOUT.demoHeader.y:LAYOUT.prodHeader.y);
 
-      // trigger
       let trig;
       if(isDemo) trig = addManual(wf, LAYOUT.demoStart.x, LAYOUT.demoStart.y, "Demo Manual Trigger");
       else {
@@ -334,7 +328,6 @@ async function buildWorkflowFromRow(row, opts){
         else trig = addManual(wf, LAYOUT.prodStart.x, LAYOUT.prodStart.y, "Manual Trigger");
       }
 
-      // init context (direct connect — no waypoint)
       const init = addFunction(wf, isDemo ? "Init Demo Context" : "Init Context (PROD)", `
 const seed=${JSON.stringify(DEMO)};
 const scenario=${JSON.stringify({
@@ -355,7 +348,6 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
         (isDemo?LAYOUT.demoStart.x:LAYOUT.prodStart.x)+LAYOUT.stepX, LAYOUT.prodStart.y);
       connect(wf, trig, init);
 
-      // optional fetch/split (direct chaining)
       let cursor = init;
       let didList=false;
       if(!isDemo){
@@ -369,14 +361,13 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
         }
       }
 
-      // branch switch
       const sw = addSwitch(wf, "Branch (LLM)", "={{$json.__branch || 'main'}}",
         (branches.length?branches:[{name:"main"}]).map(b=>({operation:'equal', value2:String(b.name||'main').slice(0,48)})),
         LAYOUT.switchX, LAYOUT.prodStart.y);
       connect(wf, cursor, sw);
 
-      // ===== VERTICAL CHANNELS PER BRANCH, with explicit links =====
-      let lastCollectorOfLastBranch = null; // to connect to Errors row
+      // VERTICAL CHANNELS PER BRANCH (fully linked)
+      let lastCollectorOfLastBranch = null;
       const baseBranchY = LAYOUT.prodStart.y - Math.floor(LAYOUT.branchY * (Math.max(branches.length,1)-1)/2);
 
       (branches.length?branches:[{name:"main",steps:[]}]).forEach((b, bIdx)=>{
@@ -384,13 +375,11 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
         const chCount = Math.max(channels.length,1);
         const firstChY = branchTopY - Math.floor(LAYOUT.channelY * (chCount-1)/2);
 
-        let prevChannelEnterName = null;      // to chain channel End -> next channel Enter
-        let lastChannelCollectorName = null;  // to chain collectors across channels (extra visual path)
+        let prevChannelCollector = null;
 
         channels.forEach((ch, chIdx)=>{
           const rowY = firstChY + chIdx*LAYOUT.channelY;
 
-          // numbering per channel chain
           let stepNo=0;
           const enterName = GUIDE.numberSteps
             ? `[${++stepNo}] Enter: ${b.name||'Case'} · ${ch.toUpperCase()}`
@@ -399,12 +388,9 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
             `return [{...$json,__branch:${JSON.stringify(b.name||'case')},__cond:${JSON.stringify(b.condition||'')},__channel:${JSON.stringify(ch)}}];`,
             LAYOUT.prodStart.x + 4*LAYOUT.stepX, rowY);
 
-          // connect switch -> first channel enter of branch
           if (chIdx === 0) connect(wf, sw, enter, bIdx);
-          // connect previous channel's collector -> this channel's enter (inside the same branch)
-          if (prevChannelEnterName) connect(wf, prevChannelEnterName.collector, enter);
+          if (prevChannelCollector) connect(wf, prevChannelCollector, enter);
 
-          // per-channel horizontal steps
           const steps = Array.isArray(b.steps)?b.steps:[];
           let prev = enter;
 
@@ -429,33 +415,27 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
               node = addFunction(wf, title, "return [$json];", x, rowY);
             }
             connect(wf, prev, node);
-            prev = node; // direct chaining, no waypoint
+            prev = node;
           });
 
-          // Send node
           const sendX = LAYOUT.prodStart.x + (5 + steps.length)*LAYOUT.stepX;
           const sendTitle = GUIDE.numberSteps ? `[${++stepNo}] Send: ${ch.toUpperCase()}` : `Send: ${ch.toUpperCase()}`;
           const sender = makeSenderNode(wf, ch, sendX, rowY, compat, isDemo);
           try{ wf.nodes[wf.nodes.findIndex(n=>n.name===sender)].name = sendTitle; }catch{}
           connect(wf, prev, sender);
 
-          // Collector for this channel
           const collector = addCollector(wf, sendX + LAYOUT.stepX, rowY);
           connect(wf, sender, collector);
 
-          // remember to chain next channel and collect last collector for branch
-          prevChannelEnterName = { collector };
-          if (lastChannelCollectorName) connect(wf, lastChannelCollectorName, collector);
-          lastChannelCollectorName = collector;
+          if (prevChannelCollector) connect(wf, prevChannelCollector, collector);
+          prevChannelCollector = collector;
 
-          // is this the very last channel of the last branch?
           if (bIdx === (Math.max(branches.length,1)-1) && chIdx === (chCount-1)) {
             lastCollectorOfLastBranch = collector;
           }
         });
       });
 
-      // Errors row — connect from the last branch's last channel collector
       if(errors.length && lastCollectorOfLastBranch){
         const bottomOfBranches = baseBranchY + (Math.max(branches.length,1)-1)*LAYOUT.branchY;
         const errY = bottomOfBranches + LAYOUT.errorRowYPad;
@@ -464,8 +444,8 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
         errors.forEach((e,i)=>{
           const fix = addFunction(wf, GUIDE.numberSteps?`[E${i+1}] ${e.name||'Error'}`:(e.name||'Error'),
             `// ${e.mitigation||''}\nreturn [$json];`, LAYOUT.prodStart.x + (5+i)*LAYOUT.stepX, errY);
-          connect(wf, prev, fix);
-          prev = fix;
+        connect(wf, prev, fix);
+        prev = fix;
         });
         const fin = addCollector(wf, LAYOUT.prodStart.x + (6 + errors.length)*LAYOUT.stepX, errY);
         connect(wf, prev, fin);
@@ -480,7 +460,7 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
   }
 
   wf.staticData=wf.staticData||{};
-  wf.staticData.__design={ archetype, prodTrigger, channels, systems, branches, errors, guide: GUIDE, layout: { verticalChannels: true, denseArrows: false } };
+  wf.staticData.__design={ archetype, prodTrigger, channels, systems, branches, errors, guide: GUIDE, layout: { verticalChannels: true } };
 
   return sanitizeWorkflow(wf);
 }
@@ -515,7 +495,7 @@ async function handler(req,res){
   }
 }
 
-// Exports (force Node.js serverless runtime on Vercel to avoid Edge)
+// Force Node.js runtime on Vercel
 module.exports = handler;
 module.exports.config = { runtime: 'nodejs20.x' };
 try { exports.default = handler; } catch {}

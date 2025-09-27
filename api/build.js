@@ -1,6 +1,6 @@
 // api/build.js
-// Deep per-scenario builder with: wide layout, mirrored demo lane, numbered steps,
-// and visual "➡️" waypoints to guide reading order.
+// Deep per-scenario builder with vertical channels under each branch, horizontal
+// per-channel process, arrow waypoints, numbered steps, and mirrored demo lane.
 // Env: SHEET_ID, GOOGLE_API_KEY, SHEET_TAB?=Scenarios, OPENAI_API_KEY
 
 const HEADERS = {
@@ -13,8 +13,9 @@ const HEADERS = {
 // ====== Layout & Guide ======
 const LAYOUT = {
   laneGap: 1700,   // distance between PROD and DEMO lanes (vertical)
-  stepX: 340,      // horizontal spacing
-  branchY: 320,    // vertical spacing between branches (bigger so labels never overlap)
+  stepX: 320,      // horizontal spacing (per hop)
+  branchY: 320,    // vertical spacing between branches
+  channelGap: 180, // vertical spacing between channels inside a branch
   prodHeader: { x: -1320, y: 40 },
   prodStart:  { x: -1180, y: 300 },
   demoHeader: { x: -1320, y: 40 },
@@ -25,7 +26,7 @@ const LAYOUT = {
 
 const GUIDE = {
   showWaypoints: true,   // ➡️ pass-through markers between sections
-  numberSteps:   true,   // prefix steps inside a branch: [1], [2], ...
+  numberSteps:   true,   // prefix steps inside a branch: [1], [2], …
 };
 
 const DEMO = {
@@ -88,7 +89,7 @@ const ARCH_RULES = [
   { a:'ACCESS_GOVERNANCE', rx:/\b(access|rbac|sso|entitlements|seats|identity|pii|dlp)\b/i },
   { a:'PRIVACY_DSR', rx:/\b(dsr|data\s*subject|privacy\s*request|gdpr|ccpa)\b/i },
   { a:'RECRUITING_INTAKE', rx:/\b(recruit(ing)?|ats|cv|resume|candidate|interviews?)\b/i },
-];
+};
 
 const TRIGGER_PREF = {
   APPOINTMENT_SCHEDULING: 'cron', CUSTOMER_SUPPORT_INTAKE: 'webhook', FEEDBACK_NPS: 'cron',
@@ -228,7 +229,7 @@ function addArrow(wf,label,x,y){
     : addFunction(wf, label, "return [$json];", x, y);
 }
 
-// sender nodes
+// channel sender nodes
 function makeSenderNode(wf, channel, x, y, compat, demo){
   const friendly = channel.toUpperCase();
   if(compat==='full'){
@@ -309,8 +310,8 @@ async function buildWorkflowFromRow(row, opts){
     const llmCh=design.channels.filter(c=>allowed.includes(String(c).toLowerCase()));
     if(llmCh.length){ channels.splice(0,channels.length,...llmCh); }
   }
-  if(typeof design.trigger==='string' && ['cron','webhook','imap','manual'].includes(design.trigger.toLowerCase())){
-    prodTrigger=design.trigger.toLowerCase();
+  if(typeof design.trigger==='string' && ['cron','webhook','imap','manual'].includes((design.trigger||'').toLowerCase())){
+    prodTrigger=(design.trigger||'').toLowerCase();
   }
   if(typeof design.archetype==='string' && design.archetype.trim()){
     archetype=design.archetype.trim().toUpperCase();
@@ -364,7 +365,7 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
         (isDemo?LAYOUT.demoStart.x:LAYOUT.prodStart.x)+LAYOUT.stepX, LAYOUT.prodStart.y);
       connect(wf, w1, init);
 
-      // optional fetch/split
+      // optional fetch/split (prod)
       let cursor = init;
       let didList=false;
       if(!isDemo){
@@ -385,14 +386,15 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
       // branch switch
       const w4 = addArrow(wf, `${didList?"Split":"Init"} → Branch`, LAYOUT.switchX - 120, LAYOUT.prodStart.y);
       connect(wf, cursor, w4);
+      const branchDefs = (branches.length?branches:[{name:"main"}]);
       const sw = addSwitch(wf, "Branch (LLM)", "={{$json.__branch || 'main'}}",
-        (branches.length?branches:[{name:"main"}]).map(b=>({operation:'equal', value2:String(b.name||'main').slice(0,48)})),
+        branchDefs.map(b=>({operation:'equal', value2:String(b.name||'main').slice(0,48)})),
         LAYOUT.switchX, LAYOUT.prodStart.y);
       connect(wf, w4, sw);
 
       // branches
-      const lastNodes=[]; const baseY = LAYOUT.prodStart.y - Math.floor(LAYOUT.branchY * (Math.max(branches.length,1)-1)/2);
-      (branches.length?branches:[{name:"main",steps:[]}]).forEach((b, idx)=>{
+      const lastNodes=[]; const baseY = LAYOUT.prodStart.y - Math.floor(LAYOUT.branchY * (Math.max(branchDefs.length,1)-1)/2);
+      branchDefs.forEach((b, idx)=>{
         const rowY = baseY + idx*LAYOUT.branchY;
 
         // enter + numbering
@@ -403,7 +405,7 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
           LAYOUT.prodStart.x + 4*LAYOUT.stepX, rowY);
         connect(wf, sw, prev, idx);
 
-        // steps
+        // pre-channel steps (shared)
         const steps = Array.isArray(b.steps)?b.steps:[];
         steps.forEach((st,k)=>{
           const x = LAYOUT.prodStart.x + (5+k)*LAYOUT.stepX;
@@ -427,56 +429,107 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, y);
             node = addFunction(wf, title, "return [$json];", x, y);
           }
           connect(wf, prev, node);
-          // tiny arrow between step blocks
           const wp = addArrow(wf, "→", x + Math.floor(LAYOUT.stepX/2), y);
           connect(wf, node, wp);
           prev = wp;
         });
 
-        // sends (sequential)
-        channels.forEach((ch,i)=>{
-          const x = LAYOUT.prodStart.x + (5 + steps.length + i)*LAYOUT.stepX;
-          const sendTitle = GUIDE.numberSteps ? `[${++stepNo}] Send: ${ch.toUpperCase()}` : `Send: ${ch.toUpperCase()}`;
-          const sender = makeSenderNode(wf, ch, x, rowY, compat, isDemo);
-          // rename with numbered prefix if possible
-          try{ wf.nodes[wf.nodes.findIndex(n=>n.name===sender)].name = sendTitle; }catch{}
-          connect(wf, prev, sender);
-          prev = addArrow(wf, "→", x + Math.floor(LAYOUT.stepX/2), rowY);
-          connect(wf, sender, prev);
+        // ===== Vertical channels under this branch =====
+        const chs = channels.slice(); // copy
+        const chBaseY = rowY - Math.floor(LAYOUT.channelGap * (Math.max(chs.length,1)-1)/2);
+        const chStartX = LAYOUT.prodStart.x + (5 + steps.length)*LAYOUT.stepX;
+
+        // Fan-out from prev to each channel "start"
+        const channelCollectors = [];
+
+        chs.forEach((ch, j) => {
+          const cy = chBaseY + j*LAYOUT.channelGap;
+
+          // Channel entry
+          const chEnter = addArrow(wf, `Branch → ${ch.toUpperCase()}`, chStartX - Math.floor(LAYOUT.stepX/2), cy);
+          connect(wf, prev, chEnter);
+
+          // Compose (channel-personalized)
+          const composeName = GUIDE.numberSteps ? `[${++stepNo}] Compose (${ch.toUpperCase()})` : `Compose (${ch.toUpperCase()})`;
+          const compose = addFunction(wf, composeName, `
+const m=$json.msg||{};
+const map={ email:m.email?.body, sms:m.sms?.body, whatsapp:m.whatsapp?.body, call:m.call?.script };
+const body= map[${JSON.stringify(ch)}] || m.email?.body || 'Hello!';
+return [{...$json, message: body }];`, chStartX, cy);
+          connect(wf, chEnter, compose);
+
+          // Send
+          const sendX = chStartX + LAYOUT.stepX;
+          const senderName = makeSenderNode(wf, ch, sendX, cy, compat, isDemo); // returns node name
+          connect(wf, compose, senderName);
+
+          // Per-channel follow-up process (horizontally)
+          const afterSend = addArrow(wf, "→", sendX + Math.floor(LAYOUT.stepX/2), cy);
+          connect(wf, senderName, afterSend);
+
+          const wait = addFunction(wf, "Wait / Listen", "return [$json];", sendX + LAYOUT.stepX, cy);
+          connect(wf, afterSend, wait);
+
+          const route = addIf(wf, "Positive Reply?", "={{$json.reply || ''}}", "notEmpty", "", sendX + 2*LAYOUT.stepX, cy);
+          connect(wf, wait, route);
+
+          // Positive path
+          let posNode = addFunction(wf, "Handle Positive", "return [$json];", sendX + 3*LAYOUT.stepX, cy - 40);
+          connect(wf, route, posNode, 0);
+          posNode = addHTTP(wf, "Log/Update (OK)", "={{'https://example.com/ok'}}", "={{$json}}", sendX + 4*LAYOUT.stepX, cy - 40);
+          connect(wf, `Handle Positive`, posNode); // by name
+
+          // Negative/No reply path
+          let negNode = addFunction(wf, "Handle Neutral/No-Reply", "return [$json];", sendX + 3*LAYOUT.stepX, cy + 40);
+          connect(wf, route, negNode, 1);
+          negNode = addHTTP(wf, "Log/Update (Retry/Nurture)", "={{'https://example.com/nurture'}}", "={{$json}}", sendX + 4*LAYOUT.stepX, cy + 40);
+          connect(wf, "Handle Neutral/No-Reply", negNode);
+
+          // Merge paths visually → collector
+          const joinWp = addArrow(wf, "→", sendX + 4.5*LAYOUT.stepX, cy);
+          connect(wf, posNode, joinWp); connect(wf, negNode, joinWp);
+
+          const chCollector = addCollector(wf, sendX + 5*LAYOUT.stepX, cy);
+          connect(wf, joinWp, chCollector);
+          channelCollectors.push(chCollector);
         });
 
-        const end = addCollector(wf, LAYOUT.prodStart.x + (6 + steps.length + channels.length)*LAYOUT.stepX, rowY);
-        const wpEnd = addArrow(wf, "→ End", LAYOUT.prodStart.x + (5.5 + steps.length + channels.length)*LAYOUT.stepX, rowY);
-        connect(wf, prev, wpEnd); connect(wf, wpEnd, end);
-        lastNodes.push(end);
+        // chain channel collectors so you can follow a single itinerary
+        for(let i=0;i<channelCollectors.length-1;i++){ connect(wf, channelCollectors[i], channelCollectors[i+1]); }
+        lastNodes.push(channelCollectors[channelCollectors.length-1] || prev);
       });
 
-      // chain collectors so the itinerary is obvious
+      // chain branch collectors
       for(let i=0;i<lastNodes.length-1;i++){ connect(wf, lastNodes[i], lastNodes[i+1]); }
       const afterBranch = lastNodes[lastNodes.length-1];
 
       // Errors row
       if(errors.length){
-        const errY = baseY + (Math.max(branches.length,1)-1)*LAYOUT.branchY + LAYOUT.errorRowYPad;
+        const rows = Math.max(branchDefs.length,1);
+        // place errors below the lowest channel row
+        const chRows = Math.max(channels.length,1);
+        const extraDown = Math.floor((chRows-1)*LAYOUT.channelGap/2);
+        const errY = (baseY + (rows-1)*LAYOUT.branchY + LAYOUT.errorRowYPad) + extraDown;
+
         const wErr = addArrow(wf, "Branches → Errors", LAYOUT.prodStart.x + 3.6*LAYOUT.stepX, errY);
         connect(wf, afterBranch, wErr);
-        let prev = addFunction(wf, "Error Monitor (LLM List)", "return [$json];", LAYOUT.prodStart.x + 4*LAYOUT.stepX, errY);
-        connect(wf, wErr, prev);
+        let prevE = addFunction(wf, "Error Monitor (LLM List)", "return [$json];", LAYOUT.prodStart.x + 4*LAYOUT.stepX, errY);
+        connect(wf, wErr, prevE);
         errors.forEach((e,i)=>{
           const fix = addFunction(wf, GUIDE.numberSteps?`[E${i+1}] ${e.name||'Error'}`:(e.name||'Error'),
             `// ${e.mitigation||''}\nreturn [$json];`, LAYOUT.prodStart.x + (5+i)*LAYOUT.stepX, errY);
-          connect(wf, prev, fix); prev = addArrow(wf, "→", LAYOUT.prodStart.x + (5+i)*LAYOUT.stepX + Math.floor(LAYOUT.stepX/2), errY); connect(wf, fix, prev);
+          connect(wf, prevE, fix); prevE = addArrow(wf, "→", LAYOUT.prodStart.x + (5+i)*LAYOUT.stepX + Math.floor(LAYOUT.stepX/2), errY); connect(wf, fix, prevE);
         });
         const fin = addCollector(wf, LAYOUT.prodStart.x + (6 + errors.length)*LAYOUT.stepX, errY);
-        connect(wf, prev, fin);
+        connect(wf, prevE, fin);
       }
     });
   }
 
   // build lanes
-  buildLane({ laneLabel:"PRODUCTION LANE", yOffset:0, triggerKind:prodTrigger, isDemo:false });
+  buildLane({ laneLabel:"PRODUCTION LANE", yOffset:0,                    triggerKind:prodTrigger, isDemo:false });
   if(includeDemo){
-    buildLane({ laneLabel:"DEMO LANE (Manual Trigger + Seeded Contacts)", yOffset:LAYOUT.laneGap, triggerKind:'manual', isDemo:true });
+    buildLane({ laneLabel:"DEMO LANE (Manual Trigger + Seeded Contacts)", yOffset:LAYOUT.laneGap, triggerKind:'manual',     isDemo:true  });
   }
 
   wf.staticData=wf.staticData||{};

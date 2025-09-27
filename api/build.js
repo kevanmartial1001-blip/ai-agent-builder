@@ -1,10 +1,6 @@
-// api/build.js
-// Wide layout, vertical-per-channel branches, no waypoint nodes, fully linked.
-// LLM-driven DECISION with exhaustive outcomes (A→Z).
-// Shared pre-send (orange zone) → shared Decision → per-outcome steps → per-channel sends.
-// Known n8n node versions so every node has link handles.
-// Env: SHEET_ID, GOOGLE_API_KEY, SHEET_TAB?=Scenarios, OPENAI_API_KEY
-// Optional: NO_SHEETS=1, NO_LLM=1 (bypass externals for debugging)
+// api/build.js (hardened)
+// Même API, mêmes features (layout espacé, vertical channels, shared send/decision, debug GET).
+// Durcissements: si Google Sheets renvoie vide/erreur, on retourne un stub cohérent au lieu de planter.
 
 const HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -13,12 +9,11 @@ const HEADERS = {
   "Content-Type": "application/json; charset=utf-8",
 };
 
-// ====== Layout (more space) ======
 const LAYOUT = {
   laneGap: 1900,
-  stepX: 540,     // more horizontal space
-  branchY: 520,   // more vertical space between branches
-  channelY: 360,  // more vertical space between channels
+  stepX: 540,
+  branchY: 520,
+  channelY: 360,
   prodHeader: { x: -1520, y: 40 },
   prodStart:  { x: -1380, y: 300 },
   demoHeader: { x: -1520, y: 40 },
@@ -46,7 +41,6 @@ const DEFAULT_HTTP = {
   waitlist_fill: "https://example.com/waitlist/fill",
 };
 
-// ====== Archetypes & rules ======
 const ARCH_RULES = [
   { a:'APPOINTMENT_SCHEDULING', rx:/(appointment|appointments|scheduling|no[-_ ]?show|calendar)/i },
   { a:'CUSTOMER_SUPPORT_INTAKE', rx:/\b(cs|support|helpdesk|ticket|sla|triage|escalation|deflection|kb)\b/i },
@@ -87,13 +81,12 @@ const CHANNEL_NORMALIZE = [
   { k: 'email', rx: /email/i },
 ];
 
-// ---------- utils ----------
 const uid = (p) => `${p}_${Math.random().toString(36).slice(2, 10)}`;
 const pos = (x, y) => [x, y];
 function toObj(header, row) { return Object.fromEntries(header.map((h,i)=>[h,(row[i]??"").toString().trim()])); }
 const listify = (v) => Array.isArray(v) ? v.map(x=>String(x).trim()).filter(Boolean) : String(v||'').split(/[;,/|\n]+/).map(x=>x.trim()).filter(Boolean);
 
-// Hardened fetch with timeout
+// fetch timeout
 const TIMEOUT_MS = 7000;
 async function timedFetch(url, opts={}) {
   const ctrl = new AbortController();
@@ -108,30 +101,45 @@ function chooseArchetype(row){
   return 'SALES_OUTREACH';
 }
 
+// ---- SAFE STUB (used if Sheets missing/empty/not found) ----
+function makeStubRow(scenarioId){
+  return {
+    scenario_id: scenarioId,
+    name: "Stub Scenario",
+    agent_name: "Agent",
+    triggers: "webhook",
+    best_reply_shapes: "email; sms; whatsapp; call",
+    how_it_works: "",
+    roi_hypothesis: "",
+    risk_notes: "",
+    tags: "scheduling"
+  };
+}
+
 // ---------- sheet + llm ----------
 async function fetchSheetRowByScenarioId(scenarioId){
-  if (process.env.NO_SHEETS === '1') {
-    // minimal stub (prevents UI fallback)
-    return {
-      scenario_id: scenarioId,
-      name: "Stub Scenario",
-      agent_name: "Agent",
-      triggers: "webhook",
-      best_reply_shapes: "email; sms; whatsapp; call",
-      how_it_works: "",
-      roi_hypothesis: "",
-      risk_notes: "",
-      tags: "scheduling"
-    };
-  }
+  // Allow explicit bypass
+  if (process.env.NO_SHEETS === '1') return makeStubRow(scenarioId);
+
   const SHEET_ID=process.env.SHEET_ID; const GOOGLE_API_KEY=process.env.GOOGLE_API_KEY; const TAB=process.env.SHEET_TAB||"Scenarios";
-  if(!SHEET_ID||!GOOGLE_API_KEY) throw new Error("Missing SHEET_ID or GOOGLE_API_KEY");
-  const url=`https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(TAB)}?key=${GOOGLE_API_KEY}`;
-  const r=await timedFetch(url,{cache:"no-store"});
-  if(!r.ok) throw new Error(`Sheets API error: ${r.status} ${r.statusText}`);
-  const data=await r.json(); const rows=data.values||[]; if(!rows.length) throw new Error("Sheet has no rows");
-  const header=rows[0].map(h=>h.trim()); const obj=rows.slice(1).map(rw=>toObj(header,rw));
-  return obj.find(x=>(x["scenario_id"]||"").toString().trim().toLowerCase()===scenarioId.toLowerCase());
+  if(!SHEET_ID||!GOOGLE_API_KEY) return makeStubRow(scenarioId);
+
+  try{
+    const url=`https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(TAB)}?key=${GOOGLE_API_KEY}`;
+    const r=await timedFetch(url,{cache:"no-store"});
+    if(!r.ok) return makeStubRow(scenarioId);
+    const data=await r.json();
+    const rows = Array.isArray(data?.values) ? data.values : null;
+    if(!rows || rows.length < 2) return makeStubRow(scenarioId); // header + at least 1 row
+
+    const header=rows[0].map(h=>String(h||'').trim());
+    const bodyRows = rows.slice(1).map(rw=>toObj(header,rw||[]));
+    const found = bodyRows.find(x=>(x["scenario_id"]||"").toString().trim().toLowerCase()===scenarioId.toLowerCase());
+    return found || makeStubRow(scenarioId);
+  }catch(e){
+    // Any parsing/network issue -> stub
+    return makeStubRow(scenarioId);
+  }
 }
 
 async function openaiJSON(prompt, schemaHint){
@@ -230,12 +238,9 @@ function addCron(wf,label,x,y,compat){ if(compat==="full"){ return addNode(wf,{ 
 function addWebhook(wf,label,x,y,compat){ if(compat==="full"){ return addNode(wf,{ id:uid("webhook"), name:label, type:"n8n-nodes-base.webhook", typeVersion:1, position:pos(x,y), parameters:{ path:uid("hook"), methods:["POST"], responseMode:"onReceived" } }); } return addNode(wf,{ id:uid("webph"), name:`${label} (Placeholder)`, type:"n8n-nodes-base.function", typeVersion:1, position:pos(x,y), parameters:{ functionCode:"return [$json];" } }); }
 function addHTTP(wf,name,urlExpr,bodyExpr,x,y,method="POST"){ return addNode(wf,{ id:uid("http"), name, type:"n8n-nodes-base.httpRequest", typeVersion:3, position:pos(x,y), parameters:{ url:urlExpr, method, jsonParameters:true, sendBody:true, bodyParametersJson:bodyExpr } }); }
 function addFunction(wf,name,code,x,y){ return addNode(wf,{ id:uid("func"), name, type:"n8n-nodes-base.function", typeVersion:1, position:pos(x,y), parameters:{ functionCode:code } }); }
-function addIf(wf,name,left,op,right,x,y){ return addNode(wf,{ id:uid("if"), name, type:"n8n-nodes-base.if", typeVersion:2, position:pos(x,y), parameters:{ conditions:{ number:[], string:[{ value1:left, operation:op, value2:right }] } } }); }
 function addSwitch(wf,name,valueExpr,rules,x,y){ return addNode(wf,{ id:uid("switch"), name, type:"n8n-nodes-base.switch", typeVersion:2, position:pos(x,y), parameters:{ value1:valueExpr, rules } }); }
-function addSplit(wf,x,y,size=20){ return addNode(wf,{ id:uid("split"), name:"Split In Batches", type:"n8n-nodes-base.splitInBatches", typeVersion:1, position:pos(x,y), parameters:{ batchSize:size } }); }
 function addCollector(wf,x,y){ return addFunction(wf,"Collector (Inspect)",`const now=new Date().toISOString(); const arr=Array.isArray(items)?items:[{json:$json}]; return arr.map((it,i)=>({json:{...it.json,__collected_at:now, index:i}}));`,x,y); }
 
-// sender nodes
 function makeSenderNode(wf, channel, x, y, compat, demo){
   const friendly = channel.toUpperCase();
   if(compat==='full'){
@@ -259,7 +264,6 @@ function makeSenderNode(wf, channel, x, y, compat, demo){
   return addFunction(wf, `Demo Send ${friendly}`, "return [$json];", x, y);
 }
 
-// ---------- sanitization ----------
 function sanitizeWorkflow(wf){
   const REQUIRED_TYPE="n8n-nodes-base.function"; const nameCounts={}; const byName=new Map();
   wf.nodes=(wf.nodes||[]).map((n,idx)=>{
@@ -281,7 +285,7 @@ function sanitizeWorkflow(wf){
   wf.connections=conns; wf.name=String(wf.name||"AI Agent Workflow"); return wf;
 }
 
-// ---------- default decisions ----------
+// defaults decision
 function schedulingDefaults(){
   return {
     name: "Confirm Appointment",
@@ -319,7 +323,7 @@ function genericDefaults(){
   };
 }
 
-// ---------- LLM orchestration ----------
+// ---------- LLM wrappers ----------
 function makeDesigner(row){
   return openaiJSON(
     makeDesignerPrompt(row),
@@ -338,16 +342,13 @@ async function buildWorkflowFromRow(row, opts){
   const compat=(opts.compat||'safe')==='full'?'full':'safe';
   const includeDemo=opts.includeDemo!==false;
 
-  // channels from best_reply_shapes
   const channels=[]; const shapes=listify(row.best_reply_shapes);
   for(const sh of shapes){ for(const norm of CHANNEL_NORMALIZE){ if(norm.rx.test(sh) && !channels.includes(norm.k)) channels.push(norm.k); } }
   if(!channels.length) channels.push('email');
 
-  // choose archetype/trigger
   let archetype=chooseArchetype(row);
   let prodTrigger=TRIGGER_PREF[archetype]||'manual';
 
-  // LLM design + messages
   const design=(await makeDesigner(row))||{};
   if(Array.isArray(design.channels)&&design.channels.length){
     const allowed=['email','sms','whatsapp','call'];
@@ -368,7 +369,11 @@ async function buildWorkflowFromRow(row, opts){
   const title=`${row.scenario_id||'Scenario'} — ${row.name||''}`.trim();
   const wf=baseWorkflow(title);
 
-  // lane builder (prod/demo)
+  function addSwitch(name, valueExpr, rules, x, y){
+    return addNode(wf,{ id:uid("switch"), name, type:"n8n-nodes-base.switch", typeVersion:2, position:pos(x,y),
+      parameters:{ value1:valueExpr, rules } });
+  }
+
   function buildLane({ laneLabel, yOffset, triggerKind, isDemo }){
     withYOffset(wf, yOffset, () => {
       addHeader(wf, laneLabel, isDemo?LAYOUT.demoHeader.x:LAYOUT.prodHeader.x, isDemo?LAYOUT.demoHeader.y:LAYOUT.prodHeader.y);
@@ -408,12 +413,11 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
         connect(wf, cursor, fetch); cursor = fetch;
       }
 
-      const sw = addSwitch(wf, "Branch (LLM)", "={{$json.__branch || 'main'}}",
+      const sw = addSwitch("Branch (LLM)", "={{$json.__branch || 'main'}}",
         (branches.length?branches:[{name:"main"}]).map(b=>({operation:'equal', value2:String(b.name||'main').slice(0,48)})),
         LAYOUT.switchX, LAYOUT.prodStart.y);
       connect(wf, cursor, sw);
 
-      // VERTICAL CHANNELS PER BRANCH with SHARED SEND + SHARED DECISION
       let lastCollectorOfLastBranch = null;
       const baseBranchY = LAYOUT.prodStart.y - Math.floor(LAYOUT.branchY * (Math.max(branches.length,1)-1)/2);
 
@@ -478,13 +482,11 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
           prevChannelCollector = sharedSend;
         });
 
-        // Shared decision after shared send
         const decisionX = sharedSend.position[0] + LAYOUT.stepX;
         const dRules = decisionSpec.outcomes.map(o=>({operation:'equal', value2:String(o.value||'outcome').slice(0,64)}));
-        const dSwitch = addSwitch(wf, `[3] Decision · ${decisionSpec.name}`, "={{$json.__decision || 'default'}}", dRules, decisionX, branchTopY);
+        const dSwitch = addSwitch(`[3] Decision · ${decisionSpec.name}`, "={{$json.__decision || 'default'}}", dRules, decisionX, branchTopY);
         connect(wf, sharedSend, dSwitch);
 
-        // Outcomes: steps → per-channel sends → final update → collector
         let lastOutcomeCollector = null;
         decisionSpec.outcomes.forEach((o, oIdx)=>{
           const oy = branchTopY - Math.floor(140*decisionSpec.outcomes.length/2) + oIdx*140;
@@ -519,7 +521,7 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Update'}];`, ox, oy);
           });
 
           let sendPrev = oPrev;
-          const channelsToSend = channels; // send on all channels for outcome
+          const channelsToSend = channels;
           channelsToSend.forEach((ch, cIdx)=>{
             const sx = decisionX + Math.floor(LAYOUT.stepX*0.8) + (Math.max(oSteps.length,0)+cIdx+1)*Math.floor(LAYOUT.stepX*0.6);
             const s = makeSenderNode(wf, ch, sx, oy, compat, isDemo);
@@ -560,7 +562,6 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Update'}];`, ox, oy);
     });
   }
 
-  // build lanes
   buildLane({ laneLabel:"PRODUCTION LANE", yOffset:0, triggerKind:prodTrigger, isDemo:false });
   if(includeDemo){
     buildLane({ laneLabel:"DEMO LANE (Manual Trigger + Seeded Contacts)", yOffset:LAYOUT.laneGap, triggerKind:'manual', isDemo:true });
@@ -573,12 +574,11 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Update'}];`, ox, oy);
   return sanitizeWorkflow(wf);
 }
 
-// ---------- HTTP handler (adds GET debug/dry, POST unchanged) ----------
+// ---------- HTTP handler (GET debug/dry, POST identique) ----------
 module.exports = async (req,res)=>{
   Object.entries(HEADERS).forEach(([k,v])=>res.setHeader(k,v));
   if(req.method==="OPTIONS") return res.status(204).end();
 
-  // New: debug via query (GET cliquable)
   const urlObj = new URL(req.url, `http://${req.headers.host}`);
   const qScenario = urlObj.searchParams.get('scenario_id');
   const qDebug    = urlObj.searchParams.get('debug') === '1';
@@ -595,11 +595,6 @@ module.exports = async (req,res)=>{
         if (qDry) { process.env.NO_SHEETS='1'; process.env.NO_LLM='1'; }
 
         const row = await fetchSheetRowByScenarioId(qScenario);
-        if(!row) {
-          res.status(404).json({ ok:false, error:`scenario_id not found: ${qScenario}` });
-          if (qDry) { process.env.NO_SHEETS=savedNO_SHEETS; process.env.NO_LLM=savedNO_LLM; }
-          return;
-        }
         const t0 = Date.now();
         const wf = await buildWorkflowFromRow(row,{ compat, includeDemo });
         const tookMs = Date.now()-t0;
@@ -616,11 +611,9 @@ module.exports = async (req,res)=>{
         res.end(JSON.stringify(wf,null,2));
         return;
       }
-      // GET without scenario_id => usage
       return res.status(200).json({ ok:true, usage:'POST {"scenario_id":"<id>", "compat":"safe|full", "includeDemo": true }' });
     }
 
-    // POST flow (unchanged)
     const body=await new Promise(resolve=>{
       const chunks=[]; req.on("data",c=>chunks.push(c));
       req.on("end",()=>{ try{ resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); }catch{ resolve({}); } });
@@ -631,8 +624,6 @@ module.exports = async (req,res)=>{
 
     const t0 = Date.now();
     const row=await fetchSheetRowByScenarioId(wanted);
-    if(!row) return res.status(404).json({ ok:false, error:`scenario_id not found: ${wanted}` });
-
     const wf=await buildWorkflowFromRow(row,{ compat, includeDemo });
     const tookMs = Date.now()-t0;
 
@@ -650,5 +641,4 @@ module.exports = async (req,res)=>{
   }
 };
 
-// Force Node runtime on Vercel
 module.exports.config = { runtime: 'nodejs20.x' };

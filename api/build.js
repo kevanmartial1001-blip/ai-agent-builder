@@ -1,8 +1,10 @@
 // api/build.js
 // Wide layout, vertical-per-channel branches, strict chronology, fully linked.
-// Adds explicit per-column "Junction [N]" spine so the visual order Step N → Step N+1 is obvious.
-// LLM-driven DECISION steps with explicit outcomes (all paths A→Z).
-// For APPOINTMENT_SCHEDULING, auto-builds a canonical chronological flow if LLM is sparse.
+// Adds a visible "spine" using Junction nodes placed **after** each step
+// (e.g., Junction [2] between Step [2] and Step [3]).
+// For decisions, adds per-outcome junctions (Junction [N: outcome]) that fan-in
+// to a main Junction [N] on the branch spine. All paths are explicit (A→Z).
+// Includes a light anti-overlap nudge so nodes never sit on top of each other.
 // Uses conservative n8n node versions (every node has link handles).
 // Env: SHEET_ID, GOOGLE_API_KEY, SHEET_TAB?=Scenarios, OPENAI_API_KEY
 
@@ -13,20 +15,21 @@ const HEADERS = {
   "Content-Type": "application/json; charset=utf-8",
 };
 
-// ====== Layout (extra air across the full canvas) ======
+// ====== Layout (extra air + spine control) ======
 const LAYOUT = {
-  laneGap: 3000,        // more distance between PROD and DEMO
-  stepX: 680,           // more horizontal distance between numbered steps
-  branchY: 760,         // more distance between branches
-  channelY: 460,        // more distance between channels
-  outcomeRowY: 320,     // more vertical spacing between decision outcomes
+  laneGap: 3200,        // distance between PROD and DEMO
+  stepX: 720,           // horizontal distance between numbered columns
+  branchY: 820,         // distance between branches
+  channelY: 520,        // distance between channels
+  outcomeRowY: 380,     // vertical spacing between decision outcomes
   prodHeader: { x: -1700, y: 40 },
   prodStart:  { x: -1560, y: 300 },
   demoHeader: { x: -1700, y: 40 },
   demoStart:  { x: -1560, y: 300 },
-  switchX: -680,        // branch switch further left so first columns breathe
-  errorRowYPad: 680,    // more room under branches for error lane
-  junctionYOffset: -38, // nudge junction dot slightly above the branch centerline
+  switchX: -760,        // branch switch further left so first columns breathe
+  errorRowYPad: 760,    // room under branches for error lane
+  junctionYOffset: -36, // nudge spine junction slightly above centerline
+  junctionXOffset: 0.35 // how far before next column the junction sits
 };
 
 // Visual guide options
@@ -214,10 +217,32 @@ function uniqueName(wf, base){
   return name;
 }
 
+// --- anti-overlap nudge (visual only, no logic impact) ---
+function nudgeIfOverlapping(wf, x, y){
+  const EPS = 64;        // “too close” box (px)
+  const STEP = 72;       // move-down amount if collision (px)
+  let yy = y;
+  // Try up to 50 nudges to find a free slot (extremely unlikely to loop that much)
+  for(let i=0;i<50;i++){
+    const hit = (wf.nodes||[]).some(n=>{
+      if(!Array.isArray(n.position)) return false;
+      const [nx, ny] = n.position;
+      return Math.abs(nx - x) < EPS && Math.abs(ny - yy) < EPS;
+    });
+    if(!hit) return yy;
+    yy += STEP;
+  }
+  return yy;
+}
+
 function addNode(wf,node){
   node.name = uniqueName(wf, node.name);
   if(Array.isArray(node.position)){
-    node.position=[node.position[0], node.position[1]+(wf.__yOffset||0)];
+    // Apply lane y-offset then anti-overlap nudge
+    const x = node.position[0];
+    const y = node.position[1] + (wf.__yOffset||0);
+    const yy = nudgeIfOverlapping(wf, x, y);
+    node.position=[x, yy];
   }
   wf.nodes.push(node);
   return node.name;
@@ -247,12 +272,21 @@ function addSwitch(wf,name,valueExpr,rules,x,y){ return addNode(wf,{ id:uid("swi
 function addSplit(wf,x,y,size=20){ return addNode(wf,{ id:uid("split"), name:"Split In Batches", type:"n8n-nodes-base.splitInBatches", typeVersion:1, position:pos(x,y), parameters:{ batchSize:size } }); }
 function addCollector(wf,x,y){ return addFunction(wf,"Collector (Inspect)",`const now=new Date().toISOString(); const arr=Array.isArray(items)?items:[{json:$json}]; return arr.map((it,i)=>({json:{...it.json,__collected_at:now, index:i}}));`,x,y); }
 
-// ── Junctions: tiny function nodes centered on branch to show step-to-step spine
+// ── Junctions placed AFTER steps (between N and N+1)
 function addJunction(wf, key, label, x, centerY){
   wf.__junctions[key] = wf.__junctions[key] || {};
   if(wf.__junctions[key][label]) return wf.__junctions[key][label];
   const name = addFunction(wf, `Junction [${label}]`, "return [$json];", x, centerY + LAYOUT.junctionYOffset);
   wf.__junctions[key][label] = name;
+  return name;
+}
+// Per-outcome junction (for scenario organization)
+function addOutcomeJunction(wf, key, label, outcome, x, y){
+  const full = `${label}:${outcome}`;
+  wf.__junctions[key] = wf.__junctions[key] || {};
+  if(wf.__junctions[key][full]) return wf.__junctions[key][full];
+  const name = addFunction(wf, `Junction [${label}: ${outcome}]`, "return [$json];", x, y);
+  wf.__junctions[key][full] = name;
   return name;
 }
 
@@ -285,7 +319,6 @@ function sanitizeWorkflow(wf){
   const REQUIRED_TYPE="n8n-nodes-base.function";
   const byName=new Map();
 
-  // Do NOT rename nodes here (keeps connections valid)
   wf.nodes=(wf.nodes||[]).map((n,idx)=>{
     if(!n.name||typeof n.name!=='string') n.name=`Node ${idx+1}`;
     if(!n.type||typeof n.type!=='string'||!n.type.trim()){ n.type=REQUIRED_TYPE; n.typeVersion=1; n.parameters={ functionCode:"return [$json];" }; }
@@ -298,7 +331,6 @@ function sanitizeWorkflow(wf){
     byName.set(n.name,n); return n;
   });
 
-  // prune invalid links; keep existing keys (names) untouched
   const conns=wf.connections||{};
   for(const [from,m] of Object.entries(conns)){
     if(!byName.has(from)){ delete conns[from]; continue; }
@@ -327,7 +359,6 @@ function makeMessages(row, archetype, channels){
 
 // ---------- Canonical chronological flow for Appointment Scheduling ----------
 function buildCanonicalSchedulingBranches(channelsIn){
-  // Preferred per-channel order
   const desired = ['call','sms','whatsapp','email'];
   const channels = desired.filter(c=>channelsIn.includes(c)).concat(channelsIn.filter(c=>!desired.includes(c)));
 
@@ -476,13 +507,13 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
         LAYOUT.switchX, LAYOUT.prodStart.y);
       connect(wf, cursor, sw);
 
-      // VERTICAL CHANNELS PER BRANCH with DECISION support (extra spacing + junction spine)
+      // VERTICAL CHANNELS PER BRANCH with DECISION support (spine + outcome junctions)
       let lastCollectorOfLastBranch = null;
       const baseBranchY = LAYOUT.prodStart.y - Math.floor(LAYOUT.branchY * (Math.max(branches.length,1)-1)/2);
 
       (branches.length?branches:[{name:"main",steps:[]}]).forEach((b, bIdx)=>{
         const branchTopY = baseBranchY + bIdx*LAYOUT.branchY;
-        const branchCenterY = branchTopY; // centerline for junctions
+        const branchCenterY = branchTopY; // centerline for main junctions
         const junctionKey = `branch_${bIdx}_${laneLabel}`;
 
         const chCount = Math.max(channels.length,1);
@@ -513,29 +544,31 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
             const title = GUIDE.numberSteps ? `[${++stepNo}] ${st.name||'Step'}` : (st.name||'Step');
             const kind=String(st.kind||'').toLowerCase();
 
-            // Column junction BEFORE branching to the next column
-            const junction = addJunction(wf, junctionKey, `${stepNo}`, x - Math.floor(LAYOUT.stepX*0.35), branchCenterY);
+            // Junction sits AFTER the step, before next column, on the spine:
+            const jx = x + Math.floor(LAYOUT.stepX * LAYOUT.junctionXOffset);
+            const mainJunction = addJunction(wf, junctionKey, `${stepNo}`, jx, branchCenterY);
 
             if(kind==='decision' && Array.isArray(st.outcomes) && st.outcomes.length){
-              // Node for the decision itself
+              // Decision node
               const rulz = st.outcomes.map(o=>({operation:'equal', value2:String(o.value||'outcome').slice(0,64)}));
               const dSwitch = addSwitch(wf, `${title} (Decision)`, "={{$json.__decision || 'default'}}", rulz, x, rowY);
               connect(wf, prev, dSwitch);
-              // also connect decision to the junction for Step N to show spine
-              connect(wf, dSwitch, junction);
 
               let lastOutcomeCollector = null;
+
               st.outcomes.forEach((o, oIdx)=>{
+                const outcomeValue = String(o.value||'path');
                 const oy = rowY - (Math.floor((st.outcomes.length-1)/2)*LAYOUT.outcomeRowY) + (oIdx*LAYOUT.outcomeRowY);
-                const oEnter = addFunction(wf, `[${stepNo}.${oIdx+1}] Outcome: ${o.value||'path'}`,
-                  `return [{...$json,__decision:${JSON.stringify(String(o.value||'path'))}}];`,
+
+                // Mark which outcome we’re on
+                const oEnter = addFunction(wf, `[${stepNo}.${oIdx+1}] Outcome: ${outcomeValue}`,
+                  `return [{...$json,__decision:${JSON.stringify(outcomeValue)}}];`,
                   x + Math.floor(LAYOUT.stepX*0.6), oy);
                 connect(wf, dSwitch, oEnter, oIdx);
 
                 let oPrev = oEnter;
                 const oSteps = Array.isArray(o.steps)?o.steps:[];
                 oSteps.forEach((os, ok)=>{
-                  // wider inner spacing inside each outcome path
                   const ox = x + (ok+1)*Math.floor(LAYOUT.stepX*1.05);
                   const ot = `[${stepNo}.${oIdx+1}.${ok+1}] ${os.name||'Step'}`;
                   const okind = String(os.kind||'').toLowerCase();
@@ -561,7 +594,7 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, ox, oy);
                   oPrev = node;
                 });
 
-                // Sender & collector for this outcome (pushed further right)
+                // Sender & collector for this outcome
                 const sendX = x + Math.floor(LAYOUT.stepX*1.1) + (Math.max(oSteps.length,0)+1)*Math.floor(LAYOUT.stepX*1.05);
                 const sender = makeSenderNode(wf, ch, sendX, oy, compat, isDemo);
                 try{ wf.nodes[wf.nodes.findIndex(n=>n.name===sender)].name = `[${stepNo}.${oIdx+1}] Send: ${ch.toUpperCase()}`; }catch{}
@@ -570,12 +603,22 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, ox, oy);
                 const oCollector = addCollector(wf, sendX + Math.floor(LAYOUT.stepX*0.9), oy);
                 connect(wf, sender, oCollector);
 
+                // Per-outcome junction to organize scenarios (placed near outcome row)
+                const outcomeJ = addOutcomeJunction(
+                  wf, junctionKey, `${stepNo}`, outcomeValue,
+                  jx, oy
+                );
+                connect(wf, oCollector, outcomeJ);
+
+                // Fan-in: outcome junction → main junction [stepNo] on the spine
+                connect(wf, outcomeJ, mainJunction);
+
                 if (lastOutcomeCollector) connect(wf, lastOutcomeCollector, oCollector);
                 lastOutcomeCollector = oCollector;
               });
 
-              // After decision fan-in, continue from the *junction* so next column is clearly chained
-              prev = junction;
+              // Continue from the main junction (so next column clearly follows)
+              prev = mainJunction;
               continue;
             }
 
@@ -599,11 +642,12 @@ return [{...m, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
             } else{
               node = addFunction(wf, title, "return [$json];", x, rowY);
             }
-            // step → junction (spine) to show explicit progression
+            // Step → (sender/collector later if last) → Junction [stepNo] on spine
             connect(wf, prev, node);
-            connect(wf, node, junction);
-            // resume building from junction (so next column starts from the spine)
-            prev = junction;
+            connect(wf, node, mainJunction);
+
+            // Next step starts from the main junction
+            prev = mainJunction;
           }
 
           // Send + collect when last step was NOT a decision (push further right)
@@ -658,7 +702,7 @@ return [{...m, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
   wf.staticData.__design={
     archetype, prodTrigger, channels, systems, branches, errors,
     guide: GUIDE,
-    layout: { verticalChannels: true, decisions: "switch+lanes", spacing: LAYOUT, spine: "junctions" },
+    layout: { verticalChannels: true, decisions: "switch+lanes", spacing: LAYOUT, spine: "junctions-after-steps", antiOverlap: true },
     zones: ZONE
   };
 

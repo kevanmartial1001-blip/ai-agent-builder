@@ -1,16 +1,25 @@
-// api/build.js
+// api/build.js (ESM style)
 // Deep per-scenario builder with vertical channels, horizontal per-channel steps,
-// arrows, numbered steps, mirrored demo lane, and LLM design/messaging.
-// Env: SHEET_ID, GOOGLE_API_KEY, SHEET_TAB?=Scenarios, OPENAI_API_KEY
+// two-lane (Prod + Demo) layout, optional OpenAI design/messaging, and rich diagnostics.
+//
+// Env required: SHEET_ID, GOOGLE_API_KEY
+// Optional:     SHEET_TAB (defaults "Scenarios"), OPENAI_API_KEY
+//
+// Usage:
+//   GET  /api/build?scenario_id=...&diag=1           -> returns the matched sheet row (diagnostic only)
+//   POST /api/build  {"scenario_id":"...", "compat":"safe|full", "includeDemo":true}
+//
+// Optional debug flags:
+//   Header: x-debug: 1   OR   Query: ?debug=1   -> include internal error details in JSON responses.
 
 const HEADERS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, X-Preview",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, X-Preview, X-Debug",
   "Content-Type": "application/json; charset=utf-8",
 };
 
-// ====== Layout & Guide ======
+// --------- layout constants (same as your last version) ----------
 const LAYOUT = {
   laneGap: 1700,
   stepX: 320,
@@ -23,7 +32,6 @@ const LAYOUT = {
   switchX: -220,
   errorRowYPad: 260,
 };
-
 const GUIDE = { showWaypoints: true, numberSteps: true };
 
 const DEMO = {
@@ -86,7 +94,7 @@ const ARCH_RULES = [
   { a:'ACCESS_GOVERNANCE', rx:/\b(access|rbac|sso|entitlements|seats|identity|pii|dlp)\b/i },
   { a:'PRIVACY_DSR', rx:/\b(dsr|data\s*subject|privacy\s*request|gdpr|ccpa)\b/i },
   { a:'RECRUITING_INTAKE', rx:/\b(recruit(ing)?|ats|cv|resume|candidate|interviews?)\b/i },
-};
+];
 
 const TRIGGER_PREF = {
   APPOINTMENT_SCHEDULING: 'cron', CUSTOMER_SUPPORT_INTAKE: 'webhook', FEEDBACK_NPS: 'cron',
@@ -108,7 +116,6 @@ const CHANNEL_NORMALIZE = [
 // ---------- utils ----------
 const uid = (p) => `${p}_${Math.random().toString(36).slice(2, 10)}`;
 const pos = (x, y) => [x, y];
-function toObj(header, row) { return Object.fromEntries(header.map((h,i)=>[h,(row[i]??"").toString().trim()])); }
 const listify = (v) => Array.isArray(v) ? v.map(x=>String(x).trim()).filter(Boolean) : String(v||'').split(/[;,/|\n]+/).map(x=>x.trim()).filter(Boolean);
 
 function chooseArchetype(row){
@@ -117,39 +124,42 @@ function chooseArchetype(row){
   return 'SALES_OUTREACH';
 }
 
-// ---------- sheet + llm ----------
-async function fetchWithTimeout(url, opts={}, ms=120000){
-  const ctrl=new AbortController(); const t=setTimeout(()=>ctrl.abort(), ms);
-  try{ return await fetch(url, {...opts, signal: ctrl.signal}); }
-  finally{ clearTimeout(t); }
+// ---------- fetch helpers ----------
+async function fetchWithTimeout(url, opts={}, ms=45000){
+  const ctrl = new AbortController();
+  const t = setTimeout(()=>ctrl.abort(), ms);
+  try { return await fetch(url, { ...opts, signal: ctrl.signal }); }
+  finally { clearTimeout(t); }
 }
 
 async function fetchSheetRowByScenarioId(scenarioId){
-  const SHEET_ID=process.env.SHEET_ID;
-  const GOOGLE_API_KEY=process.env.GOOGLE_API_KEY;
-  const TAB=process.env.SHEET_TAB || "Scenarios"; // ✅ fixed fallback!
-  if(!SHEET_ID||!GOOGLE_API_KEY) throw new Error("Missing SHEET_ID or GOOGLE_API_KEY");
+  const SHEET_ID = process.env.SHEET_ID;
+  const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
+  const TAB = process.env.SHEET_TAB || "Scenarios";
+  if(!SHEET_ID || !GOOGLE_API_KEY) throw new Error("Missing SHEET_ID or GOOGLE_API_KEY");
 
-  const url=`https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(TAB)}?key=${GOOGLE_API_KEY}`;
-  const r=await fetchWithTimeout(url, { cache:"no-store" }, 45000);
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(TAB)}?key=${GOOGLE_API_KEY}`;
+  const r = await fetchWithTimeout(url, { cache: "no-store" }, 45000);
   if(!r.ok){
     const text = await r.text().catch(()=> '');
     throw new Error(`Sheets API error: ${r.status} ${r.statusText} (tab=${TAB}) ${text.slice(0,200)}`);
   }
-  const data=await r.json();
-  const rows=data.values||[];
+  const data = await r.json();
+  const rows = data.values || [];
   if(!rows.length) throw new Error(`Sheet tab "${TAB}" has no rows`);
-  const header=rows[0].map(h=>h.trim());
-  const obj=rows.slice(1).map(rw=>toObj(header,rw));
-  const found = obj.find(x=>(x["scenario_id"]||"").toString().trim().toLowerCase()===scenarioId.toLowerCase());
+  const header = rows[0].map(h=>h.trim());
+  const obj = rows.slice(1).map(rw => Object.fromEntries(header.map((h,i)=>[h,(rw[i]??"").toString().trim()])) );
+  const found = obj.find(x => (x["scenario_id"]||"").toString().trim().toLowerCase() === scenarioId.toLowerCase());
   if(!found) throw new Error(`scenario_id not found in tab "${TAB}": ${scenarioId}`);
   return found;
 }
 
+// ---------- optional LLM ----------
 async function openaiJSON(prompt, schemaHint){
-  const key=process.env.OPENAI_API_KEY; if(!key) return null;
+  const key = process.env.OPENAI_API_KEY;
+  if(!key) return null;
   try{
-    const r=await fetchWithTimeout("https://api.openai.com/v1/chat/completions",{
+    const r = await fetchWithTimeout("https://api.openai.com/v1/chat/completions",{
       method:"POST",
       headers:{ "Authorization":`Bearer ${key}`,"Content-Type":"application/json"},
       body:JSON.stringify({
@@ -162,21 +172,16 @@ async function openaiJSON(prompt, schemaHint){
         ]
       })
     }, 90000);
-    if(!r.ok){
-      const text = await r.text().catch(()=> '');
-      console.error("OpenAI API error:", r.status, r.statusText, text);
-      return null;
-    }
-    const j=await r.json(); const txt=j.choices?.[0]?.message?.content?.trim(); if(!txt) return null;
-    try{ return JSON.parse(txt); }catch{ return null; }
-  }catch(err){
-    console.error("OpenAI call failed:", err?.message||err);
-    return null;
-  }
+    if(!r.ok){ return null; }
+    const j = await r.json();
+    const txt = j.choices?.[0]?.message?.content?.trim();
+    if(!txt) return null;
+    try { return JSON.parse(txt); } catch { return null; }
+  } catch { return null; }
 }
 
 function makeDesignerPrompt(row){
-  const ctx=[
+  const ctx = [
     `SCENARIO_ID: ${row.scenario_id||''}`,
     `AGENT_NAME: ${row.agent_name||''}`,
     `INDUSTRY (name): ${row.name||''}`,
@@ -247,7 +252,6 @@ function addCollector(wf,x,y){ return addFunction(wf,"Collector (Inspect)",`cons
 function addArrow(wf,label,x,y){ return GUIDE.showWaypoints ? addFunction(wf, `➡️ ${label}`, "return [$json];", x, y) : addFunction(wf, label, "return [$json];", x, y); }
 
 function makeSenderNode(wf, channel, x, y, compat, demo){
-  const friendly = channel.toUpperCase();
   if(compat==='full'){
     if(channel==='email'){
       return addNode(wf,{ id:uid("email"), name: demo?"[Send  Email] (Demo)":"[Send  Email]", type:"n8n-nodes-base.emailSend", typeVersion:3, position:pos(x,y),
@@ -262,20 +266,22 @@ function makeSenderNode(wf, channel, x, y, compat, demo){
         parameters:{ resource:"message", operation:"create", from:"={{'whatsapp:' + ($json.waFrom || '+10000000002')}}", to:"={{'whatsapp:' + ($json.to || '+10000000003')}}", message:"={{$json.message || $json.msg?.whatsapp?.body || 'Hello!'}}" }, credentials:{} });
     }
     if(channel==='call'){
-      return addHTTP(wf, demo?"[Place Call] (Demo)":"[Place Call]", "={{$json.callWebhook || 'https://example.com/call'}}",
+      return addHTTP(wf, demo?"[Place Call] (Demo)":"[Place Call]",
+        "={{$json.callWebhook || 'https://example.com/call'}}",
         "={{ { to:$json.to, from:$json.callFrom, text: ($json.message || $json.msg?.call?.script || 'Hello!') } }}", x, y, "POST");
     }
   }
-  return addFunction(wf, `Demo Send ${friendly}`, "return [$json];", x, y);
+  return addFunction(wf, `Demo Send ${channel.toUpperCase()}`, "return [$json];", x, y);
 }
 
-// ---------- sanitization ----------
+// ---------- sanitize ----------
 function sanitizeWorkflow(wf){
-  const REQUIRED_TYPE="n8n-nodes-base.function"; const nameCounts={}; const byName=new Map();
+  const REQUIRED_TYPE="n8n-nodes-base.function";
+  const nameCounts={}; const byName=new Map();
   wf.nodes=(wf.nodes||[]).map((n,idx)=>{
     if(!n.name||typeof n.name!=='string') n.name=`Node ${idx+1}`;
-    const k=n.name.toLowerCase(); if(nameCounts[k]==null) nameCounts[k]=0; else nameCounts[k]+=1; if(nameCounts[k]>0) n.name=`${n.name} #${nameCounts[k]}`;
-    if(!n.type||typeof n.type!=='string'||!n.type.trim()){ n.type=REQUIRED_TYPE; n.typeVersion=typeof n.typeVersion==='number'?n.typeVersion:2; n.parameters||={ functionCode:"return [$json];" }; }
+    const k=n.name.toLowerCase(); nameCounts[k]=(nameCounts[k]||0); if(nameCounts[k]++) n.name=`${n.name} #${nameCounts[k]}`;
+    if(!n.type||typeof n.type!=='string'||!n.type.trim()){ n.type=REQUIRED_TYPE; n.typeVersion=2; n.parameters={ functionCode:"return [$json];" }; }
     if(typeof n.typeVersion!=='number') n.typeVersion=1;
     if(!Array.isArray(n.position)||n.position.length!==2){ n.position=[-1000, 300+(idx*40)]; } else { n.position=[Number(n.position[0])||0, Number(n.position[1])||0]; }
     if(!n.parameters||typeof n.parameters!=='object') n.parameters={};
@@ -291,7 +297,7 @@ function sanitizeWorkflow(wf){
   wf.connections=conns; wf.name=String(wf.name||"AI Agent Workflow"); return wf;
 }
 
-// ---------- LLM orchestration ----------
+// ---------- LLM design & messaging ----------
 function makeDesigner(row){
   return openaiJSON(
     makeDesignerPrompt(row),
@@ -305,39 +311,43 @@ function makeMessages(row, archetype, channels){
   );
 }
 
-// ---------- core build ----------
+// ---------- build lanes ----------
 async function buildWorkflowFromRow(row, opts){
   const compat=(opts.compat||'safe')==='full'?'full':'safe';
   const includeDemo=opts.includeDemo!==false;
 
-  const channels=[]; const shapes=listify(row.best_reply_shapes);
+  const channels=[]; const shapes=listify(row.best_reply_shapes||row["best_reply_shapes"]);
   for(const sh of shapes){ for(const norm of CHANNEL_NORMALIZE){ if(norm.rx.test(sh) && !channels.includes(norm.k)) channels.push(norm.k); } }
   if(!channels.length) channels.push('email');
 
   let archetype=chooseArchetype(row);
   let prodTrigger=TRIGGER_PREF[archetype]||'manual';
 
+  // LLM design (best-effort)
   const design=(await makeDesigner(row))||{};
-  if(Array.isArray(design.channels)&&design.channels.length){
+  if (Array.isArray(design.channels) && design.channels.length){
     const allowed=['email','sms','whatsapp','call'];
-    const llmCh=design.channels.filter(c=>allowed.includes(String(c).toLowerCase()));
-    if(llmCh.length){ channels.splice(0,channels.length,...llmCh); }
+    const llmCh=design.channels.map(c=>String(c||'').toLowerCase()).filter(c=>allowed.includes(c));
+    if (llmCh.length) { channels.splice(0,channels.length,...llmCh); }
   }
-  if(typeof design.trigger==='string' && ['cron','webhook','imap','manual'].includes((design.trigger||'').toLowerCase())){
-    prodTrigger=(design.trigger||'').toLowerCase();
+  if (typeof design.trigger==='string' && ['cron','webhook','imap','manual'].includes(design.trigger.toLowerCase())){
+    prodTrigger = design.trigger.toLowerCase();
   }
-  if(typeof design.archetype==='string' && design.archetype.trim()){
-    archetype=design.archetype.trim().toUpperCase();
+  if (typeof design.archetype==='string' && design.archetype.trim()){
+    archetype = design.archetype.trim().toUpperCase();
   }
-  const systems=Array.isArray(design.systems)?design.systems.map(s=>String(s).toLowerCase()):[];
-  const branches=Array.isArray(design.branches)?design.branches:[{name:"main", condition:"", steps:[{name:"Compose", kind:"compose"}]}];
-  const errors=Array.isArray(design.errors)?design.errors:[];
+  const systems = Array.isArray(design.systems) ? design.systems.map(s=>String(s||'').toLowerCase()) : [];
+  const branches = Array.isArray(design.branches) && design.branches.length
+    ? design.branches
+    : [{name:"main", condition:"", steps:[{name:"Compose", kind:"compose"}]}];
+  const errors = Array.isArray(design.errors) ? design.errors : [];
+
+  // LLM messaging (best-effort)
   const msg=(await makeMessages(row, archetype, channels))||{};
 
+  // Base workflow
   const title=`${row.scenario_id||'Scenario'} — ${row.name||''}`.trim();
   const wf=baseWorkflow(title);
-
-  function addArrow(wf,label,x,y){ return GUIDE.showWaypoints ? addFunction(wf, `➡️ ${label}`, "return [$json];", x, y) : addFunction(wf, label, "return [$json];", x, y); }
 
   function buildLane({ laneLabel, yOffset, triggerKind, isDemo }){
     withYOffset(wf, yOffset, () => {
@@ -346,8 +356,8 @@ async function buildWorkflowFromRow(row, opts){
       let trig;
       if(isDemo) trig = addManual(wf, LAYOUT.demoStart.x, LAYOUT.demoStart.y, "Demo Manual Trigger");
       else {
-        if (triggerKind==='cron') trig = addCron(wf, "Cron (from LLM)", LAYOUT.prodStart.x, LAYOUT.prodStart.y - 160, compat);
-        else if (triggerKind==='webhook') trig = addWebhook(wf, "Webhook (from LLM)", LAYOUT.prodStart.x, LAYOUT.prodStart.y, compat);
+        if (triggerKind==='cron') trig = addCron(wf, "Cron (from design)", LAYOUT.prodStart.x, LAYOUT.prodStart.y - 160, compat);
+        else if (triggerKind==='webhook') trig = addWebhook(wf, "Webhook (from design)", LAYOUT.prodStart.x, LAYOUT.prodStart.y, compat);
         else if (triggerKind==='imap') trig = addFunction(wf, "IMAP Intake (Placeholder)", "return [$json];", LAYOUT.prodStart.x, LAYOUT.prodStart.y);
         else trig = addManual(wf, LAYOUT.prodStart.x, LAYOUT.prodStart.y, "Manual Trigger");
       }
@@ -365,7 +375,7 @@ const scenario=${JSON.stringify({
   how_it_works: row.how_it_works || '',
   roi_hypothesis: row.roi_hypothesis || '',
   risk_notes: row.risk_notes || '',
-  tags: listify(row["tags (;)"] || row.tags),
+  tags: listify(row["tags (;)"] || row.tags || ""),
   archetype,
 })};
 const channels=${JSON.stringify(channels)};
@@ -514,6 +524,7 @@ return [{...$json, message: body }];`, chStartX, cy);
     });
   }
 
+  // Build PRODUCTION + DEMO lanes
   buildLane({ laneLabel:"PRODUCTION LANE", yOffset:0,                    triggerKind:prodTrigger, isDemo:false });
   if(includeDemo){
     buildLane({ laneLabel:"DEMO LANE (Manual Trigger + Seeded Contacts)", yOffset:LAYOUT.laneGap, triggerKind:'manual', isDemo:true  });
@@ -521,33 +532,52 @@ return [{...$json, message: body }];`, chStartX, cy);
 
   wf.staticData=wf.staticData||{};
   wf.staticData.__design={ archetype, prodTrigger, channels, systems, branches, errors, guide: GUIDE };
-
   return sanitizeWorkflow(wf);
 }
 
-// ---------- HTTP handler ----------
-module.exports = async (req,res)=>{
+// ---------------- HTTP handler (ESM) ----------------
+export default async function handler(req, res) {
   Object.entries(HEADERS).forEach(([k,v])=>res.setHeader(k,v));
-  if(req.method==="OPTIONS") return res.status(204).end();
+  if (req.method === "OPTIONS") return res.status(204).end();
 
-  try{
-    if(req.method!=="POST"){
+  const debug = String(req.headers["x-debug"]||"").toLowerCase()==="1" || String(req.query?.debug||"")==="1";
+
+  try {
+    // quick diagnostics
+    if (req.method === "GET" && String(req.query?.diag||"") === "1") {
+      const scenarioId = String(req.query?.scenario_id||"").trim();
+      if (!scenarioId) return res.status(400).json({ ok:false, error:"Missing scenario_id" });
+      const row = await fetchSheetRowByScenarioId(scenarioId);
+      return res.status(200).json({ ok:true, env:{
+        SHEET_ID: !!process.env.SHEET_ID,
+        GOOGLE_API_KEY: !!process.env.GOOGLE_API_KEY,
+        SHEET_TAB: process.env.SHEET_TAB || "Scenarios",
+        OPENAI_API_KEY: !!process.env.OPENAI_API_KEY
+      }, row});
+    }
+
+    if (req.method !== "POST") {
       return res.status(200).json({ ok:true, usage:'POST {"scenario_id":"<id>", "compat":"safe|full", "includeDemo": true }' });
     }
-    const body=await new Promise(resolve=>{
-      const chunks=[]; req.on("data",c=>chunks.push(c)); req.on("end",()=>{ try{ resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); }catch{ resolve({}); } });
+
+    const body = await new Promise(resolve => {
+      const chunks=[]; req.on("data",c=>chunks.push(c)); req.on("end",()=>{ try{ resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); } catch{ resolve({}); } });
     });
-    const wanted=(body.scenario_id||"").toString().trim(); if(!wanted) throw new Error("Missing scenario_id");
-    const compat=(body.compat||'safe').toLowerCase()==='full'?'full':'safe';
-    const includeDemo=body.includeDemo!==false;
 
-    const row=await fetchSheetRowByScenarioId(wanted);
+    const scenarioId = String(body.scenario_id||"").trim();
+    if (!scenarioId) throw new Error("Missing scenario_id");
 
-    const wf=await buildWorkflowFromRow(row,{ compat, includeDemo });
+    // pull row
+    const row = await fetchSheetRowByScenarioId(scenarioId);
+
+    // build
+    const compat = (String(body.compat||'safe').toLowerCase()==='full')?'full':'safe';
+    const includeDemo = body.includeDemo !== false;
+    const wf = await buildWorkflowFromRow(row, { compat, includeDemo });
 
     const isPreview =
       String(req.headers["x-preview"] || "").toLowerCase() === "1" ||
-      String((req.query && req.query.preview) || "") === "1";
+      String(req.query?.preview || "") === "1";
 
     res.status(200);
     res.setHeader("Content-Type","application/json; charset=utf-8");
@@ -555,8 +585,10 @@ module.exports = async (req,res)=>{
       res.setHeader("Content-Disposition", `attachment; filename="${(row.scenario_id||'workflow')}.n8n.json"`);
     }
     res.end(JSON.stringify(wf,null,2));
-  }catch(err){
-    console.error("api/build error:", err?.message||err);
-    res.status(500).json({ ok:false, error:String(err?.message||err) });
+  } catch (err) {
+    const msg = String(err?.message || err);
+    const payload = { ok:false, error: msg };
+    if (debug) payload.stack = err?.stack || null;
+    res.status(500).json(payload);
   }
-};
+}

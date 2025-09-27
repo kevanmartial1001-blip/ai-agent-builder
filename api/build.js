@@ -14,13 +14,13 @@ const HEADERS = {
 const LAYOUT = {
   laneGap: 1700,   // distance between PROD and DEMO lanes (vertical)
   stepX: 340,      // horizontal spacing
-  branchY: 320,    // vertical spacing between branches (bigger so labels never overlap)
+  branchY: 360,    // a bit taller for readability
   prodHeader: { x: -1320, y: 40 },
   prodStart:  { x: -1180, y: 300 },
   demoHeader: { x: -1320, y: 40 },
   demoStart:  { x: -1180, y: 300 },
   switchX: -220,
-  errorRowYPad: 260,
+  errorRowYPad: 300,
 };
 
 const GUIDE = {
@@ -390,8 +390,10 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
         LAYOUT.switchX, LAYOUT.prodStart.y);
       connect(wf, w4, sw);
 
-      // branches
-      const lastNodes=[]; const baseY = LAYOUT.prodStart.y - Math.floor(LAYOUT.branchY * (Math.max(branches.length,1)-1)/2);
+      // branches (each one is a single clean chain left→right)
+      let lastEndName = null; // to hook Errors row from the final branch only
+      const baseY = LAYOUT.prodStart.y - Math.floor(LAYOUT.branchY * (Math.max(branches.length,1)-1)/2);
+
       (branches.length?branches:[{name:"main",steps:[]}]).forEach((b, idx)=>{
         const rowY = baseY + idx*LAYOUT.branchY;
 
@@ -403,7 +405,7 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
           LAYOUT.prodStart.x + 4*LAYOUT.stepX, rowY);
         connect(wf, sw, prev, idx);
 
-        // steps
+        // steps (linear)
         const steps = Array.isArray(b.steps)?b.steps:[];
         steps.forEach((st,k)=>{
           const x = LAYOUT.prodStart.x + (5+k)*LAYOUT.stepX;
@@ -427,13 +429,12 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, y);
             node = addFunction(wf, title, "return [$json];", x, y);
           }
           connect(wf, prev, node);
-          // tiny arrow between step blocks
           const wp = addArrow(wf, "→", x + Math.floor(LAYOUT.stepX/2), y);
           connect(wf, node, wp);
           prev = wp;
         });
 
-        // sends (sequential)
+        // sends (still sequential; horizontal)
         channels.forEach((ch,i)=>{
           const x = LAYOUT.prodStart.x + (5 + steps.length + i)*LAYOUT.stepX;
           const sendTitle = GUIDE.numberSteps ? `[${++stepNo}] Send: ${ch.toUpperCase()}` : `Send: ${ch.toUpperCase()}`;
@@ -441,31 +442,40 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, y);
           // rename with numbered prefix if possible
           try{ wf.nodes[wf.nodes.findIndex(n=>n.name===sender)].name = sendTitle; }catch{}
           connect(wf, prev, sender);
-          prev = addArrow(wf, "→", x + Math.floor(LAYOUT.stepX/2), rowY);
-          connect(wf, sender, prev);
+          const wp = addArrow(wf, "→", x + Math.floor(LAYOUT.stepX/2), rowY);
+          connect(wf, sender, wp);
+          prev = wp;
         });
 
+        // per-branch end (no chaining between branches)
+        const endLabel = `End #${idx+1}`;
+        const wpEnd = addArrow(wf, `→ ${endLabel}`, LAYOUT.prodStart.x + (5.5 + steps.length + channels.length)*LAYOUT.stepX, rowY);
+        connect(wf, prev, wpEnd);
         const end = addCollector(wf, LAYOUT.prodStart.x + (6 + steps.length + channels.length)*LAYOUT.stepX, rowY);
-        const wpEnd = addArrow(wf, "→ End", LAYOUT.prodStart.x + (5.5 + steps.length + channels.length)*LAYOUT.stepX, rowY);
-        connect(wf, prev, wpEnd); connect(wf, wpEnd, end);
-        lastNodes.push(end);
+        // rename collector to include #n
+        try {
+          const i = wf.nodes.findIndex(n=>n.name==="Collector (Inspect)");
+          if(i>=0) wf.nodes[i].name = `Collector (Inspect) #${idx+1}`;
+        } catch {}
+        connect(wf, wpEnd, end);
+
+        lastEndName = end; // store last branch's end node name
       });
 
-      // chain collectors so the itinerary is obvious
-      for(let i=0;i<lastNodes.length-1;i++){ connect(wf, lastNodes[i], lastNodes[i+1]); }
-      const afterBranch = lastNodes[lastNodes.length-1];
-
-      // Errors row
-      if(errors.length){
+      // Errors row — connect only from the last branch's end (keeps wiring clean)
+      if(errors.length && lastEndName){
         const errY = baseY + (Math.max(branches.length,1)-1)*LAYOUT.branchY + LAYOUT.errorRowYPad;
         const wErr = addArrow(wf, "Branches → Errors", LAYOUT.prodStart.x + 3.6*LAYOUT.stepX, errY);
-        connect(wf, afterBranch, wErr);
+        connect(wf, lastEndName, wErr);
         let prev = addFunction(wf, "Error Monitor (LLM List)", "return [$json];", LAYOUT.prodStart.x + 4*LAYOUT.stepX, errY);
         connect(wf, wErr, prev);
         errors.forEach((e,i)=>{
           const fix = addFunction(wf, GUIDE.numberSteps?`[E${i+1}] ${e.name||'Error'}`:(e.name||'Error'),
             `// ${e.mitigation||''}\nreturn [$json];`, LAYOUT.prodStart.x + (5+i)*LAYOUT.stepX, errY);
-          connect(wf, prev, fix); prev = addArrow(wf, "→", LAYOUT.prodStart.x + (5+i)*LAYOUT.stepX + Math.floor(LAYOUT.stepX/2), errY); connect(wf, fix, prev);
+          connect(wf, prev, fix);
+          const wp = addArrow(wf, "→", LAYOUT.prodStart.x + (5+i)*LAYOUT.stepX + Math.floor(LAYOUT.stepX/2), errY);
+          connect(wf, fix, wp);
+          prev = wp;
         });
         const fin = addCollector(wf, LAYOUT.prodStart.x + (6 + errors.length)*LAYOUT.stepX, errY);
         connect(wf, prev, fin);

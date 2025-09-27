@@ -1,6 +1,7 @@
 // api/build.js
 // Deep per-scenario builder with: wide layout, mirrored demo lane, numbered steps,
 // and visual "➡️" waypoints to guide reading order.
+// Channels are stacked VERTICALLY per branch; each channel has its own horizontal chain.
 // Env: SHEET_ID, GOOGLE_API_KEY, SHEET_TAB?=Scenarios, OPENAI_API_KEY
 
 const HEADERS = {
@@ -14,7 +15,8 @@ const HEADERS = {
 const LAYOUT = {
   laneGap: 1700,   // distance between PROD and DEMO lanes (vertical)
   stepX: 340,      // horizontal spacing
-  branchY: 360,    // a bit taller for readability
+  branchY: 360,    // space between branches
+  channelY: 220,   // space between channels inside a branch (vertical stacking)
   prodHeader: { x: -1320, y: 40 },
   prodStart:  { x: -1180, y: 300 },
   demoHeader: { x: -1320, y: 40 },
@@ -25,7 +27,7 @@ const LAYOUT = {
 
 const GUIDE = {
   showWaypoints: true,   // ➡️ pass-through markers between sections
-  numberSteps:   true,   // prefix steps inside a branch: [1], [2], ...
+  numberSteps:   true,   // prefix steps inside a chain: [1], [2], ...
 };
 
 const DEMO = {
@@ -88,7 +90,7 @@ const ARCH_RULES = [
   { a:'ACCESS_GOVERNANCE', rx:/\b(access|rbac|sso|entitlements|seats|identity|pii|dlp)\b/i },
   { a:'PRIVACY_DSR', rx:/\b(dsr|data\s*subject|privacy\s*request|gdpr|ccpa)\b/i },
   { a:'RECRUITING_INTAKE', rx:/\b(recruit(ing)?|ats|cv|resume|candidate|interviews?)\b/i },
-];
+};
 
 const TRIGGER_PREF = {
   APPOINTMENT_SCHEDULING: 'cron', CUSTOMER_SUPPORT_INTAKE: 'webhook', FEEDBACK_NPS: 'cron',
@@ -164,19 +166,18 @@ function makeDesignerPrompt(row){
     `TAGS: ${row["tags (;)"]||row.tags||''}`,
   ].join("\n");
   return `
-Based on the context below, design a bullet-proof workflow shape for n8n with:
+Design a workflow shape for n8n:
 - "trigger": one of ["cron","webhook","imap","manual"]
-- "channels": array subset of ["email","sms","whatsapp","call"] (ordered)
+- "channels": array subset (ordered) of ["call","whatsapp","sms","email"]  // reordered for visual stacks
 - "branches": array (max 6). Each branch:
   { "name": string, "condition": string, "steps": [ { "name": string, "kind": "compose|http|update|route|wait|score|lookup|book|ticket|notify|store|decision" } ] }
 - "errors": likely errors + mitigations
 - "systems": external systems to involve
-- "archetype": one of the 20 standard archetypes (customize allowed)
 Return JSON:
 {
   "archetype": "...",
   "trigger": "cron|webhook|imap|manual",
-  "channels": ["email","sms",...],
+  "channels": ["call","whatsapp","sms","email"],
   "branches": [{ "name": "...", "condition": "...", "steps": [{"name":"...","kind":"..."}]}],
   "errors": [{ "name":"...", "mitigation":"..." }],
   "systems": ["pms","crm",...]
@@ -298,6 +299,10 @@ async function buildWorkflowFromRow(row, opts){
   for(const sh of shapes){ for(const norm of CHANNEL_NORMALIZE){ if(norm.rx.test(sh) && !channels.includes(norm.k)) channels.push(norm.k); } }
   if(!channels.length) channels.push('email');
 
+  // enforce preferred visual order (call, whatsapp, sms, email)
+  const visualOrder = ['call','whatsapp','sms','email'];
+  channels.sort((a,b)=>visualOrder.indexOf(a)-visualOrder.indexOf(b));
+
   // choose archetype/trigger
   let archetype=chooseArchetype(row);
   let prodTrigger=TRIGGER_PREF[archetype]||'manual';
@@ -306,8 +311,13 @@ async function buildWorkflowFromRow(row, opts){
   const design=(await makeDesigner(row))||{};
   if(Array.isArray(design.channels)&&design.channels.length){
     const allowed=['email','sms','whatsapp','call'];
-    const llmCh=design.channels.filter(c=>allowed.includes(String(c).toLowerCase()));
-    if(llmCh.length){ channels.splice(0,channels.length,...llmCh); }
+    const llmCh=design.channels.map(c=>String(c).toLowerCase()).filter(c=>allowed.includes(c));
+    if(llmCh.length){
+      // remap to our visual stack order
+      const uniq=[...new Set(llmCh)];
+      uniq.sort((a,b)=>visualOrder.indexOf(a)-visualOrder.indexOf(b));
+      channels.splice(0,channels.length,...uniq);
+    }
   }
   if(typeof design.trigger==='string' && ['cron','webhook','imap','manual'].includes(design.trigger.toLowerCase())){
     prodTrigger=design.trigger.toLowerCase();
@@ -364,7 +374,7 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
         (isDemo?LAYOUT.demoStart.x:LAYOUT.prodStart.x)+LAYOUT.stepX, LAYOUT.prodStart.y);
       connect(wf, w1, init);
 
-      // optional fetch/split
+      // optional fetch/split (pre-branch)
       let cursor = init;
       let didList=false;
       if(!isDemo){
@@ -390,83 +400,93 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
         LAYOUT.switchX, LAYOUT.prodStart.y);
       connect(wf, w4, sw);
 
-      // branches (each one is a single clean chain left→right)
-      let lastEndName = null; // to hook Errors row from the final branch only
-      const baseY = LAYOUT.prodStart.y - Math.floor(LAYOUT.branchY * (Math.max(branches.length,1)-1)/2);
+      // render each branch; inside branch, stack channels vertically, each a clean horizontal chain
+      let lastBranchLastChannelEnd = null; // to hook Errors row only from last channel of last branch
+      const baseBranchY = LAYOUT.prodStart.y - Math.floor(LAYOUT.branchY * (Math.max(branches.length,1)-1)/2);
 
-      (branches.length?branches:[{name:"main",steps:[]}]).forEach((b, idx)=>{
-        const rowY = baseY + idx*LAYOUT.branchY;
+      (branches.length?branches:[{name:"main",steps:[]}]).forEach((b, bIdx)=>{
+        const branchTopY = baseBranchY + bIdx*LAYOUT.branchY;
 
-        // enter + numbering
-        let stepNo=0;
-        const enterName = GUIDE.numberSteps ? `[${++stepNo}] Enter: ${b.name||'Case'}` : `Enter: ${b.name||'Case'}`;
-        let prev = addFunction(wf, enterName,
-          `return [{...$json,__branch:${JSON.stringify(b.name||'case')},__cond:${JSON.stringify(b.condition||'')}}];`,
-          LAYOUT.prodStart.x + 4*LAYOUT.stepX, rowY);
-        connect(wf, sw, prev, idx);
+        // compute centered Y start for channels inside this branch
+        const chCount = Math.max(channels.length,1);
+        const firstChY = branchTopY - Math.floor(LAYOUT.channelY * (chCount-1)/2);
 
-        // steps (linear)
-        const steps = Array.isArray(b.steps)?b.steps:[];
-        steps.forEach((st,k)=>{
-          const x = LAYOUT.prodStart.x + (5+k)*LAYOUT.stepX;
-          const y = rowY;
-          const title = GUIDE.numberSteps ? `[${++stepNo}] ${st.name||'Step'}` : (st.name||'Step');
-          const kind=String(st.kind||'').toLowerCase();
-          let node;
-          if(kind==='compose'){
-            node = addFunction(wf, title, `
-const ch=($json.channels && $json.channels[0]) || 'email';
+        channels.forEach((ch, chIdx)=>{
+          const rowY = firstChY + chIdx*LAYOUT.channelY;
+
+          // numbering is per channel chain
+          let stepNo=0;
+          const enterName = GUIDE.numberSteps
+            ? `[${++stepNo}] Enter: ${b.name||'Case'} · ${ch.toUpperCase()}`
+            : `Enter: ${b.name||'Case'} · ${ch.toUpperCase()}`;
+
+          // connect switch output (bIdx) to every channel "enter" node (fan-out)
+          const enter = addFunction(wf, enterName,
+            `return [{...$json,__branch:${JSON.stringify(b.name||'case')},__cond:${JSON.stringify(b.condition||'')},__channel:${JSON.stringify(ch)}}];`,
+            LAYOUT.prodStart.x + 4*LAYOUT.stepX, rowY);
+          connect(wf, sw, enter, bIdx);
+
+          // steps duplicated per-channel (so each channel shows full horizontal chain)
+          const steps = Array.isArray(b.steps)?b.steps:[];
+          let prev = enter;
+
+          steps.forEach((st,k)=>{
+            const x = LAYOUT.prodStart.x + (5+k)*LAYOUT.stepX;
+            const title = GUIDE.numberSteps ? `[${++stepNo}] ${st.name||'Step'}` : (st.name||'Step');
+            const kind=String(st.kind||'').toLowerCase();
+            let node;
+            if(kind==='compose'){
+              node = addFunction(wf, title, `
+const ch=${JSON.stringify(ch)};
 const m=$json.msg||{};
 const bodies={ email:(m.email?.body)||'', sms:(m.sms?.body)||'', whatsapp:(m.whatsapp?.body)||'', call:(m.call?.script)||''};
-return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, y);
-          }else if(['http','update','store','notify','route'].includes(kind)){
-            node = addHTTP(wf, title, "={{'https://example.com/step'}}", "={{$json}}", x, y);
-          }else if(kind==='book'){
-            node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.calendar_book}'}}`, "={{$json}}", x, y);
-          }else if(kind==='ticket'){
-            node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.ticket_create}'}}`, "={{$json}}", x, y);
-          }else{
-            node = addFunction(wf, title, "return [$json];", x, y);
-          }
-          connect(wf, prev, node);
-          const wp = addArrow(wf, "→", x + Math.floor(LAYOUT.stepX/2), y);
-          connect(wf, node, wp);
-          prev = wp;
-        });
+return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
+            }else if(['http','update','store','notify','route'].includes(kind)){
+              node = addHTTP(wf, title, "={{'https://example.com/step'}}", "={{$json}}", x, rowY);
+            }else if(kind==='book'){
+              node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.calendar_book}'}}`, "={{$json}}", x, rowY);
+            }else if(kind==='ticket'){
+              node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.ticket_create}'}}`, "={{$json}}", x, rowY);
+            }else{
+              node = addFunction(wf, title, "return [$json];", x, rowY);
+            }
+            connect(wf, prev, node);
+            const wp = addArrow(wf, "→", x + Math.floor(LAYOUT.stepX/2), rowY);
+            connect(wf, node, wp);
+            prev = wp;
+          });
 
-        // sends (still sequential; horizontal)
-        channels.forEach((ch,i)=>{
-          const x = LAYOUT.prodStart.x + (5 + steps.length + i)*LAYOUT.stepX;
+          // channel-specific send
+          const sendX = LAYOUT.prodStart.x + (5 + steps.length)*LAYOUT.stepX;
           const sendTitle = GUIDE.numberSteps ? `[${++stepNo}] Send: ${ch.toUpperCase()}` : `Send: ${ch.toUpperCase()}`;
-          const sender = makeSenderNode(wf, ch, x, rowY, compat, isDemo);
-          // rename with numbered prefix if possible
+          const sender = makeSenderNode(wf, ch, sendX, rowY, compat, isDemo);
           try{ wf.nodes[wf.nodes.findIndex(n=>n.name===sender)].name = sendTitle; }catch{}
           connect(wf, prev, sender);
-          const wp = addArrow(wf, "→", x + Math.floor(LAYOUT.stepX/2), rowY);
-          connect(wf, sender, wp);
-          prev = wp;
+
+          // end/collector for this channel
+          const wpEnd = addArrow(wf, "→ End", sendX + Math.floor(LAYOUT.stepX/2), rowY);
+          connect(wf, sender, wpEnd);
+          const end = addCollector(wf, sendX + LAYOUT.stepX, rowY);
+          try {
+            const i = wf.nodes.findIndex(n=>n.name==="Collector (Inspect)");
+            if(i>=0) wf.nodes[i].name = `Collector (Inspect) · ${b.name || 'Case'} · ${ch.toUpperCase()}`;
+          } catch {}
+          connect(wf, wpEnd, end);
+
+          // remember last end of the last channel of the last branch
+          if (bIdx === (Math.max(branches.length,1)-1) && chIdx === (chCount-1)) {
+            lastBranchLastChannelEnd = end;
+          }
         });
-
-        // per-branch end (no chaining between branches)
-        const endLabel = `End #${idx+1}`;
-        const wpEnd = addArrow(wf, `→ ${endLabel}`, LAYOUT.prodStart.x + (5.5 + steps.length + channels.length)*LAYOUT.stepX, rowY);
-        connect(wf, prev, wpEnd);
-        const end = addCollector(wf, LAYOUT.prodStart.x + (6 + steps.length + channels.length)*LAYOUT.stepX, rowY);
-        // rename collector to include #n
-        try {
-          const i = wf.nodes.findIndex(n=>n.name==="Collector (Inspect)");
-          if(i>=0) wf.nodes[i].name = `Collector (Inspect) #${idx+1}`;
-        } catch {}
-        connect(wf, wpEnd, end);
-
-        lastEndName = end; // store last branch's end node name
       });
 
-      // Errors row — connect only from the last branch's end (keeps wiring clean)
-      if(errors.length && lastEndName){
-        const errY = baseY + (Math.max(branches.length,1)-1)*LAYOUT.branchY + LAYOUT.errorRowYPad;
-        const wErr = addArrow(wf, "Branches → Errors", LAYOUT.prodStart.x + 3.6*LAYOUT.stepX, errY);
-        connect(wf, lastEndName, wErr);
+      // Errors row — only from the last channel end of the last branch
+      if(errors.length && lastBranchLastChannelEnd){
+        // place error row below the entire branch stack
+        const bottomOfBranches = baseBranchY + (Math.max(branches.length,1)-1)*LAYOUT.branchY;
+        const errY = bottomOfBranches + LAYOUT.errorRowYPad;
+        const wErr = addArrow(wf, "All Channels → Errors", LAYOUT.prodStart.x + 3.6*LAYOUT.stepX, errY);
+        connect(wf, lastBranchLastChannelEnd, wErr);
         let prev = addFunction(wf, "Error Monitor (LLM List)", "return [$json];", LAYOUT.prodStart.x + 4*LAYOUT.stepX, errY);
         connect(wf, wErr, prev);
         errors.forEach((e,i)=>{
@@ -490,7 +510,7 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, y);
   }
 
   wf.staticData=wf.staticData||{};
-  wf.staticData.__design={ archetype, prodTrigger, channels, systems, branches, errors, guide: GUIDE };
+  wf.staticData.__design={ archetype, prodTrigger, channels, systems, branches, errors, guide: GUIDE, layout: { verticalChannels: true } };
 
   return sanitizeWorkflow(wf);
 }

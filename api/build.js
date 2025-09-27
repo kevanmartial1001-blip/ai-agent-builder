@@ -6,7 +6,7 @@
 const HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Allow-Headers": "Content-Type, X-Preview",
   "Content-Type": "application/json; charset=utf-8",
 };
 
@@ -122,7 +122,7 @@ function chooseArchetype(row){
 
 // ---------- sheet + llm ----------
 async function fetchSheetRowByScenarioId(scenarioId){
-  const SHEET_ID=process.env.SHEET_ID; const GOOGLE_API_KEY=process.env.GOOGLE_API_KEY; const TAB=process.env.SHEET_TAB||"Scenarios";
+  const SHEET_ID=process.env.SHEET_ID; const GOOGLE_API_KEY=process.env.GOOGLE_API_KEY; const TAB=process.env.SHEET_TAB||"Scarios";
   if(!SHEET_ID||!GOOGLE_API_KEY) throw new Error("Missing SHEET_ID or GOOGLE_API_KEY");
   const url=`https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(TAB)}?key=${GOOGLE_API_KEY}`;
   const r=await fetch(url,{cache:"no-store"}); if(!r.ok) throw new Error(`Sheets API error: ${r.status} ${r.statusText}`);
@@ -221,15 +221,8 @@ function addIf(wf,name,left,op,right,x,y){ return addNode(wf,{ id:uid("if"), nam
 function addSwitch(wf,name,valueExpr,rules,x,y){ return addNode(wf,{ id:uid("switch"), name, type:"n8n-nodes-base.switch", typeVersion:2, position:pos(x,y), parameters:{ value1:valueExpr, rules } }); }
 function addSplit(wf,x,y,size=20){ return addNode(wf,{ id:uid("split"), name:"Split In Batches", type:"n8n-nodes-base.splitInBatches", typeVersion:1, position:pos(x,y), parameters:{ batchSize:size } }); }
 function addCollector(wf,x,y){ return addFunction(wf,"Collector (Inspect)",`const now=new Date().toISOString(); const arr=Array.isArray(items)?items:[{json:$json}]; return arr.map((it,i)=>({json:{...it.json,__collected_at:now, index:i}}));`,x,y); }
+function addArrow(wf,label,x,y){ return GUIDE.showWaypoints ? addFunction(wf, `➡️ ${label}`, "return [$json];", x, y) : addFunction(wf, label, "return [$json];", x, y); }
 
-// ➡️ Waypoint (visual arrow)
-function addArrow(wf,label,x,y){
-  return GUIDE.showWaypoints
-    ? addFunction(wf, `➡️ ${label}`, "return [$json];", x, y)
-    : addFunction(wf, label, "return [$json];", x, y);
-}
-
-// channel sender nodes
 function makeSenderNode(wf, channel, x, y, compat, demo){
   const friendly = channel.toUpperCase();
   if(compat==='full'){
@@ -460,7 +453,7 @@ return [{...$json, message: body }];`, chStartX, cy);
 
           // Send
           const sendX = chStartX + LAYOUT.stepX;
-          const senderName = makeSenderNode(wf, ch, sendX, cy, compat, isDemo); // returns node name
+          const senderName = makeSenderNode(wf, ch, sendX, cy, compat, isDemo);
           connect(wf, compose, senderName);
 
           // Per-channel follow-up process (horizontally)
@@ -477,7 +470,7 @@ return [{...$json, message: body }];`, chStartX, cy);
           let posNode = addFunction(wf, "Handle Positive", "return [$json];", sendX + 3*LAYOUT.stepX, cy - 40);
           connect(wf, route, posNode, 0);
           posNode = addHTTP(wf, "Log/Update (OK)", "={{'https://example.com/ok'}}", "={{$json}}", sendX + 4*LAYOUT.stepX, cy - 40);
-          connect(wf, `Handle Positive`, posNode); // by name
+          connect(wf, `Handle Positive`, posNode);
 
           // Negative/No reply path
           let negNode = addFunction(wf, "Handle Neutral/No-Reply", "return [$json];", sendX + 3*LAYOUT.stepX, cy + 40);
@@ -506,7 +499,6 @@ return [{...$json, message: body }];`, chStartX, cy);
       // Errors row
       if(errors.length){
         const rows = Math.max(branchDefs.length,1);
-        // place errors below the lowest channel row
         const chRows = Math.max(channels.length,1);
         const extraDown = Math.floor((chRows-1)*LAYOUT.channelGap/2);
         const errY = (baseY + (rows-1)*LAYOUT.branchY + LAYOUT.errorRowYPad) + extraDown;
@@ -559,9 +551,15 @@ module.exports = async (req,res)=>{
 
     const wf=await buildWorkflowFromRow(row,{ compat, includeDemo });
 
+    const isPreview =
+      String(req.headers["x-preview"] || "").toLowerCase() === "1" ||
+      String((req.query && req.query.preview) || "") === "1";
+
     res.status(200);
     res.setHeader("Content-Type","application/json; charset=utf-8");
-    res.setHeader("Content-Disposition",`attachment; filename="${(row.scenario_id||'workflow')}.n8n.json"`);
+    if (!isPreview) {
+      res.setHeader("Content-Disposition", `attachment; filename="${(row.scenario_id||'workflow')}.n8n.json"`);
+    }
     res.end(JSON.stringify(wf,null,2));
   }catch(err){
     res.status(500).json({ ok:false, error:String(err?.message||err) });

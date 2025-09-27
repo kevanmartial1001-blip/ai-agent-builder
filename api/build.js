@@ -1,7 +1,6 @@
 // api/build.js
 // Deep per-scenario builder with: wide layout, mirrored demo lane, numbered steps,
 // and visual "➡️" waypoints to guide reading order.
-// Channels are stacked VERTICALLY per branch; each channel has its own horizontal chain.
 // Env: SHEET_ID, GOOGLE_API_KEY, SHEET_TAB?=Scenarios, OPENAI_API_KEY
 
 const HEADERS = {
@@ -15,8 +14,8 @@ const HEADERS = {
 const LAYOUT = {
   laneGap: 1700,   // distance between PROD and DEMO lanes (vertical)
   stepX: 340,      // horizontal spacing
-  branchY: 360,    // space between branches
-  channelY: 220,   // space between channels inside a branch (vertical stacking)
+  branchY: 360,    // vertical spacing between branches (bigger so labels never overlap)
+  channelY: 220,   // NEW: vertical spacing between channels (stacked per branch)
   prodHeader: { x: -1320, y: 40 },
   prodStart:  { x: -1180, y: 300 },
   demoHeader: { x: -1320, y: 40 },
@@ -27,7 +26,7 @@ const LAYOUT = {
 
 const GUIDE = {
   showWaypoints: true,   // ➡️ pass-through markers between sections
-  numberSteps:   true,   // prefix steps inside a chain: [1], [2], ...
+  numberSteps:   true,   // prefix steps inside a branch: [1], [2], ...
 };
 
 const DEMO = {
@@ -90,7 +89,7 @@ const ARCH_RULES = [
   { a:'ACCESS_GOVERNANCE', rx:/\b(access|rbac|sso|entitlements|seats|identity|pii|dlp)\b/i },
   { a:'PRIVACY_DSR', rx:/\b(dsr|data\s*subject|privacy\s*request|gdpr|ccpa)\b/i },
   { a:'RECRUITING_INTAKE', rx:/\b(recruit(ing)?|ats|cv|resume|candidate|interviews?)\b/i },
-};
+];
 
 const TRIGGER_PREF = {
   APPOINTMENT_SCHEDULING: 'cron', CUSTOMER_SUPPORT_INTAKE: 'webhook', FEEDBACK_NPS: 'cron',
@@ -166,18 +165,19 @@ function makeDesignerPrompt(row){
     `TAGS: ${row["tags (;)"]||row.tags||''}`,
   ].join("\n");
   return `
-Design a workflow shape for n8n:
+Based on the context below, design a bullet-proof workflow shape for n8n with:
 - "trigger": one of ["cron","webhook","imap","manual"]
-- "channels": array subset (ordered) of ["call","whatsapp","sms","email"]  // reordered for visual stacks
+- "channels": array subset of ["email","sms","whatsapp","call"] (ordered)
 - "branches": array (max 6). Each branch:
   { "name": string, "condition": string, "steps": [ { "name": string, "kind": "compose|http|update|route|wait|score|lookup|book|ticket|notify|store|decision" } ] }
 - "errors": likely errors + mitigations
 - "systems": external systems to involve
+- "archetype": one of the 20 standard archetypes (customize allowed)
 Return JSON:
 {
   "archetype": "...",
   "trigger": "cron|webhook|imap|manual",
-  "channels": ["call","whatsapp","sms","email"],
+  "channels": ["email","sms",...],
   "branches": [{ "name": "...", "condition": "...", "steps": [{"name":"...","kind":"..."}]}],
   "errors": [{ "name":"...", "mitigation":"..." }],
   "systems": ["pms","crm",...]
@@ -299,10 +299,6 @@ async function buildWorkflowFromRow(row, opts){
   for(const sh of shapes){ for(const norm of CHANNEL_NORMALIZE){ if(norm.rx.test(sh) && !channels.includes(norm.k)) channels.push(norm.k); } }
   if(!channels.length) channels.push('email');
 
-  // enforce preferred visual order (call, whatsapp, sms, email)
-  const visualOrder = ['call','whatsapp','sms','email'];
-  channels.sort((a,b)=>visualOrder.indexOf(a)-visualOrder.indexOf(b));
-
   // choose archetype/trigger
   let archetype=chooseArchetype(row);
   let prodTrigger=TRIGGER_PREF[archetype]||'manual';
@@ -311,12 +307,8 @@ async function buildWorkflowFromRow(row, opts){
   const design=(await makeDesigner(row))||{};
   if(Array.isArray(design.channels)&&design.channels.length){
     const allowed=['email','sms','whatsapp','call'];
-    const llmCh=design.channels.map(c=>String(c).toLowerCase()).filter(c=>allowed.includes(c));
-    if(llmCh.length){
-      const uniq=[...new Set(llmCh)];
-      uniq.sort((a,b)=>visualOrder.indexOf(a)-visualOrder.indexOf(b));
-      channels.splice(0,channels.length,...uniq);
-    }
+    const llmCh=design.channels.filter(c=>allowed.includes(String(c).toLowerCase()));
+    if(llmCh.length){ channels.splice(0,channels.length,...llmCh.map(c=>String(c).toLowerCase())); }
   }
   if(typeof design.trigger==='string' && ['cron','webhook','imap','manual'].includes(design.trigger.toLowerCase())){
     prodTrigger=design.trigger.toLowerCase();
@@ -373,7 +365,7 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
         (isDemo?LAYOUT.demoStart.x:LAYOUT.prodStart.x)+LAYOUT.stepX, LAYOUT.prodStart.y);
       connect(wf, w1, init);
 
-      // optional fetch/split (pre-branch)
+      // optional fetch/split
       let cursor = init;
       let didList=false;
       if(!isDemo){
@@ -399,33 +391,30 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
         LAYOUT.switchX, LAYOUT.prodStart.y);
       connect(wf, w4, sw);
 
-      // render each branch; inside branch, stack channels vertically, each a clean horizontal chain
-      let lastBranchLastChannelEnd = null; // to hook Errors row only from last channel of last branch
+      // ===== VERTICAL CHANNELS PER BRANCH =====
+      let lastBranchLastChannelEnd = null; // only this connects to Errors row
       const baseBranchY = LAYOUT.prodStart.y - Math.floor(LAYOUT.branchY * (Math.max(branches.length,1)-1)/2);
 
       (branches.length?branches:[{name:"main",steps:[]}]).forEach((b, bIdx)=>{
         const branchTopY = baseBranchY + bIdx*LAYOUT.branchY;
-
-        // compute centered Y start for channels inside this branch
         const chCount = Math.max(channels.length,1);
         const firstChY = branchTopY - Math.floor(LAYOUT.channelY * (chCount-1)/2);
 
         channels.forEach((ch, chIdx)=>{
           const rowY = firstChY + chIdx*LAYOUT.channelY;
 
-          // numbering is per channel chain
+          // numbering per channel chain
           let stepNo=0;
           const enterName = GUIDE.numberSteps
             ? `[${++stepNo}] Enter: ${b.name||'Case'} · ${ch.toUpperCase()}`
             : `Enter: ${b.name||'Case'} · ${ch.toUpperCase()}`;
-
-          // connect switch output (bIdx) to every channel "enter" node (fan-out)
           const enter = addFunction(wf, enterName,
             `return [{...$json,__branch:${JSON.stringify(b.name||'case')},__cond:${JSON.stringify(b.condition||'')},__channel:${JSON.stringify(ch)}}];`,
             LAYOUT.prodStart.x + 4*LAYOUT.stepX, rowY);
+          // fan out from switch (branch index) into each channel row
           connect(wf, sw, enter, bIdx);
 
-          // steps duplicated per-channel (so each channel shows full horizontal chain)
+          // per-channel horizontal steps (duplicate steps for clarity)
           const steps = Array.isArray(b.steps)?b.steps:[];
           let prev = enter;
 
@@ -455,14 +444,14 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
             prev = wp;
           });
 
-          // channel-specific send
+          // Send node (channel-specific)
           const sendX = LAYOUT.prodStart.x + (5 + steps.length)*LAYOUT.stepX;
           const sendTitle = GUIDE.numberSteps ? `[${++stepNo}] Send: ${ch.toUpperCase()}` : `Send: ${ch.toUpperCase()}`;
           const sender = makeSenderNode(wf, ch, sendX, rowY, compat, isDemo);
           try{ wf.nodes[wf.nodes.findIndex(n=>n.name===sender)].name = sendTitle; }catch{}
           connect(wf, prev, sender);
 
-          // end/collector for this channel
+          // End → Collector for this channel
           const wpEnd = addArrow(wf, "→ End", sendX + Math.floor(LAYOUT.stepX/2), rowY);
           connect(wf, sender, wpEnd);
           const end = addCollector(wf, sendX + LAYOUT.stepX, rowY);
@@ -472,16 +461,15 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
           } catch {}
           connect(wf, wpEnd, end);
 
-          // remember last end of the last channel of the last branch
+          // Remember last channel of last branch
           if (bIdx === (Math.max(branches.length,1)-1) && chIdx === (chCount-1)) {
             lastBranchLastChannelEnd = end;
           }
         });
       });
 
-      // Errors row — only from the last channel end of the last branch
+      // Errors row — connect only from the last channel end of the last branch
       if(errors.length && lastBranchLastChannelEnd){
-        // place error row below the entire branch stack
         const bottomOfBranches = baseBranchY + (Math.max(branches.length,1)-1)*LAYOUT.branchY;
         const errY = bottomOfBranches + LAYOUT.errorRowYPad;
         const wErr = addArrow(wf, "All Channels → Errors", LAYOUT.prodStart.x + 3.6*LAYOUT.stepX, errY);
@@ -514,10 +502,8 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
   return sanitizeWorkflow(wf);
 }
 
-// ─────────────────────────────────────────────────────────────
-// Serverless HTTP handler (Node.js runtime forced)
-// ─────────────────────────────────────────────────────────────
-async function handler(req, res) {
+// ---------- HTTP handler ----------
+async function handler(req,res){
   Object.entries(HEADERS).forEach(([k,v])=>res.setHeader(k,v));
   if(req.method==="OPTIONS") return res.status(204).end();
 
@@ -546,7 +532,7 @@ async function handler(req, res) {
   }
 }
 
-// Exports (force Node.js serverless runtime on Vercel)
+// Exports (force Node.js serverless runtime on Vercel to avoid Edge)
 module.exports = handler;
 module.exports.config = { runtime: 'nodejs20.x' };
 try { exports.default = handler; } catch {}

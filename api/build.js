@@ -1,6 +1,6 @@
 // api/build.js
-// Deep per-scenario builder with vertical channels under each branch, horizontal
-// per-channel process, arrow waypoints, numbered steps, and mirrored demo lane.
+// Deep per-scenario builder with vertical channels, horizontal per-channel steps,
+// arrows, numbered steps, mirrored demo lane, and LLM design/messaging.
 // Env: SHEET_ID, GOOGLE_API_KEY, SHEET_TAB?=Scenarios, OPENAI_API_KEY
 
 const HEADERS = {
@@ -12,10 +12,10 @@ const HEADERS = {
 
 // ====== Layout & Guide ======
 const LAYOUT = {
-  laneGap: 1700,   // distance between PROD and DEMO lanes (vertical)
-  stepX: 320,      // horizontal spacing (per hop)
-  branchY: 320,    // vertical spacing between branches
-  channelGap: 180, // vertical spacing between channels inside a branch
+  laneGap: 1700,
+  stepX: 320,
+  branchY: 320,
+  channelGap: 180,
   prodHeader: { x: -1320, y: 40 },
   prodStart:  { x: -1180, y: 300 },
   demoHeader: { x: -1320, y: 40 },
@@ -24,10 +24,7 @@ const LAYOUT = {
   errorRowYPad: 260,
 };
 
-const GUIDE = {
-  showWaypoints: true,   // ➡️ pass-through markers between sections
-  numberSteps:   true,   // prefix steps inside a branch: [1], [2], …
-};
+const GUIDE = { showWaypoints: true, numberSteps: true };
 
 const DEMO = {
   to: "+34613030526",
@@ -121,20 +118,38 @@ function chooseArchetype(row){
 }
 
 // ---------- sheet + llm ----------
+async function fetchWithTimeout(url, opts={}, ms=120000){
+  const ctrl=new AbortController(); const t=setTimeout(()=>ctrl.abort(), ms);
+  try{ return await fetch(url, {...opts, signal: ctrl.signal}); }
+  finally{ clearTimeout(t); }
+}
+
 async function fetchSheetRowByScenarioId(scenarioId){
-  const SHEET_ID=process.env.SHEET_ID; const GOOGLE_API_KEY=process.env.GOOGLE_API_KEY; const TAB=process.env.SHEET_TAB||"Scarios";
+  const SHEET_ID=process.env.SHEET_ID;
+  const GOOGLE_API_KEY=process.env.GOOGLE_API_KEY;
+  const TAB=process.env.SHEET_TAB || "Scenarios"; // ✅ fixed fallback!
   if(!SHEET_ID||!GOOGLE_API_KEY) throw new Error("Missing SHEET_ID or GOOGLE_API_KEY");
+
   const url=`https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(TAB)}?key=${GOOGLE_API_KEY}`;
-  const r=await fetch(url,{cache:"no-store"}); if(!r.ok) throw new Error(`Sheets API error: ${r.status} ${r.statusText}`);
-  const data=await r.json(); const rows=data.values||[]; if(!rows.length) throw new Error("Sheet has no rows");
-  const header=rows[0].map(h=>h.trim()); const obj=rows.slice(1).map(rw=>toObj(header,rw));
-  return obj.find(x=>(x["scenario_id"]||"").toString().trim().toLowerCase()===scenarioId.toLowerCase());
+  const r=await fetchWithTimeout(url, { cache:"no-store" }, 45000);
+  if(!r.ok){
+    const text = await r.text().catch(()=> '');
+    throw new Error(`Sheets API error: ${r.status} ${r.statusText} (tab=${TAB}) ${text.slice(0,200)}`);
+  }
+  const data=await r.json();
+  const rows=data.values||[];
+  if(!rows.length) throw new Error(`Sheet tab "${TAB}" has no rows`);
+  const header=rows[0].map(h=>h.trim());
+  const obj=rows.slice(1).map(rw=>toObj(header,rw));
+  const found = obj.find(x=>(x["scenario_id"]||"").toString().trim().toLowerCase()===scenarioId.toLowerCase());
+  if(!found) throw new Error(`scenario_id not found in tab "${TAB}": ${scenarioId}`);
+  return found;
 }
 
 async function openaiJSON(prompt, schemaHint){
   const key=process.env.OPENAI_API_KEY; if(!key) return null;
   try{
-    const r=await fetch("https://api.openai.com/v1/chat/completions",{
+    const r=await fetchWithTimeout("https://api.openai.com/v1/chat/completions",{
       method:"POST",
       headers:{ "Authorization":`Bearer ${key}`,"Content-Type":"application/json"},
       body:JSON.stringify({
@@ -146,10 +161,18 @@ async function openaiJSON(prompt, schemaHint){
           {role:"user",content:prompt+(schemaHint?("\n\nSchema:\n"+schemaHint):"")}
         ]
       })
-    });
+    }, 90000);
+    if(!r.ok){
+      const text = await r.text().catch(()=> '');
+      console.error("OpenAI API error:", r.status, r.statusText, text);
+      return null;
+    }
     const j=await r.json(); const txt=j.choices?.[0]?.message?.content?.trim(); if(!txt) return null;
     try{ return JSON.parse(txt); }catch{ return null; }
-  }catch{ return null; }
+  }catch(err){
+    console.error("OpenAI call failed:", err?.message||err);
+    return null;
+  }
 }
 
 function makeDesignerPrompt(row){
@@ -287,16 +310,13 @@ async function buildWorkflowFromRow(row, opts){
   const compat=(opts.compat||'safe')==='full'?'full':'safe';
   const includeDemo=opts.includeDemo!==false;
 
-  // channels from best_reply_shapes
   const channels=[]; const shapes=listify(row.best_reply_shapes);
   for(const sh of shapes){ for(const norm of CHANNEL_NORMALIZE){ if(norm.rx.test(sh) && !channels.includes(norm.k)) channels.push(norm.k); } }
   if(!channels.length) channels.push('email');
 
-  // choose archetype/trigger
   let archetype=chooseArchetype(row);
   let prodTrigger=TRIGGER_PREF[archetype]||'manual';
 
-  // LLM design + messages
   const design=(await makeDesigner(row))||{};
   if(Array.isArray(design.channels)&&design.channels.length){
     const allowed=['email','sms','whatsapp','call'];
@@ -310,20 +330,19 @@ async function buildWorkflowFromRow(row, opts){
     archetype=design.archetype.trim().toUpperCase();
   }
   const systems=Array.isArray(design.systems)?design.systems.map(s=>String(s).toLowerCase()):[];
-  const branches=Array.isArray(design.branches)?design.branches:[];
+  const branches=Array.isArray(design.branches)?design.branches:[{name:"main", condition:"", steps:[{name:"Compose", kind:"compose"}]}];
   const errors=Array.isArray(design.errors)?design.errors:[];
   const msg=(await makeMessages(row, archetype, channels))||{};
 
   const title=`${row.scenario_id||'Scenario'} — ${row.name||''}`.trim();
   const wf=baseWorkflow(title);
 
-  // lane builder (prod/demo)
+  function addArrow(wf,label,x,y){ return GUIDE.showWaypoints ? addFunction(wf, `➡️ ${label}`, "return [$json];", x, y) : addFunction(wf, label, "return [$json];", x, y); }
+
   function buildLane({ laneLabel, yOffset, triggerKind, isDemo }){
     withYOffset(wf, yOffset, () => {
-      // header
       addHeader(wf, laneLabel, isDemo?LAYOUT.demoHeader.x:LAYOUT.prodHeader.x, isDemo?LAYOUT.demoHeader.y:LAYOUT.prodHeader.y);
 
-      // trigger
       let trig;
       if(isDemo) trig = addManual(wf, LAYOUT.demoStart.x, LAYOUT.demoStart.y, "Demo Manual Trigger");
       else {
@@ -333,11 +352,9 @@ async function buildWorkflowFromRow(row, opts){
         else trig = addManual(wf, LAYOUT.prodStart.x, LAYOUT.prodStart.y, "Manual Trigger");
       }
 
-      // ➡️ waypoint
       const w1 = addArrow(wf, "Start → Init", (isDemo?LAYOUT.demoStart.x:LAYOUT.prodStart.x)+Math.floor(LAYOUT.stepX/2), LAYOUT.prodStart.y);
       connect(wf, trig, w1);
 
-      // init context
       const init = addFunction(wf, isDemo ? "Init Demo Context" : "Init Context (PROD)", `
 const seed=${JSON.stringify(DEMO)};
 const scenario=${JSON.stringify({
@@ -358,7 +375,6 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
         (isDemo?LAYOUT.demoStart.x:LAYOUT.prodStart.x)+LAYOUT.stepX, LAYOUT.prodStart.y);
       connect(wf, w1, init);
 
-      // optional fetch/split (prod)
       let cursor = init;
       let didList=false;
       if(!isDemo){
@@ -376,7 +392,6 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
         }
       }
 
-      // branch switch
       const w4 = addArrow(wf, `${didList?"Split":"Init"} → Branch`, LAYOUT.switchX - 120, LAYOUT.prodStart.y);
       connect(wf, cursor, w4);
       const branchDefs = (branches.length?branches:[{name:"main"}]);
@@ -385,123 +400,104 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
         LAYOUT.switchX, LAYOUT.prodStart.y);
       connect(wf, w4, sw);
 
-      // branches
       const lastNodes=[]; const baseY = LAYOUT.prodStart.y - Math.floor(LAYOUT.branchY * (Math.max(branchDefs.length,1)-1)/2);
       branchDefs.forEach((b, idx)=>{
         const rowY = baseY + idx*LAYOUT.branchY;
 
-        // enter + numbering
         let stepNo=0;
-        const enterName = GUIDE.numberSteps ? `[${++stepNo}] Enter: ${b.name||'Case'}` : `Enter: ${b.name||'Case'}`;
-        let prev = addFunction(wf, enterName,
+        let prev = addFunction(wf, GUIDE.numberSteps ? `[${++stepNo}] Enter: ${b.name||'Case'}` : `Enter: ${b.name||'Case'}`,
           `return [{...$json,__branch:${JSON.stringify(b.name||'case')},__cond:${JSON.stringify(b.condition||'')}}];`,
           LAYOUT.prodStart.x + 4*LAYOUT.stepX, rowY);
         connect(wf, sw, prev, idx);
 
-        // pre-channel steps (shared)
         const steps = Array.isArray(b.steps)?b.steps:[];
         steps.forEach((st,k)=>{
           const x = LAYOUT.prodStart.x + (5+k)*LAYOUT.stepX;
-          const y = rowY;
           const title = GUIDE.numberSteps ? `[${++stepNo}] ${st.name||'Step'}` : (st.name||'Step');
           const kind=String(st.kind||'').toLowerCase();
           let node;
           if(kind==='compose'){
             node = addFunction(wf, title, `
-const ch=($json.channels && $json.channels[0]) || 'email';
 const m=$json.msg||{};
+const ch=($json.channels && $json.channels[0]) || 'email';
 const bodies={ email:(m.email?.body)||'', sms:(m.sms?.body)||'', whatsapp:(m.whatsapp?.body)||'', call:(m.call?.script)||''};
-return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, y);
+return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
           }else if(['http','update','store','notify','route'].includes(kind)){
-            node = addHTTP(wf, title, "={{'https://example.com/step'}}", "={{$json}}", x, y);
+            node = addHTTP(wf, title, "={{'https://example.com/step'}}", "={{$json}}", x, rowY);
           }else if(kind==='book'){
-            node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.calendar_book}'}}`, "={{$json}}", x, y);
+            node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.calendar_book}'}}`, "={{$json}}", x, rowY);
           }else if(kind==='ticket'){
-            node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.ticket_create}'}}`, "={{$json}}", x, y);
+            node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.ticket_create}'}}`, "={{$json}}", x, rowY);
           }else{
-            node = addFunction(wf, title, "return [$json];", x, y);
+            node = addFunction(wf, title, "return [$json];", x, rowY);
           }
           connect(wf, prev, node);
-          const wp = addArrow(wf, "→", x + Math.floor(LAYOUT.stepX/2), y);
+          const wp = addArrow(wf, "→", x + Math.floor(LAYOUT.stepX/2), rowY);
           connect(wf, node, wp);
           prev = wp;
         });
 
-        // ===== Vertical channels under this branch =====
-        const chs = channels.slice(); // copy
+        // vertical channels
+        const chs = channels.slice();
         const chBaseY = rowY - Math.floor(LAYOUT.channelGap * (Math.max(chs.length,1)-1)/2);
         const chStartX = LAYOUT.prodStart.x + (5 + steps.length)*LAYOUT.stepX;
 
-        // Fan-out from prev to each channel "start"
         const channelCollectors = [];
-
         chs.forEach((ch, j) => {
           const cy = chBaseY + j*LAYOUT.channelGap;
 
-          // Channel entry
           const chEnter = addArrow(wf, `Branch → ${ch.toUpperCase()}`, chStartX - Math.floor(LAYOUT.stepX/2), cy);
           connect(wf, prev, chEnter);
 
-          // Compose (channel-personalized)
-          const composeName = GUIDE.numberSteps ? `[${++stepNo}] Compose (${ch.toUpperCase()})` : `Compose (${ch.toUpperCase()})`;
-          const compose = addFunction(wf, composeName, `
+          const compose = addFunction(wf, GUIDE.numberSteps ? `[${++stepNo}] Compose (${ch.toUpperCase()})` : `Compose (${ch.toUpperCase()})`, `
 const m=$json.msg||{};
 const map={ email:m.email?.body, sms:m.sms?.body, whatsapp:m.whatsapp?.body, call:m.call?.script };
 const body= map[${JSON.stringify(ch)}] || m.email?.body || 'Hello!';
 return [{...$json, message: body }];`, chStartX, cy);
           connect(wf, chEnter, compose);
 
-          // Send
-          const sendX = chStartX + LAYOUT.stepX;
-          const senderName = makeSenderNode(wf, ch, sendX, cy, compat, isDemo);
+          const senderName = makeSenderNode(wf, ch, chStartX + LAYOUT.stepX, cy, (opts.compat||'safe'), isDemo);
           connect(wf, compose, senderName);
 
-          // Per-channel follow-up process (horizontally)
-          const afterSend = addArrow(wf, "→", sendX + Math.floor(LAYOUT.stepX/2), cy);
+          const afterSend = addArrow(wf, "→", chStartX + Math.floor(1.5*LAYOUT.stepX), cy);
           connect(wf, senderName, afterSend);
 
-          const wait = addFunction(wf, "Wait / Listen", "return [$json];", sendX + LAYOUT.stepX, cy);
+          const wait = addFunction(wf, "Wait / Listen", "return [$json];", chStartX + 2*LAYOUT.stepX, cy);
           connect(wf, afterSend, wait);
 
-          const route = addIf(wf, "Positive Reply?", "={{$json.reply || ''}}", "notEmpty", "", sendX + 2*LAYOUT.stepX, cy);
+          const route = addIf(wf, "Positive Reply?", "={{$json.reply || ''}}", "notEmpty", "", chStartX + 3*LAYOUT.stepX, cy);
           connect(wf, wait, route);
 
-          // Positive path
-          let posNode = addFunction(wf, "Handle Positive", "return [$json];", sendX + 3*LAYOUT.stepX, cy - 40);
+          let posNode = addFunction(wf, "Handle Positive", "return [$json];", chStartX + 4*LAYOUT.stepX, cy - 40);
           connect(wf, route, posNode, 0);
-          posNode = addHTTP(wf, "Log/Update (OK)", "={{'https://example.com/ok'}}", "={{$json}}", sendX + 4*LAYOUT.stepX, cy - 40);
-          connect(wf, `Handle Positive`, posNode);
+          posNode = addHTTP(wf, "Log/Update (OK)", "={{'https://example.com/ok'}}", "={{$json}}", chStartX + 5*LAYOUT.stepX, cy - 40);
+          connect(wf, "Handle Positive", posNode);
 
-          // Negative/No reply path
-          let negNode = addFunction(wf, "Handle Neutral/No-Reply", "return [$json];", sendX + 3*LAYOUT.stepX, cy + 40);
+          let negNode = addFunction(wf, "Handle Neutral/No-Reply", "return [$json];", chStartX + 4*LAYOUT.stepX, cy + 40);
           connect(wf, route, negNode, 1);
-          negNode = addHTTP(wf, "Log/Update (Retry/Nurture)", "={{'https://example.com/nurture'}}", "={{$json}}", sendX + 4*LAYOUT.stepX, cy + 40);
+          negNode = addHTTP(wf, "Log/Update (Retry/Nurture)", "={{'https://example.com/nurture'}}", "={{$json}}", chStartX + 5*LAYOUT.stepX, cy + 40);
           connect(wf, "Handle Neutral/No-Reply", negNode);
 
-          // Merge paths visually → collector
-          const joinWp = addArrow(wf, "→", sendX + 4.5*LAYOUT.stepX, cy);
+          const joinWp = addArrow(wf, "→", chStartX + 5.5*LAYOUT.stepX, cy);
           connect(wf, posNode, joinWp); connect(wf, negNode, joinWp);
 
-          const chCollector = addCollector(wf, sendX + 5*LAYOUT.stepX, cy);
+          const chCollector = addCollector(wf, chStartX + 6*LAYOUT.stepX, cy);
           connect(wf, joinWp, chCollector);
           channelCollectors.push(chCollector);
         });
 
-        // chain channel collectors so you can follow a single itinerary
         for(let i=0;i<channelCollectors.length-1;i++){ connect(wf, channelCollectors[i], channelCollectors[i+1]); }
         lastNodes.push(channelCollectors[channelCollectors.length-1] || prev);
       });
 
-      // chain branch collectors
       for(let i=0;i<lastNodes.length-1;i++){ connect(wf, lastNodes[i], lastNodes[i+1]); }
       const afterBranch = lastNodes[lastNodes.length-1];
 
-      // Errors row
       if(errors.length){
         const rows = Math.max(branchDefs.length,1);
-        const chRows = Math.max(channels.length,1);
+        const chRows = Math.max((Array.isArray(branchDefs[0]?.channels)?branchDefs[0].channels.length:0) || 1, 1);
         const extraDown = Math.floor((chRows-1)*LAYOUT.channelGap/2);
-        const errY = (baseY + (rows-1)*LAYOUT.branchY + LAYOUT.errorRowYPad) + extraDown;
+        const errY = (LAYOUT.prodStart.y - Math.floor(LAYOUT.branchY*(rows-1)/2) + (rows-1)*LAYOUT.branchY + LAYOUT.errorRowYPad) + extraDown;
 
         const wErr = addArrow(wf, "Branches → Errors", LAYOUT.prodStart.x + 3.6*LAYOUT.stepX, errY);
         connect(wf, afterBranch, wErr);
@@ -518,10 +514,9 @@ return [{...$json, message: body }];`, chStartX, cy);
     });
   }
 
-  // build lanes
   buildLane({ laneLabel:"PRODUCTION LANE", yOffset:0,                    triggerKind:prodTrigger, isDemo:false });
   if(includeDemo){
-    buildLane({ laneLabel:"DEMO LANE (Manual Trigger + Seeded Contacts)", yOffset:LAYOUT.laneGap, triggerKind:'manual',     isDemo:true  });
+    buildLane({ laneLabel:"DEMO LANE (Manual Trigger + Seeded Contacts)", yOffset:LAYOUT.laneGap, triggerKind:'manual', isDemo:true  });
   }
 
   wf.staticData=wf.staticData||{};
@@ -547,7 +542,6 @@ module.exports = async (req,res)=>{
     const includeDemo=body.includeDemo!==false;
 
     const row=await fetchSheetRowByScenarioId(wanted);
-    if(!row) return res.status(404).json({ ok:false, error:`scenario_id not found: ${wanted}` });
 
     const wf=await buildWorkflowFromRow(row,{ compat, includeDemo });
 
@@ -562,6 +556,7 @@ module.exports = async (req,res)=>{
     }
     res.end(JSON.stringify(wf,null,2));
   }catch(err){
+    console.error("api/build error:", err?.message||err);
     res.status(500).json({ ok:false, error:String(err?.message||err) });
   }
 };

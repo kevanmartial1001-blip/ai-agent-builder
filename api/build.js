@@ -1,8 +1,7 @@
 // api/build.js
-// Wide layout, vertical-per-channel branches, strict chronology, fully linked.
-// Adds LLM-driven DECISION steps with explicit outcomes (all paths A→Z).
+// Wide layout, vertical-per-channel branches, strict chronology grid, fully linked.
+// Bigger spacing (no overlap) + full-lane "orange band" scaffolding (FLOW + per-stage columns).
 // For APPOINTMENT_SCHEDULING, auto-builds a canonical chronological flow if LLM is sparse.
-// Uses conservative n8n node versions (every node has link handles).
 // Env: SHEET_ID, GOOGLE_API_KEY, SHEET_TAB?=Scenarios, OPENAI_API_KEY
 
 const HEADERS = {
@@ -12,30 +11,38 @@ const HEADERS = {
   "Content-Type": "application/json; charset=utf-8",
 };
 
-// ====== Layout (more air to prevent overlap) ======
+// ====== Layout (more air; grid stages to avoid stack collisions) ======
 const LAYOUT = {
-  laneGap: 2100,        // ↑ from 1900
-  stepX: 520,           // ↑ from 460 (more horizontal spacing per step)
-  branchY: 520,         // ↑ from 440 (more spacing between branches)
-  channelY: 360,        // ↑ from 280 (more spacing between channels)
-  outcomeRowY: 200,     // ↑ (vertical spacing between decision outcomes)
+  laneGap: 2300,        // more room between PROD and DEMO lanes
+  stepX: 640,           // wider columns so labels never collide
+  branchY: 620,         // more space between branches
+  channelY: 420,        // more space between channels
+  outcomeRowY: 260,     // more space between decision outcomes
   prodHeader: { x: -1520, y: 40 },
   prodStart:  { x: -1380, y: 300 },
   demoHeader: { x: -1520, y: 40 },
   demoStart:  { x: -1380, y: 300 },
-  switchX: -420,        // move branch switch a bit further left so first columns breathe
-  errorRowYPad: 460,    // a bit more room under branches for the error lane
+  switchX: -520,        // push branch switch further left to open the grid
+  errorRowYPad: 520,    // more room for error lane
 };
 
 // Visual guide options
 const GUIDE = { showWaypoints: false, numberSteps: true };
 
-// “Orange band” style hint for your UI renderer: we emit section labels consistently.
-// (n8n JSON cannot color backgrounds; your UI can style these header/section nodes.)
+// “Orange band” hints for your UI renderer (names are stable for styling)
 const ZONE = {
-  FLOW: "FLOW AREA",   // main process band
-  ERR:  "ERROR AREA",  // error band
+  FLOW: "FLOW AREA",
+  ERR:  "ERROR AREA",
 };
+
+// Chronology grid columns (bands across the whole flow)
+const STAGES = [
+  { key: "S1", label: "Stage 1 · Check System" },             // lookups, context load
+  { key: "S2", label: "Stage 2 · Outreach (per channel)" },    // compose/send
+  { key: "S3", label: "Stage 3 · Response Decision" },         // yes / cannot attend, etc.
+  { key: "S4", label: "Stage 4 · Action (confirm/reschedule)" },
+  { key: "S5", label: "Stage 5 · CRM / Calendar Updates" },    // audit trail, reminders
+];
 
 const DEMO = {
   to: "+34613030526",
@@ -126,7 +133,7 @@ async function openaiJSON(prompt, schemaHint){
         temperature:0.35,
         response_format:{type:"json_object"},
         messages:[
-          {role:"system",content:"You are an expert workflow designer for n8n. Exhaustively enumerate decision outcomes. Always return valid JSON."},
+          {role:"system",content:"You are an expert workflow designer for n8n. Exhaustively enumerate decision outcomes. Keep strict chronological order. Always return valid JSON."},
           {role:"user",content:prompt+(schemaHint?("\n\nSchema:\n"+schemaHint):"")}
         ]
       })
@@ -157,7 +164,7 @@ Rules:
 - "branches": ≤6. Each branch is a high-level path.
 - Step kinds: "compose" | "http" | "update" | "route" | "wait" | "score" | "lookup" | "book" | "ticket" | "notify" | "store" | "decision".
 - A "decision" step MUST include exhaustive "outcomes". Each outcome: { "value": string, "steps": Step[] }.
-- Preserve strict chronological order. No ambiguous jumps.
+- Preserve strict chronological order. No ambiguous jumps between stages S1→S5.
 
 Return JSON:
 {
@@ -207,8 +214,14 @@ function connect(wf,from,to,outputIndex=0){ wf.connections[from]??={}; wf.connec
 function withYOffset(wf,yOffset,fn){ const prev=wf.__yOffset||0; wf.__yOffset=yOffset; try{ fn(); } finally{ wf.__yOffset=prev; } }
 
 // Section headers (your UI can render these as “orange bands”)
-function addHeader(wf,label,x,y){ 
+function addHeader(wf,label,x,y){
   return addNode(wf,{ id:uid("label"), name:`=== ${label} ===`, type:"n8n-nodes-base.function", typeVersion:1, position:pos(x,y), parameters:{ functionCode:"return [$json];" } });
+}
+
+// Stage column headers (one per chronology stage; your UI can tint the entire column)
+function addStageHeader(wf,stageLabel,stageIndex,baseX,baseY){
+  const x = baseX + (stageIndex+3) * LAYOUT.stepX; // columns start after Enter node (~4th column)
+  return addHeader(wf, stageLabel, x, baseY - 220); // a bit above rows; UI uses it to paint the column
 }
 
 function addManual(wf,x,y,label="Manual Trigger"){ return addNode(wf,{ id:uid("manual"), name:label, type:"n8n-nodes-base.manualTrigger", typeVersion:1, position:pos(x,y), parameters:{} }); }
@@ -216,9 +229,7 @@ function addCron(wf,label,x,y,compat){ if(compat==="full"){ return addNode(wf,{ 
 function addWebhook(wf,label,x,y,compat){ if(compat==="full"){ return addNode(wf,{ id:uid("webhook"), name:label, type:"n8n-nodes-base.webhook", typeVersion:1, position:pos(x,y), parameters:{ path:uid("hook"), methods:["POST"], responseMode:"onReceived" } }); } return addNode(wf,{ id:uid("webph"), name:`${label} (Placeholder)`, type:"n8n-nodes-base.function", typeVersion:1, position:pos(x,y), parameters:{ functionCode:"return [$json];" } }); }
 function addHTTP(wf,name,urlExpr,bodyExpr,x,y,method="POST"){ return addNode(wf,{ id:uid("http"), name, type:"n8n-nodes-base.httpRequest", typeVersion:3, position:pos(x,y), parameters:{ url:urlExpr, method, jsonParameters:true, sendBody:true, bodyParametersJson:bodyExpr } }); }
 function addFunction(wf,name,code,x,y){ return addNode(wf,{ id:uid("func"), name, type:"n8n-nodes-base.function", typeVersion:1, position:pos(x,y), parameters:{ functionCode:code } }); }
-function addIf(wf,name,left,op,right,x,y){ return addNode(wf,{ id:uid("if"), name, type:"n8n-nodes-base.if", typeVersion:2, position:pos(x,y), parameters:{ conditions:{ number:[], string:[{ value1:left, operation:op, value2:right }] } } }); }
 function addSwitch(wf,name,valueExpr,rules,x,y){ return addNode(wf,{ id:uid("switch"), name, type:"n8n-nodes-base.switch", typeVersion:2, position:pos(x,y), parameters:{ value1:valueExpr, rules } }); }
-function addSplit(wf,x,y,size=20){ return addNode(wf,{ id:uid("split"), name:"Split In Batches", type:"n8n-nodes-base.splitInBatches", typeVersion:1, position:pos(x,y), parameters:{ batchSize:size } }); }
 function addCollector(wf,x,y){ return addFunction(wf,"Collector (Inspect)",`const now=new Date().toISOString(); const arr=Array.isArray(items)?items:[{json:$json}]; return arr.map((it,i)=>({json:{...it.json,__collected_at:now, index:i}}));`,x,y); }
 
 // sender nodes
@@ -283,38 +294,47 @@ function makeMessages(row, archetype, channels){
 
 // ---------- Canonical chronological flow for Appointment Scheduling ----------
 function buildCanonicalSchedulingBranches(channelsIn){
-  // Default channel order per your screenshot text: Phone, SMS, WhatsApp, Email
+  // Desired visible order
   const desired = ['call','sms','whatsapp','email'];
   const channels = desired.filter(c=>channelsIn.includes(c)).concat(channelsIn.filter(c=>!desired.includes(c)));
-  // One branch "Scheduling"
+
   const steps = [
+    // S1
     { name:"Lookup: Upcoming Appointments (PMS/CRM)", kind:"lookup" },
-    { name:"Decision: Do we have an upcoming appointment for this contact?", kind:"decision",
+    // S2
+    { name:"Compose: Multi-channel outreach message", kind:"compose" },
+    // S3
+    { name:"Decision: Client response", kind:"decision",
       outcomes:[
-        { value:"yes_upcoming",
+        { value:"yes_attending",
           steps:[
-            { name:"Compose: Confirmation message with business address & reason", kind:"compose" },
+            // S4
             { name:"Book: Confirm in Calendar", kind:"book" },
-            { name:"Notify: Reminder 2h before appointment", kind:"notify" },
+            { name:"Notify: Reminder 2h before", kind:"notify" },
+            // S5
             { name:"Update: CRM visit status → Confirmed", kind:"update" },
+            { name:"Store: Audit trail", kind:"store" },
           ]
         },
-        { value:"no_or_cannot_attend",
+        { value:"cannot_attend",
           steps:[
+            // S4
             { name:"Lookup: Next available time slots", kind:"lookup" },
-            { name:"Compose: Offer reschedule options (3 choices)", kind:"compose" },
-            { name:"Decision: Client chose a new slot?", kind:"decision",
+            { name:"Compose: Offer 3 reschedule options", kind:"compose" },
+            { name:"Decision: Client picked a new slot?", kind:"decision",
               outcomes:[
                 { value:"reschedule_yes",
                   steps:[
                     { name:"Book: New slot in Calendar", kind:"book" },
-                    { name:"Compose: New confirmation with date/time/address/reason", kind:"compose" },
-                    { name:"Notify: Reminder 2h before new appointment", kind:"notify" },
+                    { name:"Notify: Reminder 2h before (new slot)", kind:"notify" },
+                    // S5
                     { name:"Update: CRM visit status → Rescheduled", kind:"update" },
+                    { name:"Store: Audit trail", kind:"store" },
                   ]
                 },
                 { value:"reschedule_no",
                   steps:[
+                    // S5
                     { name:"Store: Add to follow-up list", kind:"store" },
                     { name:"Update: CRM visit status → Follow-up", kind:"update" },
                   ]
@@ -324,8 +344,7 @@ function buildCanonicalSchedulingBranches(channelsIn){
           ]
         }
       ]
-    },
-    { name:"Store: Audit trail & timeline event", kind:"store" }
+    }
   ];
 
   return {
@@ -370,10 +389,8 @@ async function buildWorkflowFromRow(row, opts){
     if(sparse){
       const built = buildCanonicalSchedulingBranches(channels);
       branches = built.branches;
-      // prefer our channel order
       const wanted = built.channels;
       channels.splice(0, channels.length, ...wanted);
-      // ensure we mark systems needed if missing
       if(!systems.includes('calendar')) systems.push('calendar');
       if(!systems.includes('crm')) systems.push('crm');
       if(!systems.includes('pms')) systems.push('pms');
@@ -391,7 +408,7 @@ async function buildWorkflowFromRow(row, opts){
   // lane builder (prod/demo)
   function buildLane({ laneLabel, yOffset, triggerKind, isDemo }){
     withYOffset(wf, yOffset, () => {
-      // Orange-band style section headers (your UI can style these background bands)
+      // Full-lane orange band header
       addHeader(wf, `${ZONE.FLOW} · ${laneLabel}`, isDemo?LAYOUT.demoHeader.x:LAYOUT.prodHeader.x, isDemo?LAYOUT.demoHeader.y:LAYOUT.prodHeader.y);
 
       let trig;
@@ -429,10 +446,14 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
         connect(wf, cursor, fetch); cursor = fetch;
       }
 
+      // Branch switch
       const sw = addSwitch(wf, "Branch (LLM/Canonical)", "={{$json.__branch || 'main'}}",
         (branches.length?branches:[{name:"main"}]).map(b=>({operation:'equal', value2:String(b.name||'main').slice(0,48)})),
         LAYOUT.switchX, LAYOUT.prodStart.y);
       connect(wf, cursor, sw);
+
+      // Draw chronology stage headers (columns) once per lane (your UI can paint the whole column in orange)
+      STAGES.forEach((s, i)=> addStageHeader(wf, s.label, i, LAYOUT.prodStart.x, LAYOUT.prodStart.y));
 
       // VERTICAL CHANNELS PER BRANCH with DECISION support (extra spacing)
       let lastCollectorOfLastBranch = null;
@@ -464,14 +485,17 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
 
           for (let k=0; k<steps.length; k++){
             const st = steps[k];
-            const x = LAYOUT.prodStart.x + (5+k)*LAYOUT.stepX;
+            // Snap steps to stage columns S1..S5 for a clean chronology grid
+            const columnOffset = Math.min(k+5, 5+5); // after Enter (~col 5), keep pushing right
+            const x = LAYOUT.prodStart.x + columnOffset * LAYOUT.stepX;
+
             const title = GUIDE.numberSteps ? `[${++stepNo}] ${st.name||'Step'}` : (st.name||'Step');
             const kind=String(st.kind||'').toLowerCase();
 
             if(kind==='decision' && Array.isArray(st.outcomes) && st.outcomes.length){
-              // Decision: fan out lanes per outcome with more vertical spacing
-              const rulz = st.outcomes.map(o=>({operation:'equal', value2:String(o.value||'outcome').slice(0,64)}));
-              const dSwitch = addSwitch(wf, `${title} (Decision)`, "={{$json.__decision || 'default'}}", rulz, x, rowY);
+              const dSwitch = addSwitch(wf, `${title} (Decision)`, "={{$json.__decision || 'default'}}",
+                st.outcomes.map(o=>({operation:'equal', value2:String(o.value||'outcome').slice(0,64)})),
+                x, rowY);
               connect(wf, prev, dSwitch);
 
               let lastOutcomeCollector = null;
@@ -479,13 +503,13 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
                 const oy = rowY - (Math.floor((st.outcomes.length-1)/2)*LAYOUT.outcomeRowY) + (oIdx*LAYOUT.outcomeRowY);
                 const oEnter = addFunction(wf, `[${stepNo}.${oIdx+1}] Outcome: ${o.value||'path'}`,
                   `return [{...$json,__decision:${JSON.stringify(String(o.value||'path'))}}];`,
-                  x + Math.floor(LAYOUT.stepX*0.6), oy);
+                  x + Math.floor(LAYOUT.stepX*0.7), oy);
                 connect(wf, dSwitch, oEnter, oIdx);
 
                 let oPrev = oEnter;
                 const oSteps = Array.isArray(o.steps)?o.steps:[];
                 oSteps.forEach((os, ok)=>{
-                  const ox = x + (ok+1)*Math.floor(LAYOUT.stepX*0.85);
+                  const ox = x + (ok+2)*Math.floor(LAYOUT.stepX*0.9);
                   const ot = `[${stepNo}.${oIdx+1}.${ok+1}] ${os.name||'Step'}`;
                   const okind = String(os.kind||'').toLowerCase();
                   let node;
@@ -495,14 +519,11 @@ const ch=${JSON.stringify(ch)};
 const m=$json.msg||{};
 const bodies={ email:(m.email?.body)||'', sms:(m.sms?.body)||'', whatsapp:(m.whatsapp?.body)||'', call:(m.call?.script)||''};
 return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, ox, oy);
-                  } else if(['http','update','store','notify','route','lookup'].includes(okind)){
-                    node = addHTTP(wf, ot, "={{'https://example.com/step'}}", "={{$json}}", ox, oy);
-                  } else if(okind==='book'){
-                    node = addHTTP(wf, ot, `={{'${DEFAULT_HTTP.calendar_book}'}}`, "={{$json}}", ox, oy);
-                  } else if(okind==='ticket'){
-                    node = addHTTP(wf, ot, `={{'${DEFAULT_HTTP.ticket_create}'}}`, "={{$json}}", ox, oy);
-                  } else if(okind==='wait'){
-                    node = addFunction(wf, ot, "return [$json];", ox, oy);
+                  } else if(['http','update','store','notify','route','lookup','book','ticket','wait'].includes(okind)){
+                    const url = okind==='book' ? `{{'${DEFAULT_HTTP.calendar_book}'}}`
+                              : okind==='ticket' ? `{{'${DEFAULT_HTTP.ticket_create}'}}`
+                              : "{{'https://example.com/step'}}";
+                    node = addHTTP(wf, ot, "="+url, "={{$json}}", ox, oy);
                   } else {
                     node = addFunction(wf, ot, "return [$json];", ox, oy);
                   }
@@ -510,20 +531,19 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, ox, oy);
                   oPrev = node;
                 });
 
-                // Sender & collector for this outcome
-                const sendX = x + Math.floor(LAYOUT.stepX*0.85) + (Math.max(oSteps.length,0)+1)*Math.floor(LAYOUT.stepX*0.85);
+                const sendX = x + Math.floor(LAYOUT.stepX*0.9) + (Math.max(oSteps.length,0)+2)*Math.floor(LAYOUT.stepX*0.9);
                 const sender = makeSenderNode(wf, ch, sendX, oy, compat, isDemo);
                 try{ wf.nodes[wf.nodes.findIndex(n=>n.name===sender)].name = `[${stepNo}.${oIdx+1}] Send: ${ch.toUpperCase()}`; }catch{}
                 connect(wf, oPrev, sender);
 
-                const oCollector = addCollector(wf, sendX + Math.floor(LAYOUT.stepX*0.7), oy);
+                const oCollector = addCollector(wf, sendX + Math.floor(LAYOUT.stepX*0.8), oy);
                 connect(wf, sender, oCollector);
 
                 if (lastOutcomeCollector) connect(wf, lastOutcomeCollector, oCollector);
                 lastOutcomeCollector = oCollector;
               });
 
-              prev = lastOutcomeCollector; // continue after decision fan-in
+              prev = lastOutcomeCollector;
               continue;
             }
 
@@ -542,9 +562,7 @@ return [{...m, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
               node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.calendar_book}'}}`, "={{$json}}", x, rowY);
             } else if(kind==='ticket'){
               node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.ticket_create}'}}`, "={{$json}}", x, rowY);
-            } else if(kind==='wait'){
-              node = addFunction(wf, title, "return [$json];", x, rowY);
-            } else{
+            } else {
               node = addFunction(wf, title, "return [$json];", x, rowY);
             }
             connect(wf, prev, node);
@@ -554,18 +572,17 @@ return [{...m, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
           // Send + collect when last step was NOT a decision
           const lastIsDecision = steps.some(s=>String(s.kind||'').toLowerCase()==='decision');
           if(!lastIsDecision){
-            const sendX = LAYOUT.prodStart.x + (5 + steps.length)*LAYOUT.stepX;
+            const sendX = LAYOUT.prodStart.x + (5 + Math.max(steps.length,3)) * LAYOUT.stepX;
             const sendTitle = GUIDE.numberSteps ? `[${++stepNo}] Send: ${ch.toUpperCase()}` : `Send: ${ch.toUpperCase()}`;
             const sender = makeSenderNode(wf, ch, sendX, rowY, compat, isDemo);
             try{ wf.nodes[wf.nodes.findIndex(n=>n.name===sender)].name = sendTitle; }catch{}
             connect(wf, prev, sender);
-            const collector = addCollector(wf, sendX + LAYOUT.stepX, rowY);
+            const collector = addCollector(wf, sendX + Math.floor(LAYOUT.stepX*0.9), rowY);
             connect(wf, sender, collector);
             if (prevChannelCollector) connect(wf, prevChannelCollector, collector);
             prevChannelCollector = collector;
           }
 
-          // Remember last collector of the whole branch for error row
           if (bIdx === (Math.max(branches.length,1)-1) && chIdx === (chCount-1)) {
             lastCollectorOfLastBranch = prevChannelCollector;
           }
@@ -577,7 +594,7 @@ return [{...m, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
         const errY = bottomOfBranches + LAYOUT.errorRowYPad;
 
         // Error “orange band”
-        addHeader(wf, `${ZONE.ERR} · ${laneLabel}`, LAYOUT.prodStart.x + 3*LAYOUT.stepX, errY - 120);
+        addHeader(wf, `${ZONE.ERR} · ${laneLabel}`, LAYOUT.prodStart.x + 3*LAYOUT.stepX, errY - 160);
 
         let prev = addFunction(wf, "Error Monitor (LLM List)", "return [$json];", LAYOUT.prodStart.x + 4*LAYOUT.stepX, errY);
         connect(wf, lastCollectorOfLastBranch, prev);
@@ -600,11 +617,12 @@ return [{...m, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
   }
 
   wf.staticData=wf.staticData||{};
-  wf.staticData.__design={ 
+  wf.staticData.__design={
     archetype, prodTrigger, channels, systems, branches, errors,
     guide: GUIDE,
     layout: { verticalChannels: true, decisions: "switch+lanes", spacing: LAYOUT },
-    zones: ZONE
+    zones: ZONE,
+    stages: STAGES
   };
 
   return sanitizeWorkflow(wf);

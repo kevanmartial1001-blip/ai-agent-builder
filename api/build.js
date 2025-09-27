@@ -313,7 +313,6 @@ async function buildWorkflowFromRow(row, opts){
     const allowed=['email','sms','whatsapp','call'];
     const llmCh=design.channels.map(c=>String(c).toLowerCase()).filter(c=>allowed.includes(c));
     if(llmCh.length){
-      // remap to our visual stack order
       const uniq=[...new Set(llmCh)];
       uniq.sort((a,b)=>visualOrder.indexOf(a)-visualOrder.indexOf(b));
       channels.splice(0,channels.length,...uniq);
@@ -515,8 +514,10 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
   return sanitizeWorkflow(wf);
 }
 
-// ---------- HTTP handler ----------
-module.exports = async (req,res)=>{
+// ─────────────────────────────────────────────────────────────
+// Serverless HTTP handler (Node.js runtime forced)
+// ─────────────────────────────────────────────────────────────
+async function handler(req, res) {
   Object.entries(HEADERS).forEach(([k,v])=>res.setHeader(k,v));
   if(req.method==="OPTIONS") return res.status(204).end();
 
@@ -543,4 +544,10 @@ module.exports = async (req,res)=>{
   }catch(err){
     res.status(500).json({ ok:false, error:String(err?.message||err) });
   }
-};
+}
+
+// Exports (force Node.js serverless runtime on Vercel)
+module.exports = handler;
+module.exports.config = { runtime: 'nodejs20.x' };
+try { exports.default = handler; } catch {}
+try { exports.config = { runtime: 'nodejs20.x' }; } catch {}

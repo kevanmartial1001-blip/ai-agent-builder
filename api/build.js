@@ -1,12 +1,9 @@
 // api/build.js
-// Wide layout, vertical-per-channel branches, strict chronology, fully linked.
-// Adds a visible "spine" using Junction nodes placed **after** each step
-// (e.g., Junction [2] between Step [2] and Step [3]).
-// For decisions, adds per-outcome junctions (Junction [N: outcome]) that fan-in
-// to a main Junction [N] on the branch spine. All paths are explicit (A→Z).
-// Includes a light anti-overlap nudge so nodes never sit on top of each other.
-// Uses conservative n8n node versions (every node has link handles).
-// Env: SHEET_ID, GOOGLE_API_KEY, SHEET_TAB?=Scenarios, OPENAI_API_KEY
+// Wide layout, vertical-per-channel branches, strict chronology, fully linked end-to-end.
+// Step-1 is fixed: Webhook → Init Context → Fetch Upcoming (PMS) → Branch.
+// Adds Junctions AFTER steps (spine) so chronology is visually obvious.
+// Universal prompt + universal fallback so any scenario becomes a clean A→Z plan.
+// Uses conservative n8n node versions. Env: SHEET_ID, GOOGLE_API_KEY, SHEET_TAB?=Scenarios, OPENAI_API_KEY
 
 const HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -35,9 +32,10 @@ const LAYOUT = {
 // Visual guide options
 const GUIDE = { showWaypoints: false, numberSteps: true };
 
-// “Orange band” style hint for your UI renderer
+// Bands (your UI can color these)
 const ZONE = { FLOW: "FLOW AREA", ERR: "ERROR AREA" };
 
+// Demo seed
 const DEMO = {
   to: "+34613030526",
   emailTo: "kevanm.spain@gmail.com",
@@ -46,11 +44,18 @@ const DEMO = {
   callFrom: "+13412184164",
 };
 
+// Default endpoints (replace with real ones later)
 const DEFAULT_HTTP = {
   pms_upcoming: "https://example.com/pms/upcoming",
   ticket_create: "https://example.com/ticket/create",
   calendar_book: "https://example.com/calendar/book",
 };
+
+// —— Universal scaffolding for any scenario ——
+const UNIVERSAL_STEP_KINDS = [
+  "compose","http","update","store","notify","route","wait","score","lookup","book","ticket","decision","send"
+];
+const OUTCOME_VOCAB = ["yes","no","reschedule_yes","reschedule_no","unknown","timeout","invalid","error"];
 
 // ====== Archetypes & rules ======
 const ARCH_RULES = [
@@ -149,31 +154,49 @@ function makeDesignerPrompt(row){
     `RISK_NOTES: ${row.risk_notes||''}`,
     `TAGS: ${row["tags (;)"]||row.tags||''}`,
   ].join("\n");
+
+  const stepKinds = UNIVERSAL_STEP_KINDS.join("|");
+  const outcomes = OUTCOME_VOCAB.join(" | ");
+
   return `
-Design a bullet-proof n8n workflow and enumerate ALL realistic outcomes using industry knowledge + context (TRIGGERS/BEST_REPLY_SHAPES/RISK_NOTES/ROI_HYPOTHESIS).
+Design a UNIVERSAL, strictly chronological n8n workflow that will import cleanly and read well.
+Do not include vendor-specific nodes; use semantic kinds only.
 
-Rules:
-- "trigger": one of ["cron","webhook","imap","manual"].
-- "channels": ordered subset of ["email","sms","whatsapp","call"].
-- "branches": ≤6. Each branch is a high-level path.
-- Step kinds: "compose" | "http" | "update" | "route" | "wait" | "score" | "lookup" | "book" | "ticket" | "notify" | "store" | "decision".
-- A "decision" step MUST include exhaustive "outcomes". Each outcome: { "value": string, "steps": Step[] }.
-- Preserve strict chronological order. No ambiguous jumps.
+Hard rules:
+- The initial four nodes are FIXED and **not part of your output**:
+  1) Webhook (from LLM) → 2) Init Context (PROD) → 3) Fetch Upcoming (PMS) → 4) Branch (LLM/Canonical)
+- From Step 2 onward (inside each branch/channel), produce a compact flow (2–6 steps before send).
+- Enforce per-channel lanes (subset of: email, sms, whatsapp, call) and strict left→right chronology.
+- Decisions must enumerate **all realistic outcomes** using: [ ${outcomes} ] — only those that apply.
+- Do NOT emit any "junction" or "merge" nodes; just steps and outcomes (we add visuals later).
+- Use only these step kinds: ${stepKinds}
+  (Note: "send" is conceptual; the builder will place channel senders.)
 
-Return JSON:
+Return **valid JSON** with this schema:
 {
-  "archetype": "...",
+  "archetype": "string",
   "trigger": "cron|webhook|imap|manual",
   "channels": ["email","sms","whatsapp","call"],
   "branches": [
-    { "name":"...", "condition":"...", "steps":[
-        { "name":"...", "kind":"compose|http|update|route|wait|score|lookup|book|ticket|notify|store" },
-        { "name":"...", "kind":"decision", "outcomes":[
-          { "value":"...", "steps":[{ "name":"...","kind":"..." }, ...] }, ...
-        ] }
-    ] }
+    {
+      "name": "string",
+      "condition": "string",
+      "steps": [
+        { "name": "string", "kind": "compose|http|update|store|notify|route|wait|score|lookup|book|ticket" },
+        { "name": "string", "kind": "decision",
+          "outcomes": [
+            { "value": "string",
+              "steps": [
+                { "name": "string", "kind": "compose|http|update|store|notify|route|wait|score|lookup|book|ticket" },
+                { "name": "string", "kind": "send" }
+              ]
+            }
+          ]
+        }
+      ]
+    }
   ],
-  "errors": [{ "name":"...", "mitigation":"..." }],
+  "errors": [{ "name": "string", "mitigation": "short text" }],
   "systems": ["pms","crm","calendar","kb","twilio","email"]
 }
 
@@ -193,7 +216,7 @@ function makeMessagingPrompt(row, archetype, channels){
   ].join("\n");
   return `
 Write concise outreach content for ${JSON.stringify(channels)} for archetype ${archetype}.
-No IVR "press 1". 3–6 short lines each.
+No IVR "press 1". 3–6 short lines each. Keep wording scenario-appropriate.
 
 Return JSON: { "email": { "subject":"...", "body":"..." }, "sms": {"body":"..."}, "whatsapp":{"body":"..."}, "call":{"script":"..."} }
 
@@ -204,25 +227,18 @@ ${ctx}`;
 // ---------- workflow primitives (known versions) ----------
 function baseWorkflow(name){ return { name, nodes:[], connections:{}, active:false, settings:{}, staticData:{}, __yOffset:0, __junctions:{} }; }
 
-// ensure unique names BEFORE inserting (prevents breaking connections later)
 function uniqueName(wf, base){
   const existing = new Set((wf.nodes||[]).map(n=>String(n.name||'').toLowerCase()));
   if(!base || typeof base!=='string') base = 'Node';
-  let name = base;
-  let i = 1;
-  while(existing.has(name.toLowerCase())){
-    i += 1;
-    name = `${base} #${i}`;
-  }
+  let name = base, i = 1;
+  while(existing.has(name.toLowerCase())){ i += 1; name = `${base} #${i}`; }
   return name;
 }
 
-// --- anti-overlap nudge (visual only, no logic impact) ---
+// anti-overlap nudge (visual only)
 function nudgeIfOverlapping(wf, x, y){
-  const EPS = 64;        // “too close” box (px)
-  const STEP = 72;       // move-down amount if collision (px)
+  const EPS = 64, STEP = 72;
   let yy = y;
-  // Try up to 50 nudges to find a free slot (extremely unlikely to loop that much)
   for(let i=0;i<50;i++){
     const hit = (wf.nodes||[]).some(n=>{
       if(!Array.isArray(n.position)) return false;
@@ -238,7 +254,6 @@ function nudgeIfOverlapping(wf, x, y){
 function addNode(wf,node){
   node.name = uniqueName(wf, node.name);
   if(Array.isArray(node.position)){
-    // Apply lane y-offset then anti-overlap nudge
     const x = node.position[0];
     const y = node.position[1] + (wf.__yOffset||0);
     const yy = nudgeIfOverlapping(wf, x, y);
@@ -257,7 +272,7 @@ function connect(wf,from,to,outputIndex=0){
 
 function withYOffset(wf,yOffset,fn){ const prev=wf.__yOffset||0; wf.__yOffset=yOffset; try{ fn(); } finally{ wf.__yOffset=prev; } }
 
-// Section headers (your UI can render these as “orange bands”)
+// Headers (for orange bands)
 function addHeader(wf,label,x,y){
   return addNode(wf,{ id:uid("label"), name:`=== ${label} ===`, type:"n8n-nodes-base.function", typeVersion:1, position:pos(x,y), parameters:{ functionCode:"return [$json];" } });
 }
@@ -280,7 +295,6 @@ function addJunction(wf, key, label, x, centerY){
   wf.__junctions[key][label] = name;
   return name;
 }
-// Per-outcome junction (for scenario organization)
 function addOutcomeJunction(wf, key, label, outcome, x, y){
   const full = `${label}:${outcome}`;
   wf.__junctions[key] = wf.__junctions[key] || {};
@@ -366,12 +380,13 @@ function buildCanonicalSchedulingBranches(channelsIn){
     { name:"Lookup: Upcoming Appointments (PMS/CRM)", kind:"lookup" },
     { name:"Decision: Do we have an upcoming appointment for this contact?", kind:"decision",
       outcomes:[
-        { value:"yes_upcoming",
+        { value:"yes",
           steps:[
-            { name:"Compose: Confirmation message with business address & reason", kind:"compose" },
+            { name:"Compose: Confirmation (address + reason)", kind:"compose" },
             { name:"Book: Confirm in Calendar", kind:"book" },
             { name:"Notify: Reminder 2h before appointment", kind:"notify" },
-            { name:"Update: CRM visit status → Confirmed", kind:"update" },
+            { name:"Update: CRM status → Confirmed", kind:"update" },
+            { name:"Send confirmation", kind:"send" }
           ]
         },
         { value:"no_or_cannot_attend",
@@ -383,15 +398,17 @@ function buildCanonicalSchedulingBranches(channelsIn){
                 { value:"reschedule_yes",
                   steps:[
                     { name:"Book: New slot in Calendar", kind:"book" },
-                    { name:"Compose: New confirmation with date/time/address/reason", kind:"compose" },
+                    { name:"Compose: New confirmation", kind:"compose" },
                     { name:"Notify: Reminder 2h before new appointment", kind:"notify" },
-                    { name:"Update: CRM visit status → Rescheduled", kind:"update" },
+                    { name:"Update: CRM status → Rescheduled", kind:"update" },
+                    { name:"Send reschedule confirmation", kind:"send" }
                   ]
                 },
                 { value:"reschedule_no",
                   steps:[
                     { name:"Store: Add to follow-up list", kind:"store" },
-                    { name:"Update: CRM visit status → Follow-up", kind:"update" },
+                    { name:"Update: CRM status → Follow-up", kind:"update" },
+                    { name:"Send follow-up acknowledgement", kind:"send" }
                   ]
                 }
               ]
@@ -406,6 +423,52 @@ function buildCanonicalSchedulingBranches(channelsIn){
   return {
     channels,
     branches: [{ name:"Scheduling", condition:"All scheduling cases", steps }]
+  };
+}
+
+// ---------- Universal fallback (any archetype) ----------
+function buildUniversalFallback(archetype, channelsIn){
+  const desired = ['call','sms','whatsapp','email'];
+  const channels = desired.filter(c=>channelsIn.includes(c)).concat(channelsIn.filter(c=>!desired.includes(c)));
+
+  const steps = [
+    { name:"Lookup: Current context / records", kind:"lookup" },
+    { name:"Compose: First outbound (purpose + next action)", kind:"compose" },
+    { name:"Decision: Customer intent / System status", kind:"decision",
+      outcomes:[
+        { value:"yes",
+          steps:[
+            { name:"Update: Primary system state", kind:"update" },
+            { name:"Notify: Confirmation / next steps", kind:"notify" },
+            { name:"Send: confirmation", kind:"send" }
+          ]
+        },
+        { value:"no",
+          steps:[
+            { name:"Store: Follow-up queue", kind:"store" },
+            { name:"Notify: Acknowledgement", kind:"notify" },
+            { name:"Send: acknowledgement", kind:"send" }
+          ]
+        },
+        { value:"unknown",
+          steps:[
+            { name:"Compose: Clarifying question", kind:"compose" },
+            { name:"Send: clarification request", kind:"send" }
+          ]
+        },
+        { value:"timeout",
+          steps:[
+            { name:"Route: Alternate channel or escalation", kind:"route" },
+            { name:"Send: escalation notice", kind:"send" }
+          ]
+        }
+      ]
+    }
+  ];
+
+  return {
+    channels,
+    branches: [{ name: archetype || "Main", condition: "All cases", steps }]
   };
 }
 
@@ -439,20 +502,22 @@ async function buildWorkflowFromRow(row, opts){
   let systems=Array.isArray(design.systems)?design.systems.map(s=>String(s).toLowerCase()):[];
   let branches=Array.isArray(design.branches)?design.branches:[];
 
-  // Enforce strict chronological flow for APPOINTMENT_SCHEDULING if LLM is empty/sparse
-  if(archetype==='APPOINTMENT_SCHEDULING'){
-    const sparse = !branches.length || !branches.some(b=>Array.isArray(b.steps)&&b.steps.length);
-    if(sparse){
-      const built = buildCanonicalSchedulingBranches(channels);
-      branches = built.branches;
-      const wanted = built.channels;
-      channels.splice(0, channels.length, ...wanted);
-      if(!systems.includes('calendar')) systems.push('calendar');
-      if(!systems.includes('crm')) systems.push('crm');
-      if(!systems.includes('pms')) systems.push('pms');
-      if(!systems.includes('email')) systems.push('email');
-      if(!systems.includes('twilio')) systems.push('twilio');
-    }
+  // Prefer LLM design; if sparse, synthesize a sane chronological plan
+  const noSteps = (arr)=>!arr || !arr.some(b=>Array.isArray(b.steps)&&b.steps.length);
+
+  if(archetype==='APPOINTMENT_SCHEDULING' && noSteps(branches)){
+    const built = buildCanonicalSchedulingBranches(channels);
+    branches = built.branches;
+    channels.splice(0, channels.length, ...built.channels);
+    if(!systems.includes('calendar')) systems.push('calendar');
+    if(!systems.includes('crm')) systems.push('crm');
+    if(!systems.includes('pms')) systems.push('pms');
+    if(!systems.includes('email')) systems.push('email');
+    if(!systems.includes('twilio')) systems.push('twilio');
+  } else if (noSteps(branches)) {
+    const builtU = buildUniversalFallback(archetype, channels);
+    branches = builtU.branches;
+    channels.splice(0, channels.length, ...builtU.channels);
   }
 
   const errors=Array.isArray(design.errors)?design.errors:[];
@@ -513,7 +578,7 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
 
       (branches.length?branches:[{name:"main",steps:[]}]).forEach((b, bIdx)=>{
         const branchTopY = baseBranchY + bIdx*LAYOUT.branchY;
-        const branchCenterY = branchTopY; // centerline for main junctions
+        const branchCenterY = branchTopY;
         const junctionKey = `branch_${bIdx}_${laneLabel}`;
 
         const chCount = Math.max(channels.length,1);
@@ -544,12 +609,11 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
             const title = GUIDE.numberSteps ? `[${++stepNo}] ${st.name||'Step'}` : (st.name||'Step');
             const kind=String(st.kind||'').toLowerCase();
 
-            // Junction sits AFTER the step, before next column, on the spine:
+            // Junction sits AFTER the step, on the spine:
             const jx = x + Math.floor(LAYOUT.stepX * LAYOUT.junctionXOffset);
             const mainJunction = addJunction(wf, junctionKey, `${stepNo}`, jx, branchCenterY);
 
             if(kind==='decision' && Array.isArray(st.outcomes) && st.outcomes.length){
-              // Decision node
               const rulz = st.outcomes.map(o=>({operation:'equal', value2:String(o.value||'outcome').slice(0,64)}));
               const dSwitch = addSwitch(wf, `${title} (Decision)`, "={{$json.__decision || 'default'}}", rulz, x, rowY);
               connect(wf, prev, dSwitch);
@@ -560,7 +624,6 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
                 const outcomeValue = String(o.value||'path');
                 const oy = rowY - (Math.floor((st.outcomes.length-1)/2)*LAYOUT.outcomeRowY) + (oIdx*LAYOUT.outcomeRowY);
 
-                // Mark which outcome we’re on
                 const oEnter = addFunction(wf, `[${stepNo}.${oIdx+1}] Outcome: ${outcomeValue}`,
                   `return [{...$json,__decision:${JSON.stringify(outcomeValue)}}];`,
                   x + Math.floor(LAYOUT.stepX*0.6), oy);
@@ -603,21 +666,15 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, ox, oy);
                 const oCollector = addCollector(wf, sendX + Math.floor(LAYOUT.stepX*0.9), oy);
                 connect(wf, sender, oCollector);
 
-                // Per-outcome junction to organize scenarios (placed near outcome row)
-                const outcomeJ = addOutcomeJunction(
-                  wf, junctionKey, `${stepNo}`, outcomeValue,
-                  jx, oy
-                );
+                // Per-outcome junction → main junction [stepNo]
+                const outcomeJ = addOutcomeJunction(wf, junctionKey, `${stepNo}`, outcomeValue, jx, oy);
                 connect(wf, oCollector, outcomeJ);
-
-                // Fan-in: outcome junction → main junction [stepNo] on the spine
                 connect(wf, outcomeJ, mainJunction);
 
                 if (lastOutcomeCollector) connect(wf, lastOutcomeCollector, oCollector);
                 lastOutcomeCollector = oCollector;
               });
 
-              // Continue from the main junction (so next column clearly follows)
               prev = mainJunction;
               continue;
             }
@@ -642,15 +699,12 @@ return [{...m, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
             } else{
               node = addFunction(wf, title, "return [$json];", x, rowY);
             }
-            // Step → (sender/collector later if last) → Junction [stepNo] on spine
             connect(wf, prev, node);
-            connect(wf, node, mainJunction);
-
-            // Next step starts from the main junction
+            connect(wf, node, mainJunction); // step → spine
             prev = mainJunction;
           }
 
-          // Send + collect when last step was NOT a decision (push further right)
+          // Send + collect when last step was NOT a decision
           const lastIsDecision = steps.some(s=>String(s.kind||'').toLowerCase()==='decision');
           if(!lastIsDecision){
             const sendX = LAYOUT.prodStart.x + (5 + steps.length)*LAYOUT.stepX + Math.floor(LAYOUT.stepX*0.4);
@@ -664,7 +718,7 @@ return [{...m, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
             prevChannelCollector = collector;
           }
 
-          // Remember last collector for error row
+          // Track last collector across whole branch
           if (bIdx === (Math.max(branches.length,1)-1) && chIdx === (chCount-1)) {
             lastCollectorOfLastBranch = prevChannelCollector;
           }
@@ -675,7 +729,6 @@ return [{...m, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
         const bottomOfBranches = baseBranchY + (Math.max(branches.length,1)-1)*LAYOUT.branchY;
         const errY = bottomOfBranches + LAYOUT.errorRowYPad;
 
-        // Error band
         addHeader(wf, `${ZONE.ERR} · ${laneLabel}`, LAYOUT.prodStart.x + 3*LAYOUT.stepX, errY - 120);
 
         let prev = addFunction(wf, "Error Monitor (LLM List)", "return [$json];", LAYOUT.prodStart.x + 4*LAYOUT.stepX, errY);
@@ -692,7 +745,7 @@ return [{...m, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
     });
   }
 
-  // build lanes
+  // build lanes (PROD first, DEMO second)
   buildLane({ laneLabel:"PRODUCTION LANE", yOffset:0, triggerKind:prodTrigger, isDemo:false });
   if(includeDemo){
     buildLane({ laneLabel:"DEMO LANE (Manual Trigger + Seeded Contacts)", yOffset:LAYOUT.laneGap, triggerKind:'manual', isDemo:true });
@@ -709,7 +762,7 @@ return [{...m, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
   return sanitizeWorkflow(wf);
 }
 
-// ---------- HTTP handler (unchanged signature) ----------
+// ---------- HTTP handler ----------
 module.exports = async (req,res)=>{
   Object.entries(HEADERS).forEach(([k,v])=>res.setHeader(k,v));
   if(req.method==="OPTIONS") return res.status(204).end();
@@ -739,5 +792,5 @@ module.exports = async (req,res)=>{
   }
 };
 
-// Force Node runtime on Vercel (same as before)
+// Force Node runtime on Vercel
 module.exports.config = { runtime: 'nodejs20.x' };

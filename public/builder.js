@@ -1,1513 +1,506 @@
 // public/builder.js
-// Two lanes per workflow: PRODUCTION (top) + DEMO (bottom), no overlap.
-// Demo lane uses Manual Trigger + seeded test contacts; Prod lane uses real signal trigger.
-// Archetype-aware message composer (uses scenario.* + context from 4 columns + optional LLM plan).
-// Import-safe: all If/Switch rule values are stringified to avoid n8n "toLowerCase" errors.
-// Deep planning pipeline: Plan (LLM/local) → Adopt → Validate → Fallback.
-// Attach global: window.Builder = { buildWorkflowJSON }
+// Minimal but expressive builder:
+// - One clean lane, left→right chronology
+// - "Communication (Stage)" before per-channel fan-out
+// - Vertical per-channel rows; each row is fully chained A→Z (no junction nodes)
+// - Personalization from scenario/industry fields with short, channel-aware copy
+// - Safe client-side (HTTP placeholders), import-safe Switch/If values coerced to strings
+// Exposes: window.Builder.buildWorkflowJSON(s, industry, { selectedChannel, forcePresentation, compat:'safe|full' })
 
-(function () {
+(function(){
   "use strict";
 
-  // ---------------- basics ----------------
-  const QS = new URLSearchParams(location.search);
-  const compat = (QS.get("compat") || "safe").toLowerCase() === "full" ? "full" : "safe";
-  const planDepthQS = (QS.get("plan") || "deep").toLowerCase(); // 'deep' | 'fast'
-  const uid = (p) => `${p}_${Math.random().toString(36).slice(2, 10)}`;
-  const pos = (x, y) => [x, y];
-  const listify = (v) =>
-    Array.isArray(v)
-      ? v.map((x) => String(x).trim()).filter(Boolean)
-      : String(v || "")
-          .split(/[;,\n|]+/)
-          .map((x) => x.trim())
-          .filter(Boolean);
+  // ---------- Layout (spacious but compact numbers) ----------
+  const LAYOUT = {
+    stepX: 640,          // horizontal spacing between columns
+    channelY: 460,       // spacing between channels (vertical rows)
+    outcomeRowY: 340,    // spacing between decision outcomes
+    header: { x: -1600, y: 40 },
+    start:  { x: -1460, y: 300 },
+    switchX: -820
+  };
 
-  function baseWorkflow(name) {
-    return { name, nodes: [], connections: {}, active: false, settings: {}, staticData: {}, __yOffset: 0 };
+  // ---------- Simple guide ----------
+  const GUIDE = { numberSteps: true };
+
+  // ---------- Defaults for placeholder HTTP nodes ----------
+  const DEFAULT_HTTP = {
+    pms_upcoming: "https://example.com/pms/upcoming",
+    ticket_create: "https://example.com/ticket/create",
+    calendar_book: "https://example.com/calendar/book",
+    step_generic: "https://example.com/step"
+  };
+
+  // ---------- Archetype rules (compact) ----------
+  const ARCH_RULES = [
+    { a:'APPOINTMENT_SCHEDULING', rx:/(appointment|appointments|scheduling|no[-_ ]?show|calendar)/i },
+    { a:'CUSTOMER_SUPPORT_INTAKE', rx:/\b(cs|support|helpdesk|ticket|sla|triage|escalation|deflection|kb)\b/i },
+    { a:'FEEDBACK_NPS', rx:/\b(nps|survey|surveys|feedback|csat|ces)\b/i },
+    { a:'KNOWLEDGEBASE_FAQ', rx:/\b(kb|faq|knowledge|self-?service)\b/i },
+    { a:'SALES_OUTREACH', rx:/\b(sales|outreach|cadence|sequence|abm|prospect|cold[-_ ]?email)\b/i },
+    { a:'LEAD_QUAL_INBOUND', rx:/\b(inbound|lead[-_ ]?qual|qualification|routing|router|forms?)\b/i },
+    { a:'CHURN_WINBACK', rx:/\b(churn|win[-_ ]?back|reactivation|retention|loyalty)\b/i },
+    { a:'RENEWALS_CSM', rx:/\b(renewal|qbr|success|csm|upsell|cross-?sell)\b/i },
+    { a:'AR_FOLLOWUP', rx:/\b(a\/?r|accounts?\s*receivable|invoice|collections?|dso|reconciliation)\b/i },
+    { a:'AP_AUTOMATION', rx:/\b(a\/?p|accounts?\s*payable|invoices?|3[-\s]?way|three[-\s]?way|matching|approvals?)\b/i },
+    { a:'INVENTORY_MONITOR', rx:/\b(inventory|stock|sku|threshold|warehouse|3pl|wms|backorder)\b/i },
+    { a:'REPLENISHMENT_PO', rx:/\b(replenishment|purchase[-_ ]?order|po|procure|procurement|vendors?|suppliers?)\b/i },
+    { a:'FIELD_SERVICE_DISPATCH', rx:/\b(dispatch|work[-_ ]?orders?|technicians?|field|geo|eta|route|yard)\b/i },
+    { a:'COMPLIANCE_AUDIT', rx:/\b(compliance|audit|audits|policy|governance|sox|iso|gdpr|hipaa|attestation)\b/i },
+    { a:'INCIDENT_MGMT', rx:/\b(incident|sev[: ]?(high|p[12])|major|rca|postmortem|downtime|uptime|slo)\b/i },
+    { a:'DATA_PIPELINE_ETL', rx:/\b(etl|pipeline|ingest|transform|load|csv|s3|gcs|orchestration)\b/i },
+    { a:'REPORTING_KPI_DASH', rx:/\b(dashboard|dashboards|kpi|scorecard|report|reporting)\b/i },
+    { a:'ACCESS_GOVERNANCE', rx:/\b(access|rbac|sso|entitlements|seats|identity|pii|dlp)\b/i },
+    { a:'PRIVACY_DSR', rx:/\b(dsr|data\s*subject|privacy\s*request|gdpr|ccpa)\b/i },
+    { a:'RECRUITING_INTAKE', rx:/\b(recruit(ing)?|ats|cv|resume|candidate|interviews?)\b/i },
+  ];
+
+  // Preferred triggers per archetype (fallback)
+  const TRIGGER_PREF = {
+    APPOINTMENT_SCHEDULING: 'cron', CUSTOMER_SUPPORT_INTAKE: 'webhook', FEEDBACK_NPS: 'cron',
+    KNOWLEDGEBASE_FAQ: 'webhook', SALES_OUTREACH: 'manual', LEAD_QUAL_INBOUND: 'webhook',
+    CHURN_WINBACK: 'cron', RENEWALS_CSM: 'cron', AR_FOLLOWUP: 'cron', AP_AUTOMATION: 'webhook',
+    INVENTORY_MONITOR: 'cron', REPLENISHMENT_PO: 'webhook', FIELD_SERVICE_DISPATCH: 'webhook',
+    COMPLIANCE_AUDIT: 'cron', INCIDENT_MGMT: 'webhook', DATA_PIPELINE_ETL: 'cron',
+    REPORTING_KPI_DASH: 'cron', ACCESS_GOVERNANCE: 'webhook', PRIVACY_DSR: 'webhook',
+    RECRUITING_INTAKE: 'webhook',
+  };
+
+  // Channel normalization
+  const CHANNEL_MAP = [
+    { k:'whatsapp', rx:/whatsapp/i },
+    { k:'sms',      rx:/(sms|text)/i },
+    { k:'call',     rx:/(voice|call|phone)/i },
+    { k:'email',    rx:/email/i },
+  ];
+
+  // ---------- Utils ----------
+  const uid = (p)=>`${p}_${Math.random().toString(36).slice(2,10)}`;
+  const pos = (x,y)=>[x,y];
+  const listify = (v)=> Array.isArray(v) ? v.map(x=>String(x).trim()).filter(Boolean)
+                  : String(v||'').split(/[;,/|\n]+/).map(x=>x.trim()).filter(Boolean);
+
+  function chooseArchetype(s){
+    const hay = [s.scenario_id, s.name, s.tags, s.triggers, s.how_it_works, s.tool_stack_dev]
+      .map(x=>String(x||'')).join(' ');
+    for(const r of ARCH_RULES) if(r.rx.test(hay)) return r.a;
+    return 'SALES_OUTREACH';
   }
 
-  function addNode(wf, node) {
-    // apply lane Y offset so Prod vs Demo don't overlap
-    if (Array.isArray(node.position) && node.position.length === 2) {
-      node.position = [node.position[0], node.position[1] + (wf.__yOffset || 0)];
+  function normalizeChannels(s, selected){
+    const fromShapes = listify(s.best_reply_shapes||[])
+      .map(t=>{
+        for(const m of CHANNEL_MAP) if(m.rx.test(t)) return m.k;
+        return null;
+      })
+      .filter(Boolean);
+    let channels = Array.from(new Set(fromShapes));
+    if(!channels.length) channels = ['email'];
+    if(selected && channels.includes(selected)) {
+      channels = [selected].concat(channels.filter(c=>c!==selected));
+    } else if (selected && !channels.includes(selected)) {
+      channels = [selected].concat(channels);
     }
-    wf.nodes.push(node);
-    return node.name;
+    return channels;
   }
 
-  function connect(wf, from, to, outputIndex = 0) {
-    wf.connections[from] ??= { main: [] };
-    // ensure index exists
-    while (wf.connections[from].main.length <= outputIndex) {
-      wf.connections[from].main.push([]);
+  function preferredTrigger(archetype, s){
+    const t = String(s.triggers||'').toLowerCase();
+    if (/webhook|callback|incoming|real[- ]?time/.test(t)) return 'webhook';
+    if (/daily|weekly|cron|every\s+\d+\s*(min|hour|day)/.test(t)) return 'cron';
+    if (/imap|inbox|email/.test(t)) return 'imap';
+    return TRIGGER_PREF[archetype] || 'manual';
+  }
+  // ---------- n8n primitives (minimal, import-safe) ----------
+  function baseWorkflow(name){ return { name, nodes:[], connections:{}, active:false, settings:{}, staticData:{} }; }
+
+  function uniqueName(wf, base){
+    const existing=new Set((wf.nodes||[]).map(n=>String(n.name||'').toLowerCase()));
+    let name=base||'Node', i=1;
+    while(existing.has(name.toLowerCase())){ i++; name = `${base} #${i}`; }
+    return name;
+  }
+
+  // small anti-overlap
+  function nudge(wf,x,y){
+    const EPS=56, STEP=64;
+    let yy=y;
+    for(let i=0;i<60;i++){
+      const hit=(wf.nodes||[]).some(n=>{
+        const p=n.position||[]; return Math.abs((p[0]||0)-x)<EPS && Math.abs((p[1]||0)-yy)<EPS;
+      });
+      if(!hit) return yy;
+      yy+=STEP;
     }
+    return yy;
+  }
+
+  function addNode(wf,node){
+    node.name = uniqueName(wf, node.name);
+    if(Array.isArray(node.position)){
+      node.position=[ node.position[0], nudge(wf, node.position[0], node.position[1]) ];
+    }
+    wf.nodes.push(node); return node.name;
+  }
+
+  function connect(wf, from, to, outputIndex=0){
+    wf.connections[from]??={};
+    wf.connections[from].main??=[];
+    for(let i=wf.connections[from].main.length;i<=outputIndex;i++) wf.connections[from].main[i]=[];
     wf.connections[from].main[outputIndex].push({ node: to, type: "main", index: 0 });
   }
 
-  // helper to build a lane at a given Y offset
-  function withYOffset(wf, yOffset, fn) {
-    const prev = wf.__yOffset || 0;
-    wf.__yOffset = yOffset;
-    try {
-      fn();
-    } finally {
-      wf.__yOffset = prev;
-    }
+  // ---------- Small node set ----------
+  function addHeader(wf,label,x,y){
+    return addNode(wf,{ id:uid('label'), name:`=== ${label} ===`, type:'n8n-nodes-base.function', typeVersion:2,
+      position:pos(x,y), parameters:{ functionCode:'return [$json];' }});
   }
-
-  // ---------------- shared nodes ----------------
-  function addLaneHeader(wf, label, x = -1320, y = 40) {
-    return addNode(wf, {
-      id: uid("label"),
-      name: `=== ${label} ===`,
-      type: "n8n-nodes-base.function",
-      typeVersion: 2,
-      position: pos(x, y),
-      parameters: { functionCode: "return [$json];" },
-    });
+  function addManual(wf,x,y,label='Manual Trigger'){
+    return addNode(wf,{ id:uid('manual'), name:label, type:'n8n-nodes-base.manualTrigger', typeVersion:1, position:pos(x,y), parameters:{} });
   }
-
-  function addManual(wf, x = -1180, y = 300, label = "Manual Trigger") {
-    return addNode(wf, {
-      id: uid("manual"),
-      name: label,
-      type: "n8n-nodes-base.manualTrigger",
-      typeVersion: 1,
-      position: pos(x, y),
-      parameters: {},
-    });
+  function addCron(wf,label,x,y,compat){
+    if(compat==='full') return addNode(wf,{ id:uid('cron'), name:label, type:'n8n-nodes-base.cron', typeVersion:1,
+      position:pos(x,y), parameters:{ triggerTimes:{ item:[{ mode:'everyX', everyX:{ hours:0, minutes:15 } }] } }});
+    return addNode(wf,{ id:uid('cronph'), name:`${label} (Placeholder)`, type:'n8n-nodes-base.function', typeVersion:2,
+      position:pos(x,y), parameters:{ functionCode:'return [$json];' }});
   }
-  function addCron(wf, label = "Cron (15m)", x = -1180, y = 140) {
-    if (compat === "full") {
-      return addNode(wf, {
-        id: uid("cron"),
-        name: label,
-        type: "n8n-nodes-base.cron",
-        typeVersion: 1,
-        position: pos(x, y),
-        parameters: { triggerTimes: { item: [{ mode: "everyX", everyX: { hours: 0, minutes: 15 } }] } },
-      });
-    }
-    return addNode(wf, {
-      id: uid("cronph"),
-      name: `${label} (Placeholder)`,
-      type: "n8n-nodes-base.function",
-      typeVersion: 2,
-      position: pos(x, y),
-      parameters: { functionCode: "return [$json];" },
-    });
+  function addWebhook(wf,label,x,y,compat){
+    if(compat==='full') return addNode(wf,{ id:uid('webhook'), name:label, type:'n8n-nodes-base.webhook', typeVersion:1,
+      position:pos(x,y), parameters:{ path:uid('hook'), methods:['POST'], responseMode:'onReceived' }});
+    return addNode(wf,{ id:uid('webph'), name:`${label} (Placeholder)`, type:'n8n-nodes-base.function', typeVersion:2,
+      position:pos(x,y), parameters:{ functionCode:'return [$json];' }});
   }
-  function addWebhook(wf, label = "Webhook (Incoming)", x = -1180, y = 300) {
-    if (compat === "full") {
-      return addNode(wf, {
-        id: uid("webhook"),
-        name: label,
-        type: "n8n-nodes-base.webhook",
-        typeVersion: 1,
-        position: pos(x, y),
-        parameters: { path: uid("hook"), methods: ["POST"], responseMode: "onReceived" },
-      });
-    }
-    return addNode(wf, {
-      id: uid("webph"),
-      name: `${label} (Placeholder)`,
-      type: "n8n-nodes-base.function",
-      typeVersion: 2,
-      position: pos(x, y),
-      parameters: { functionCode: "return [$json];" },
-    });
+  function addHTTP(wf,name,urlExpr,bodyExpr,x,y,method='POST'){
+    return addNode(wf,{ id:uid('http'), name, type:'n8n-nodes-base.httpRequest', typeVersion:4, position:pos(x,y),
+      parameters:{ url:urlExpr, method, jsonParameters:true, sendBody:true, bodyParametersJson:bodyExpr } });
   }
-  function addHTTP(wf, name, urlExpr, bodyExpr, x, y, method = "POST") {
-    return addNode(wf, {
-      id: uid("http"),
-      name,
-      type: "n8n-nodes-base.httpRequest",
-      typeVersion: 4,
-      position: pos(x, y),
-      parameters: { url: urlExpr, method, jsonParameters: true, sendBody: true, bodyParametersJson: bodyExpr },
-    });
+  function addFunction(wf,name,code,x,y){
+    return addNode(wf,{ id:uid('func'), name, type:'n8n-nodes-base.function', typeVersion:2, position:pos(x,y),
+      parameters:{ functionCode:code }});
   }
-  function addFunction(wf, name, code, x, y) {
-    return addNode(wf, {
-      id: uid("func"),
-      name,
-      type: "n8n-nodes-base.function",
-      typeVersion: 2,
-      position: pos(x, y),
-      parameters: { functionCode: code },
-    });
+  // import-safe IF / SWITCH: force string value2
+  function addIf(wf,name,left,op,right,x,y){
+    return addNode(wf,{ id:uid('if'), name, type:'n8n-nodes-base.if', typeVersion:2, position:pos(x,y),
+      parameters:{ conditions:{ number:[], string:[{ value1:left, operation:op, value2:String(right??'') }] } }});
   }
-  // IMPORT-SAFE If: force string for value2 so importer never lowercases undefined/number
-  function addIf(wf, name, left, op, right, x, y) {
-    return addNode(wf, {
-      id: uid("if"),
-      name,
-      type: "n8n-nodes-base.if",
-      typeVersion: 2,
-      position: pos(x, y),
-      parameters: {
-        conditions: {
-          number: [],
-          string: [{ value1: left, operation: op, value2: String(right ?? "") }],
-        },
-      },
-    });
+  function addSwitch(wf,name,valueExpr,rules,x,y){
+    const safe = (rules||[]).map(r=>({ operation:r.operation||'equal', value2:String(r.value2??'') }));
+    return addNode(wf,{ id:uid('switch'), name, type:'n8n-nodes-base.switch', typeVersion:2, position:pos(x,y),
+      parameters:{ value1:valueExpr, rules:safe }});
   }
-  // IMPORT-SAFE Switch: force rule value2 to string
-  function addSwitch(wf, name, valueExpr, rules, x, y) {
-    const safeRules = (rules || []).map((r) => ({
-      operation: r.operation || "equal",
-      value2: String(r.value2 ?? ""),
-    }));
-    return addNode(wf, {
-      id: uid("switch"),
-      name,
-      type: "n8n-nodes-base.switch",
-      typeVersion: 2,
-      position: pos(x, y),
-      parameters: { value1: valueExpr, rules: safeRules },
-    });
-  }
-  function addMerge(wf, name, x, y, mode = "append") {
-    return addNode(wf, {
-      id: uid("merge"),
-      name,
-      type: "n8n-nodes-base.merge",
-      typeVersion: 2,
-      position: pos(x, y),
-      parameters: { mode },
-    });
-  }
-  function addSplit(wf, x, y, size = 20) {
-    return addNode(wf, {
-      id: uid("split"),
-      name: "Split In Batches",
-      type: "n8n-nodes-base.splitInBatches",
-      typeVersion: 1,
-      position: pos(x, y),
-      parameters: { batchSize: size },
-    });
-  }
-
-  // ---------------- context extractor ----------------
-  function buildContextObj(s) {
-    const out = {
-      triggers: String(s?.triggers || "").trim(),
-      best_reply_shapes: listify(s?.best_reply_shapes || []),
-      risk_notes: String(s?.risk_notes || "").trim(),
-      roi_hypothesis: String(s?.roi_hypothesis || "").trim(),
-    };
-    out.summary = [
-      out.triggers && `Triggers: ${out.triggers}`,
-      out.best_reply_shapes?.length && `Shapes: ${out.best_reply_shapes.join(", ")}`,
-      out.risk_notes && `Risks: ${out.risk_notes}`,
-      out.roi_hypothesis && `ROI: ${out.roi_hypothesis}`,
-    ]
-      .filter(Boolean)
-      .join(" | ");
-    return out;
-  }
-
-  // ---------------- demo/init/collector ----------------
-  function addInit(wf, scenario, industry, primaryChannel, demoFlag = true, x = -920, y = 300, archetypeName = null) {
-    const seed = {
-      demo: !!demoFlag,
-      to: "+34613030526",
-      emailTo: "kevanm.spain@gmail.com",
-      smsFrom: "+13412184164",
-      waFrom: "+14155238886",
-      callFrom: "+13412184164",
-      callWebhook: "https://example.com/call",
-      recommendedChannel: primaryChannel || "email",
-      archetype: archetypeName || scenario?.archetype || "UNKNOWN",
-      scenario,
-      industry,
-      context: buildContextObj(scenario),
-      // Planning endpoint overridable at runtime:
-      llmPlanUrl: "https://example.com/llm/plan"
-    };
-    return addNode(wf, {
-      id: uid("init"),
-      name: demoFlag ? "Init Context (Demo Seeds)" : "Init Context",
-      type: "n8n-nodes-base.function",
-      typeVersion: 2,
-      position: pos(x, y),
-      parameters: { functionCode: `const seed=${JSON.stringify(seed, null, 2)}; return [seed];` },
-    });
-  }
-
-  function addCollector(wf, x = 1600, y = 300) {
-    return addFunction(
-      wf,
-      "Collector (Inspect)",
+  function addCollector(wf,x,y){
+    return addFunction(wf,"Collector (Inspect)",
       `
 const now=new Date().toISOString();
 const arr=Array.isArray(items)?items:[{json:$json}];
-return arr.map((it,i)=>({json:{...it.json,__collected_at:now, index:i}}));`,
-      x,
-      y
-    );
+return arr.map((it,i)=>({json:{...it.json,__collected_at:now,index:i}}));`, x, y);
   }
 
-  // ---------------- LLM planning (deep, multi-pass) ----------------
-  function addDeepPlan(wf, x = -720, y = 180, opts = {}) {
-    const depth = (opts.planDepth || planDepthQS || 'deep').toLowerCase();
-
-    if (compat === "full") {
-      // In full mode, call your planner with deliberate params
-      return addHTTP(
-        wf,
-        depth === 'fast' ? "LLM Plan (Fast)" : "LLM Plan (Deliberate Deep)",
-        "={{$json.llmPlanUrl || 'https://example.com/llm/plan'}}",
-        `={{{
-          industry: $json.industry,
-          scenario: $json.scenario,
-          context: $json.context,
-          options: {
-            deliberate: ${depth === 'deep'},
-            iterations: ${depth === 'deep' ? 3 : 1},
-            critique: ${depth === 'deep'},
-            expand_paths: ${depth === 'deep'},
-            risk_matrix: ${depth === 'deep'},
-            channels_research: true,
-            require: { trigger: true, channels: true, branches: true, tools: true, errors: true, messages: true },
-            max_branches: ${depth === 'deep' ? 12 : 6}
-          }
-        }}}`,
-        x,
-        y,
-        "POST"
-      );
+  // ---------- Channel sender (demo-safe) ----------
+  function makeSender(wf, channel, x, y, compat){
+    if(compat==='full'){
+      if(channel==='email'){
+        return addNode(wf,{ id:uid('email'), name:'Send Email', type:'n8n-nodes-base.emailSend', typeVersion:3, position:pos(x,y),
+          parameters:{ to:"={{$json.emailTo||'user@example.com'}}", subject:"={{$json.subject||'Update'}}", text:"={{$json.message||'Hello!'}}" }, credentials:{} });
+      }
+      if(channel==='sms'){
+        return addNode(wf,{ id:uid('sms'), name:'Send SMS (Twilio)', type:'n8n-nodes-base.twilio', typeVersion:3, position:pos(x,y),
+          parameters:{ resource:'message', operation:'create', from:"={{$json.smsFrom||'+10000000000'}}", to:"={{$json.to||'+10000000001'}}", message:"={{$json.message||'Hello!'}}" }, credentials:{} });
+      }
+      if(channel==='whatsapp'){
+        return addNode(wf,{ id:uid('wa'), name:'Send WhatsApp (Twilio)', type:'n8n-nodes-base.twilio', typeVersion:3, position:pos(x,y),
+          parameters:{ resource:'message', operation:'create', from:"={{'whatsapp:' + ($json.waFrom||'+10000000002')}}", to:"={{'whatsapp:' + ($json.to||'+10000000003')}}", message:"={{$json.message||'Hello!'}}" }, credentials:{} });
+      }
+      if(channel==='call'){
+        return addHTTP(wf, 'Place Call', "={{$json.callWebhook||'https://example.com/call'}}",
+          "={{ { to:$json.to, from:$json.callFrom, text: ($json.message||'Hello!') } }}", x, y, 'POST');
+      }
     }
-
-    // Safe-mode local synthesizer, but more exhaustive
-    return addFunction(
-      wf,
-      depth === 'fast' ? "LLM Plan (Synthesize Fast)" : "LLM Plan (Synthesize Deep)",
-      `
-const ctx = $json.context||{};
-const scen = $json.scenario||{};
-const ind  = $json.industry||{};
-const depth = '${(opts.planDepth || planDepthQS || 'deep').toLowerCase()}';
-
-function pickTrigger(){
-  const t = (ctx.triggers||scen.triggers||'').toLowerCase();
-  if (/real[- ]?time|webhook|event|incoming/.test(t)) return 'webhook';
-  if (/daily|weekly|monthly|cron|every\\s+\\d+\\s*(min|hour|day)/.test(t)) return 'cron';
-  return 'manual';
-}
-function pickChannels(){
-  const shapes=(ctx.best_reply_shapes||scen.best_reply_shapes||[]).map(s=>String(s).toLowerCase());
-  const fromShapes = shapes.map(s => s.includes('whatsapp')?'whatsapp': s.includes('sms')||s.includes('text')?'sms': s.includes('voice')||s.includes('call')?'voice': s.includes('email')?'email': s.includes('web')||s.includes('chat')?'web': null).filter(Boolean);
-  const uniq=(a)=>Array.from(new Set(a));
-  const guess = uniq(fromShapes);
-  return guess.length? guess : ['email','whatsapp'];
-}
-
-const arche = String($json.archetype||scen.archetype||'').toUpperCase();
-const baseBranches = [
-  { id:'happy',      title:'Happy Path',         steps:['compose','send','log'] },
-  { id:'missing',    title:'Missing Info',       steps:['ask_info','wait','retry','timeout'] },
-  { id:'negative',   title:'Negative Response',  steps:['capture_reason','offer_alt','log'] },
-  { id:'reschedule', title:'Reschedule/Change',  steps:['offer_slots','confirm','update_sys'] },
-  { id:'handoff',    title:'Human Handoff',      steps:['route_human','notify','log'] },
-  { id:'timeout',    title:'No Response',        steps:['nudge','final','close'] },
-  { id:'compliance', title:'DNC/Opt-out',        steps:['record_optout','suppress','log'] },
-  { id:'language',   title:'Language Switch',    steps:['detect_lang','switch_templates','continue'] }
-];
-
-function extraByArchetype(a){
-  switch(a){
-    case 'APPOINTMENT_SCHEDULING': return [
-      { id:'double-book', title:'Double Booking', steps:['detect','reoffer','confirm'] },
-      { id:'cancellation',title:'Cancellation',   steps:['offer_waitlist','confirm','update_pms'] }
-    ];
-    case 'CUSTOMER_SUPPORT_INTAKE': return [
-      { id:'kb-deflect',  title:'KB Deflection',  steps:['search_kb','answer','close'] },
-      { id:'sev-high',    title:'High Severity',  steps:['page_oncall','bridge','status_updates'] }
-    ];
-    case 'AR_FOLLOWUP': return [
-      { id:'dispute',     title:'Invoice Dispute', steps:['collect_details','route_finance','hold_dunning'] }
-    ];
-    default: return [];
-  }
-}
-
-const trigger = pickTrigger();
-let channels = pickChannels();
-
-const toolShelf = {
-  crm: 'CRM',
-  messaging: 'MAILING',
-  telephony: 'TELCO',
-  kb: 'KB',
-  calendar: 'CALENDAR',
-  bi: 'BI',
-  iam: 'IAM',
-  payments: 'PAY'
-};
-
-const errors = [
-  { code:'AUTH_MISSING',   remedy:'Warn + skip step; alert ops' },
-  { code:'RATE_LIMIT',     remedy:'Exponential backoff w/ jitter' },
-  { code:'INVALID_INPUT',  remedy:'Normalize/validate; ask for correction' },
-  { code:'DELIVERY_FAIL',  remedy:'Try alternate channel; log' },
-  { code:'API_TIMEOUT',    remedy:'Retry 3x; circuit-breaker; alert' }
-];
-
-const messages = {
-  tone:'natural-professional',
-  style_notes:[
-    'avoid robotic menus',
-    'acknowledge user intent in first sentence',
-    'use short sentences and contractions for SMS/WA',
-    'mirror customer vocabulary (industry.vocabulary if present)'
-  ]
-};
-
-let branches = baseBranches.concat(extraByArchetype(arche));
-if (depth === 'fast') branches = branches.slice(0,6);
-if (branches.length>12) branches = branches.slice(0,12);
-
-return [{
-  plan:{ trigger, channels, tools:toolShelf, errors, branches },
-  messages
-}];
-`,
-      x,
-      y
-    );
+    return addFunction(wf, `Demo Send ${channel.toUpperCase()}`, "return [$json];", x, y);
   }
 
-  function addAdoptPlan(wf, x = -460, y = 180) {
-    return addFunction(
-      wf,
-      "Adopt Plan → JSON",
-      `
-const p = $json.plan || $json.body || $json.data || {};
-const plan = p.plan || ($json.plan ? $json.plan : p);
-const messages = p.messages || $json.messages || {};
-let channels = Array.isArray(plan?.channels) && plan.channels.length ? plan.channels : ($json.channels||[]);
-if (!channels || !channels.length) channels = ['email'];
-const recommendedChannel = channels[0];
-return [{ ...$json, plan, messages, channels, recommendedChannel, trigger: plan?.trigger || $json.trigger || 'manual' }];
-`,
-      x,
-      y
-    );
-  }
-
-  function addPlanValidator(wf, x = -220, y = 180) {
-    return addFunction(
-      wf,
-      "Validate Plan (Min Requirements)",
-      `
-const p = $json.plan || {};
-const ok = !!(p.trigger && Array.isArray(p.channels) && p.channels.length && Array.isArray(p.branches) && p.branches.length && p.tools);
-return [{ ...$json, __plan_ok: ok }];
-`,
-      x,
-      y
-    );
-  }
-
-  function addFallbackSynthesize(wf, x = 20, y = 180) {
-    return addFunction(
-      wf,
-      "Fallback Plan (Simple)",
-      `
-if ($json.__plan_ok) return [$json];
-const fallback={ trigger:$json.trigger||'manual', channels:$json.channels&&$json.channels.length?$json.channels:['email'], tools:{crm:'CRM'}, errors:[{code:'GENERIC'}], branches:[{id:'happy',title:'Happy Path',steps:['compose','send']}] };
-return [{...$json, plan:fallback, __plan_ok:true}];
-`,
-      x,
-      y
-    );
-  }
-
-  // ---------------- derive signals (static fallback) ----------------
-  function deriveSignals(scenario) {
-    const text = (k) => String(scenario[k] || "").toLowerCase();
-    const inText = (k, ...rxs) => rxs.some((rx) => new RegExp(rx, "i").test(text(k)));
-
-    let trigger = "manual";
-    if (inText("triggers", "daily|weekly|monthly|cron|every \\d+ (min|hour|day)")) trigger = "cron";
-    if (inText("triggers", "real[- ]?time|webhook|event|callback|incoming")) trigger = "webhook";
-    if (inText("triggers", "email|inbox|imap")) trigger = "imap";
-
-    const tools = (text("tool_stack_dev") + " " + text("how_it_works")).toLowerCase();
-    const systems = {
-      pms: /dentrix|opendental|eaglesoft|pms/.test(tools),
-      crm: /crm|hubspot|salesforce|pipedrive/.test(tools),
-      wms: /wms|warehouse|3pl/.test(tools),
-      erp: /erp|netsuite|sap|oracle/.test(tools),
-      accounting: /quickbooks|xero|stripe|billing/.test(tools),
-      ats: /ats|greenhouse|lever/.test(tools),
-      calendar: /calendar|google calendar|calendly|outlook/.test(tools),
-      slack: /slack/.test(tools),
-      kb: /kb|knowledge[- ]?base|confluence|notion/.test(tools),
-      bi: /bi|dashboard|kpi|scorecard/.test(tools),
-      iam: /iam|sso|rbac|entitlements?/.test(tools),
-      privacy: /privacy|dsr|gdpr|ccpa|dlp/.test(tools),
+  // ---------- Compact, channel-aware composer ----------
+  function composeBody(archetype, channel, s, industry){
+    const ctx = {
+      trig: String(s.triggers||'').trim(),
+      how: String(s.how_it_works||'').trim(),
+      roi: String(s.roi_hypothesis||'').trim(),
+      risk: String(s.risk_notes||'').trim(),
+      tone: (industry?.agent_language_prompt || industry?.vocabulary || '').trim()
     };
-    const features = {
-      waitlist: /waitlist|backfill|fill cancellations/.test(tools),
-      dedupe: /dedup|dedupe/.test(tools),
-      enrich: /enrich|enrichment|clearbit|apollo|zoominfo/.test(tools),
-      score: /score|scoring|priority|risk/.test(tools),
-      buckets_30_60_90: /30.?60.?90|aging/.test(tools),
-      three_way_match: /3[- ]?way|three[- ]?way/.test(tools),
-      approvals: /approval|sign[- ]?off|legal review|finance review/.test(tools),
-      geo_route: /geo|route|eta|technician|dispatch/.test(tools),
-      faq_search: /faq|kb search|deflection/.test(tools),
-      survey: /nps|csat|survey/.test(tools),
-      identity_verify: /kyc|identity|verify/.test(tools),
-      severity: /sev|incident|outage|downtime|uptime|slo/.test(tools),
-      kpi_calc: /kpi|metrics|scorecard|report/.test(tools),
-    };
+    const opener = { email:'Hi — quick note:', sms:'Quick update:', whatsapp:'Heads up:', call:'Talk track:' }[channel] || 'Note:';
+    const cta = { email:'Reply or click to confirm.', sms:'Reply 1=confirm, 2=change.', whatsapp:'Reply here to confirm/change.', call:'Say “confirm” or “reschedule”.' }[channel] || 'Reply to proceed.';
 
-    const shapes = listify(scenario.best_reply_shapes || []);
-    const norm = (s) => String(s || "").toLowerCase();
-    const chan = shapes
-      .map(norm)
-      .map((s) =>
-        s.includes("whatsapp")
-          ? "whatsapp"
-          : s.includes("sms") || s.includes("text")
-          ? "sms"
-          : s.includes("voice") || s.includes("call")
-          ? "call"
-          : s.includes("email")
-          ? "email"
-          : s
-      )
-      .filter(Boolean);
-    const channels = [...new Set(chan)];
-    const cadence = channels.length >= 3 ? "drip3" : channels.length === 2 ? "drip2" : "single";
+    function block(lines, max=5){ return lines.filter(Boolean).slice(0, max).join('\n'); }
 
-    return { trigger, systems, features, channels, cadence };
-  }
-
-  // ---------------- triggers ----------------
-  function addTriggerBySignals(wf, sig, x = -1180) {
-    switch (sig.trigger) {
-      case "cron":
-        return addCron(wf, "Cron (from triggers)", x, 140);
-      case "webhook":
-        return addWebhook(wf, "Webhook (from triggers)", x, 300);
-      case "imap":
-        return addFunction(wf, "IMAP Intake (Placeholder)", "return [$json];", x, 300);
+    switch(archetype){
+      case 'APPOINTMENT_SCHEDULING':
+        return block([
+          `${opener}`,
+          ctx.trig && `Why now: ${ctx.trig}`,
+          ctx.how && `Plan: ${ctx.how}`,
+          ctx.roi && `Impact: ${ctx.roi}`,
+          ctx.risk && `Note: ${ctx.risk}`,
+          ctx.tone && ctx.tone,
+          cta
+        ]);
+      case 'CUSTOMER_SUPPORT_INTAKE':
+        return block([
+          `${opener}`,
+          `We received your request and opened a ticket.`,
+          ctx.trig && `Context: ${ctx.trig}`,
+          ctx.how && `Next: ${ctx.how}`,
+          ctx.tone && ctx.tone,
+          cta
+        ]);
       default:
-        return addManual(wf, x, 300, "Manual Trigger");
+        return block([
+          `${opener}`,
+          ctx.trig && `Context: ${ctx.trig}`,
+          ctx.how && `Plan: ${ctx.how}`,
+          ctx.roi && `Value: ${ctx.roi}`,
+          ctx.tone && ctx.tone,
+          cta
+        ]);
     }
   }
-  // ---------------- message composer (context + plan aware) ----------------
-  function composeMessageFunctionBody() {
-    return `
-const s = $json.scenario || {};
-const ind = $json.industry || {};
-const archetype = String($json.archetype || '').toUpperCase();
-const ch = String($json.recommendedChannel || 'email').toLowerCase();
-const ctx = $json.context || {};
-const plan = $json.plan || {};
-const planMsgs = ($json.messages && $json.messages.bundles) || ($json.messages || {});
-const trim = (t, n=240) => (String(t||'').replace(/\\s+/g,' ').trim()).slice(0,n);
-const line = (lbl, v) => v ? \`\${lbl}: \${trim(v)}\\n\` : '';
-const emoji = { email:'📧', sms:'📱', whatsapp:'🟢', call:'📞' }[ch] || '💬';
-const industryLine = ind.name || ind.industry_id ? \`Industry: \${ind.name||ind.industry_id}\\n\` : '';
-
-const lex = trim(ind.agent_language_prompt || ind.vocabulary || '', 200);
-const suffixLex = lex ? ("\\n" + lex) : '';
-
-const triggers = trim(ctx.triggers || s.triggers, 200);
-const how = trim(s.how_it_works, 260);
-const roi = trim(ctx.roi_hypothesis || s.roi_hypothesis, 180);
-const risks = trim(ctx.risk_notes, 160);
-
-const openers = { email: 'Hi there — quick note:', sms: 'Quick update:', whatsapp: 'Heads up:', call: 'Talk track:' };
-const cta = { email: 'Reply or click the link to confirm.', sms: 'Reply with 1 to confirm, 2 to reschedule.', whatsapp: 'Reply here to confirm or change.', call: 'Confirm during IVR or say “reschedule”.' };
-
-function pickFromPlan(kind){
-  try {
-    const b = planMsgs[kind];
-    if (!b) return null;
-    const arr = Array.isArray(b) ? b : (Array.isArray(b?.[ch]) ? b[ch] : null);
-    if (!arr || !arr.length) return null;
-    return String(arr[0]);
-  } catch(e){ return null; }
-}
-
-function msgScheduling(){
-  const fromPlan = pickFromPlan('APPOINTMENT_SCHEDULING');
-  if (fromPlan) return fromPlan;
-  return \`\${emoji} \${openers[ch]}\\n\${industryLine}\${line('Why now', triggers)}\${line('Plan', how)}\${roi?line('Impact', roi):''}\${risks?line('Keep in mind', risks):''}\${suffixLex}\\n\${cta[ch]}\`;
-}
-function msgSupport(){
-  const fromPlan = pickFromPlan('CUSTOMER_SUPPORT_INTAKE');
-  if (fromPlan) return fromPlan;
-  return \`\${emoji} \${openers[ch]}\\n\${industryLine}We received your request and created a ticket.\\n\${line('Context', triggers)}\${line('What happens next', how)}Priority auto-routed by SLA/VIP.\${suffixLex}\\n\${cta[ch]}\`;
-}
-function msgNps(){
-  const fromPlan = pickFromPlan('FEEDBACK_NPS');
-  if (fromPlan) return fromPlan;
-  return \`\${emoji} \${openers[ch]}\\n\${industryLine}We’d value your feedback after the recent interaction.\\n\${line('Context', triggers)}\${roi?line('Why this matters', roi):''}\${suffixLex}\\nPlease rate us 0–10: link enclosed.\\nThanks!\`;
-}
-function msgFaq(){
-  const fromPlan = pickFromPlan('KNOWLEDGEBASE_FAQ');
-  if (fromPlan) return fromPlan;
-  return \`\${emoji} \${openers[ch]}\\n\${industryLine}\${line('We found an answer', how || 'Your question matches our knowledge base.')}\${suffixLex}\\n\${cta[ch]}\`;
-}
-function msgSales(){
-  const fromPlan = pickFromPlan('SALES_OUTREACH');
-  if (fromPlan) return fromPlan;
-  return \`\${emoji} \${openers[ch]}\\n\${industryLine}\${line('Problem we solve', triggers)}\${line('How it works', how)}\${roi?line('Expected ROI', roi):''}\${suffixLex}\\nInterested in a quick demo?\`;
-}
-function msgLeadQual(){
-  const fromPlan = pickFromPlan('LEAD_QUAL_INBOUND');
-  if (fromPlan) return fromPlan;
-  return \`\${emoji} \${openers[ch]}\\n\${industryLine}Got your details — qualifying now.\\n\${line('Form intent', triggers)}\${suffixLex}\\nIf you’re ready, grab a time on the calendar.\`;
-}
-function msgChurn(){
-  const fromPlan = pickFromPlan('CHURN_WINBACK');
-  if (fromPlan) return fromPlan;
-  return \`\${emoji} \${openers[ch]}\\n\${industryLine}\${line('We noticed inactivity', triggers)}\${line('What you’ll get back', roi)}\${suffixLex}\\nReply to re-activate or claim an offer.\`;
-}
-function msgRenewals(){
-  const fromPlan = pickFromPlan('RENEWALS_CSM');
-  if (fromPlan) return fromPlan;
-  return \`\${emoji} \${openers[ch]}\\n\${industryLine}Your renewal is coming up.\\n\${line('Usage summary', triggers)}\${line('Success plan', how)}\${roi?line('Outcomes', roi):''}\${suffixLex}\\nShall we book a QBR?\`;
-}
-function msgAR(){
-  const fromPlan = pickFromPlan('AR_FOLLOWUP');
-  if (fromPlan) return fromPlan;
-  return \`\${emoji} \${openers[ch]}\\n\${industryLine}Friendly reminder: an invoice is past due.\\n\${line('Context', triggers)}\${line('Resolution path', how)}\${suffixLex}\\nIf there’s a dispute, reply “dispute”.\`;
-}
-function msgAP(){
-  const fromPlan = pickFromPlan('AP_AUTOMATION');
-  if (fromPlan) return fromPlan;
-  return \`\${emoji} \${openers[ch]}\\n\${industryLine}We received an invoice.\\n\${line('Matching rules', how)}\${suffixLex}\\nExceptions go to approval. You’ll get a confirmation once paid.\`;
-}
-function msgInventory(){
-  const fromPlan = pickFromPlan('INVENTORY_MONITOR');
-  if (fromPlan) return fromPlan;
-  return \`\${emoji} \${openers[ch]}\\n\${industryLine}Low stock detected on key SKUs.\\n\${line('Signal', triggers)}\${line('Replenishment flow', how)}\${suffixLex}\\nWe can auto-raise a PO if approved.\`;
-}
-function msgReplenishment(){
-  const fromPlan = pickFromPlan('REPLENISHMENT_PO');
-  if (fromPlan) return fromPlan;
-  return \`\${emoji} \${openers[ch]}\\n\${industryLine}Low-stock event — preparing PO.\\n\${line('Selection logic', how)}\${suffixLex}\\nApprove to release the order.\`;
-}
-function msgDispatch(){
-  const fromPlan = pickFromPlan('FIELD_SERVICE_DISPATCH');
-  if (fromPlan) return fromPlan;
-  return \`\${emoji} \${openers[ch]}\\n\${industryLine}We’re assigning a technician now.\\n\${line('Routing logic', how)}\${suffixLex}\\nYou’ll receive ETA + calendar invite.\`;
-}
-function msgCompliance(){
-  const fromPlan = pickFromPlan('COMPLIANCE_AUDIT');
-  if (fromPlan) return fromPlan;
-  return \`\${emoji} \${openers[ch]}\\n\${industryLine}Compliance sweep in progress.\\n\${line('Controls', how)}\${suffixLex}\\nIssues will be reported with remediation steps.\`;
-}
-function msgIncident(){
-  const fromPlan = pickFromPlan('INCIDENT_MGMT');
-  if (fromPlan) return fromPlan;
-  return \`\${emoji} \${openers[ch]}\\n\${industryLine}Incident triage active.\\n\${line('Detection', triggers)}\${line('Runbook', how)}\${suffixLex}\\nHigh severity routes to on-call.\`;
-}
-function msgETL(){
-  const fromPlan = pickFromPlan('DATA_PIPELINE_ETL');
-  if (fromPlan) return fromPlan;
-  return \`\${emoji} \${openers[ch]}\\n\${industryLine}Data pipeline execution.\\n\${line('Source → Transform', how || triggers)}\${suffixLex}\\nYou’ll get status + load confirmation.\`;
-}
-function msgReporting(){
-  const fromPlan = pickFromPlan('REPORTING_KPI_DASH');
-  if (fromPlan) return fromPlan;
-  return \`\${emoji} \${openers[ch]}\\n\${industryLine}Reporting job complete.\\n\${line('KPIs', triggers || how)}\${suffixLex}\\nDashboard export is attached/linked.\`;
-}
-function msgAccess(){
-  const fromPlan = pickFromPlan('ACCESS_GOVERNANCE');
-  if (fromPlan) return fromPlan;
-  return \`\${emoji} \${openers[ch]}\\n\${industryLine}Access request received.\\n\${line('Entitlements check', how)}\${suffixLex}\\nAwaiting approval before provisioning.\`;
-}
-function msgPrivacy(){
-  const fromPlan = pickFromPlan('PRIVACY_DSR');
-  if (fromPlan) return fromPlan;
-  return \`\${emoji} \${openers[ch]}\\n\${industryLine}We received your data subject request.\\n\${line('Verification', how)}\${suffixLex}\\nWe’ll respond within the required window.\`;
-}
-function msgRecruiting(){
-  const fromPlan = pickFromPlan('RECRUITING_INTAKE');
-  if (fromPlan) return fromPlan;
-  return \`\${emoji} \${openers[ch]}\\n\${industryLine}Thanks for applying — reviewing your details now.\\n\${line('Screening', how)}\${suffixLex}\\nWe’ll reach out to book an interview.\`;
-}
-
-let body;
-switch(String($json.archetype||'').toUpperCase()){
-  case 'APPOINTMENT_SCHEDULING': body = msgScheduling(); break;
-  case 'CUSTOMER_SUPPORT_INTAKE': body = msgSupport(); break;
-  case 'FEEDBACK_NPS': body = msgNps(); break;
-  case 'KNOWLEDGEBASE_FAQ': body = msgFaq(); break;
-  case 'SALES_OUTREACH': body = msgSales(); break;
-  case 'LEAD_QUAL_INBOUND': body = msgLeadQual(); break;
-  case 'CHURN_WINBACK': body = msgChurn(); break;
-  case 'RENEWALS_CSM': body = msgRenewals(); break;
-  case 'AR_FOLLOWUP': body = msgAR(); break;
-  case 'AP_AUTOMATION': body = msgAP(); break;
-  case 'INVENTORY_MONITOR': body = msgInventory(); break;
-  case 'REPLENISHMENT_PO': body = msgReplenishment(); break;
-  case 'FIELD_SERVICE_DISPATCH': body = msgDispatch(); break;
-  case 'COMPLIANCE_AUDIT': body = msgCompliance(); break;
-  case 'INCIDENT_MGMT': body = msgIncident(); break;
-  case 'DATA_PIPELINE_ETL': body = msgETL(); break;
-  case 'REPORTING_KPI_DASH': body = msgReporting(); break;
-  case 'ACCESS_GOVERNANCE': body = msgAccess(); break;
-  case 'PRIVACY_DSR': body = msgPrivacy(); break;
-  case 'RECRUITING_INTAKE': body = msgRecruiting(); break;
-  default: body = msgSales();
-}
-const subject = s.agent_name ? \`\${s.agent_name} — \${s.scenario_id||''}\` : (s.title||s.scenario_id||'AI Workflow');
-return [{ message: body, subject }];
-`;
+  // ---------- Tiny canonical branches ----------
+  function canonicalScheduling(channels){
+    // Minimal but complete; decisions inline; exhaustive outcomes; fits any channel row
+    return [{
+      name: 'Scheduling',
+      steps: [
+        { name:'Lookup: Upcoming Appointments (PMS/CRM)', kind:'lookup' },
+        { name:'Decision: Do we have an upcoming appointment?', kind:'decision', outcomes:[
+          { value:'yes_upcoming', steps:[
+            { name:'Compose: Confirmation', kind:'compose' },
+            { name:'Book: Confirm in Calendar', kind:'book' },
+            { name:'Update: CRM visit → Confirmed', kind:'update' }
+          ]},
+          { value:'no_or_cannot_attend', steps:[
+            { name:'Lookup: Next available time slots', kind:'lookup' },
+            { name:'Compose: Offer 3 reschedule options', kind:'compose' },
+            { name:'Decision: Client picked a slot?', kind:'decision', outcomes:[
+              { value:'reschedule_yes', steps:[
+                { name:'Book: New slot in Calendar', kind:'book' },
+                { name:'Update: CRM visit → Rescheduled', kind:'update' }
+              ]},
+              { value:'reschedule_no', steps:[
+                { name:'Store: Add to follow-up list', kind:'store' },
+                { name:'Update: CRM visit → Follow-up', kind:'update' }
+              ]}
+            ]}
+          ]}
+        ]}
+      ]
+    }];
   }
 
-  function addCadence(wf, fromNodeName, channels, xStart = 300, y = 300) {
-    let prev = fromNodeName;
-    const dx = 260;
-    (channels || []).forEach((ch, i) => {
-      const builder = CHANNEL_BUILDERS[ch] || CHANNEL_BUILDERS.email;
-      const node = builder(wf, xStart + dx * (i + 1), y);
-      connect(wf, prev, node);
-      prev = node;
-    });
-    return prev;
+  function canonicalGeneric(archetype){
+    // Slim generic staircase used for most archetypes
+    return [{
+      name: 'Main',
+      steps: [
+        { name:'Score/Route (light)', kind:'score' },
+        { name:'Compose: Personalized message', kind:'compose' },
+        { name:'Lookup/HTTP (optional)', kind:'http' }
+      ]
+    }];
   }
 
-  // ---------------- classifier fallback ----------------
-  const RULES = [
-    { a: "APPOINTMENT_SCHEDULING", inc: [/appointment|appointments|scheduling|no[-_ ]?show|calendar/i] },
-    { a: "CUSTOMER_SUPPORT_INTAKE", inc: [/\b(cs|support|helpdesk|ticket|sla|triage|escalation|deflection|kb)\b/i] },
-    { a: "FEEDBACK_NPS", inc: [/\b(nps|survey|surveys|feedback|csat|ces)\b/i] },
-    { a: "KNOWLEDGEBASE_FAQ", inc: [/\b(kb|faq|knowledge|self-?service)\b/i], exc: [/ticket|escalation/i] },
-    { a: "SALES_OUTREACH", inc: [/\b(sales|outreach|cadence|sequence|abm|prospect|cold[-_ ]?email)\b/i] },
-    { a: "LEAD_QUAL_INBOUND", inc: [/\b(inbound|lead[-_ ]?qual|qualification|routing|router|forms?)\b/i] },
-    { a: "CHURN_WINBACK", inc: [/\b(churn|win[-_ ]?back|reactivation|retention|loyalty)\b/i] },
-    { a: "RENEWALS_CSM", inc: [/\b(renewal|qbr|success|csm|upsell|cross-?sell)\b/i] },
-    { a: "AR_FOLLOWUP", inc: [/\b(a\/?r|accounts?\s*receivable|invoice|collections?|dso|reconciliation)\b/i] },
-    { a: "AP_AUTOMATION", inc: [/\b(a\/?p|accounts?\s*payable|invoices?|3[-\s]?way|three[-\s]?way|matching|approvals?)\b/i] },
-    { a: "INVENTORY_MONITOR", inc: [/\b(inventory|stock|sku|threshold|warehouse|3pl|wms|backorder)\b/i] },
-    { a: "REPLENISHMENT_PO", inc: [/\b(replenishment|purchase[-_ ]?order|po|procure|procurement|vendors?|suppliers?)\b/i] },
-    { a: "FIELD_SERVICE_DISPATCH", inc: [/\b(dispatch|work[-_ ]?orders?|technicians?|field|geo|eta|route|yard)\b/i] },
-    { a: "COMPLIANCE_AUDIT", inc: [/\b(compliance|audit|audits|policy|governance|sox|iso|gdpr|hipaa|attestation)\b/i] },
-    { a: "INCIDENT_MGMT", inc: [/\b(incident|sev[: ]?(high|p[12])|major|rca|postmortem|downtime|uptime|slo)\b/i] },
-    { a: "DATA_PIPELINE_ETL", inc: [/\b(etl|pipeline|ingest|transform|load|csv|s3|gcs|orchestration)\b/i] },
-    { a: "REPORTING_KPI_DASH", inc: [/\b(dashboard|dashboards|kpi|scorecard|report|reporting)\b/i] },
-    { a: "ACCESS_GOVERNANCE", inc: [/\b(access|rbac|sso|entitlements|seats|identity|pii|dlp)\b/i] },
-    { a: "PRIVACY_DSR", inc: [/\b(dsr|data\s*subject|privacy\s*request|gdpr|ccpa)\b/i] },
-    { a: "RECRUITING_INTAKE", inc: [/\b(recruit(ing)?|ats|cv|resume|candidate|interviews?)\b/i] },
-  ];
-  function classifyFallback(s) {
-    const hay = [String(s.scenario_id || ""), String(s.name || ""), ...(Array.isArray(s.tags) ? s.tags : listify(s.tags))]
-      .join(" ")
-      .toLowerCase();
-    for (const r of RULES) {
-      const match = r.inc?.some((rx) => rx.test(hay));
-      const blocked = r.exc?.some((rx) => rx.test(hay));
-      if (match && !blocked) return r.a;
-    }
-    return "SALES_OUTREACH";
-  }
+  // ---------- Core builder (single lane) ----------
+  function buildWorkflowJSON(scenario, industry, opts={}){
+    const compat = (opts.compat||'safe').toLowerCase()==='full'?'full':'safe';
+    const selectedChannel = (opts.selectedChannel||'').toLowerCase().trim();
+    const archetype = (scenario?.archetype) ? String(scenario.archetype).toUpperCase() : chooseArchetype(scenario);
+    const channels = normalizeChannels(scenario, selectedChannel);
+    const trigger = preferredTrigger(archetype, scenario);
 
-  // ------------------- archetype templates -------------------
-  const T = {};
-  const addCompose = (wf, x, y) => addFunction(wf, "Compose Message", composeMessageFunctionBody(), x, y);
+    const title = `${scenario?.scenario_id||'Scenario'} — ${scenario?.name||''}`.trim();
+    const wf = baseWorkflow(title);
 
-  // Helper: deep plan chain (Plan → Adopt → Validate → Fallback)
-  function planChain(wf, entryName, x = -720, y = 180, opts = {}) {
-    const plan = addDeepPlan(wf, x, y, opts);
-    connect(wf, entryName, plan);
-    const adopt = addAdoptPlan(wf, x + 240, y);
-    connect(wf, plan, adopt);
-    const validate = addPlanValidator(wf, x + 480, y);
-    connect(wf, adopt, validate);
-    const fallback = addFallbackSynthesize(wf, x + 720, y);
-    connect(wf, validate, fallback);
-    return fallback; // guaranteed plan downstream
-  }
+    // Header + Trigger
+    addHeader(wf, 'FLOW AREA · PRODUCTION', LAYOUT.header.x, LAYOUT.header.y);
+    let trig;
+    if (trigger==='cron') trig = addCron(wf, 'Cron Trigger', LAYOUT.start.x, LAYOUT.start.y-160, compat);
+    else if (trigger==='webhook') trig = addWebhook(wf, 'Webhook Trigger', LAYOUT.start.x, LAYOUT.start.y, compat);
+    else if (trigger==='imap') trig = addFunction(wf, 'IMAP Intake (Placeholder)', 'return [$json];', LAYOUT.start.x, LAYOUT.start.y);
+    else trig = addManual(wf, LAYOUT.start.x, LAYOUT.start.y, 'Manual Trigger');
 
-  // ---------------- channels (demo-aware) ----------------
-  function demoLeaf(label) {
-    return (wf, x, y) =>
-      addFunction(
-        wf,
-        `Demo Send ${label}`,
-        `
-const d=$json;
-const payload={
-  channel: '${label.toLowerCase()}',
-  to:d.to, emailTo:d.emailTo, smsFrom:d.smsFrom, waFrom:d.waFrom, callFrom:d.callFrom,
-  message:d.message||'(no message)'
-};
-return [payload];`,
-        x,
-        y
-      );
-  }
-
-  function addEmailNode(wf, x, y) {
-    if (compat === "full")
-      return addNode(wf, {
-        id: uid("email"),
-        name: "Send Email",
-        type: "n8n-nodes-base.emailSend",
-        typeVersion: 3,
-        position: pos(x, y),
-        parameters: {
-          to: "={{$json.emailTo}}",
-          subject: "={{$json.subject || $json.scenario?.agent_name || 'AI Outreach'}}",
-          text: "={{$json.message}}"
-        },
-        credentials: {} // select in n8n
-      });
-    return demoLeaf("Email")(wf, x, y);
-  }
-  function addSMSNode(wf, x, y) {
-    if (compat === "full")
-      return addNode(wf, {
-        id: uid("sms"),
-        name: "Send SMS (Twilio)",
-        type: "n8n-nodes-base.twilio",
-        typeVersion: 3,
-        position: pos(x, y),
-        parameters: { resource: "message", operation: "create", from: "={{$json.smsFrom}}", to: "={{$json.to}}", message: "={{$json.message}}" },
-        credentials: {}
-      });
-    return demoLeaf("SMS")(wf, x, y);
-  }
-  function addWANode(wf, x, y) {
-    if (compat === "full")
-      return addNode(wf, {
-        id: uid("wa"),
-        name: "Send WhatsApp (Twilio)",
-        type: "n8n-nodes-base.twilio",
-        typeVersion: 3,
-        position: pos(x, y),
-        parameters: {
-          resource: "message",
-          operation: "create",
-          from: "={{'whatsapp:' + ($json.waFrom)}}",
-          to: "={{'whatsapp:' + ($json.to)}}",
-          message: "={{$json.message}}",
-        },
-        credentials: {}
-      });
-    return demoLeaf("WhatsApp")(wf, x, y);
-  }
-  function addCallNode(wf, x, y) {
-    if (compat === "full")
-      return addNode(wf, {
-        id: uid("call"),
-        name: "Place Call (HTTP/Provider)",
-        type: "n8n-nodes-base.httpRequest",
-        typeVersion: 4,
-        position: pos(x, y),
-        parameters: {
-          url: "={{$json.callWebhook}}",
-          method: "POST",
-          jsonParameters: true,
-          sendBody: true,
-          bodyParametersJson: "={{ { to:$json.to, from:$json.callFrom, text:$json.message } }}"
-        },
-      });
-    return demoLeaf("Call")(wf, x, y);
-  }
-
-  const CHANNEL_BUILDERS = { email: addEmailNode, sms: addSMSNode, whatsapp: addWANode, call: addCallNode };
-
-  // 1) APPOINTMENT_SCHEDULING
-  T.APPOINTMENT_SCHEDULING = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo, planDepth } = ctx,
-      sig = deriveSignals(scenario);
-    const arch = "APPOINTMENT_SCHEDULING";
-    if (forceTrigger) sig.trigger = forceTrigger;
-    const trig = addTriggerBySignals(wf, sig, -1180);
-    const init = addInit(wf, scenario, industry, sig.channels[0] || "sms", !!demo, -940, 300, arch);
-    connect(wf, trig, init);
-
-    const adopt = planChain(wf, init, -700, 220, { planDepth });
-
-    const fetch = addHTTP(wf, "Fetch Upcoming (PMS)", "={{$json.pms_upcoming || 'https://example.com/pms/upcoming'}}", "={{$json}}", -700, 300);
-    connect(wf, adopt, fetch);
-    const split = addSplit(wf, -460, 300);
-    connect(wf, fetch, split);
-    const personalize = addCompose(wf, -220, 300);
-    connect(wf, split, personalize);
-
-    const ch = (sig.channels.length ? sig.channels : ["sms","email"]);
-    const lastSend = addCadence(wf, personalize, ch, 20, 300);
-
-    let post = lastSend;
-    if (sig.features.waitlist) {
-      const detectCancel = addIf(wf, "Canceled?", "={{$json.status}}", "equal", "canceled", 20, 140);
-      connect(wf, lastSend, detectCancel);
-      const backfill = addHTTP(wf, "Backfill from Waitlist", "={{$json.waitlist_url || 'https://example.com/waitlist/fill'}}", "={{$json}}", 280, 140);
-      const confirm = addHTTP(wf, "Update PMS (Confirm)", "={{$json.pms_update || 'https://example.com/pms/update'}}", "={{$json}}", 540, 140);
-      connect(wf, detectCancel, backfill, 0);
-      connect(wf, backfill, confirm);
-      const confirm2 = addHTTP(wf, "Update PMS (Confirm)", "={{$json.pms_update || 'https://example.com/pms/update'}}", "={{$json}}", 280, 300);
-      connect(wf, detectCancel, confirm2, 1);
-      post = confirm2;
-    } else {
-      post = addHTTP(wf, "Update PMS (Confirm)", "={{$json.pms_update || 'https://example.com/pms/update'}}", "={{$json}}", 280, 300);
-      connect(wf, lastSend, post);
-    }
-    if (sig.systems.slack) {
-      const sum = addHTTP(wf, "Slack Daily Summary", "={{'https://example.com/slack/summary'}}", "={{$json}}", 540, 300);
-      connect(wf, post, sum);
-      post = sum;
-    }
-    const col = addCollector(wf, 820, 300);
-    connect(wf, post, col);
-  };
-
-  // 2) CUSTOMER_SUPPORT_INTAKE
-  T.CUSTOMER_SUPPORT_INTAKE = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo, planDepth } = ctx,
-      sig = deriveSignals(scenario);
-    const arch = "CUSTOMER_SUPPORT_INTAKE";
-    if (forceTrigger) sig.trigger = forceTrigger;
-    const trig = addTriggerBySignals(wf, sig, -1180);
-    const init = addInit(wf, scenario, industry, sig.channels[0] || "email", !!demo, -940, 300, arch);
-    connect(wf, trig, init);
-
-    const adopt = planChain(wf, init, -700, 220, { planDepth });
-
-    let entry = adopt;
-    if (sig.features.faq_search || sig.systems.kb) {
-      const kb = addHTTP(wf, "KB Search", "={{'https://example.com/kb/search'}}", "={{$json}}", -700, 300);
-      const found = addIf(wf, "Found Answer?", "={{$json.kbHit || $json.answer}}", "notEmpty", "", -460, 300);
-      connect(wf, adopt, kb);
-      connect(wf, kb, found);
-      const defl = addCompose(wf, -220, 200);
-      connect(wf, found, defl, 0);
-      const deflSend = addCadence(wf, defl, sig.channels.slice(0,1).length ? sig.channels.slice(0,1) : ["email"], 20, 200);
-      const merge = addMerge(wf, "Merge (Deflection/Ticket)", 260, 260, "append");
-      connect(wf, deflSend, merge);
-      entry = addFunction(wf, "No KB Hit → Ticket", "return [$json];", -220, 380);
-      connect(wf, found, entry, 1);
-      connect(wf, entry, merge);
-      entry = merge;
-    }
-
-    const classify = addFunction(
+    // Init context
+    const init = addFunction(
       wf,
-      "Classify SLA/VIP",
+      'Init Context',
       `
-const t=($json.message||$json.body||'').toLowerCase();
-const vip=/vip|priority|enterprise/.test(t); const sla=/sev[ -:]?1|urgent|outage/.test(t)?'high':'normal';
-return [{...$json,vip,sla}];`,
-      520,
-      300
+const scenario=${JSON.stringify({
+  scenario_id: scenario.scenario_id||'',
+  agent_name: scenario.agent_name||'',
+  name: scenario.name||'',
+  triggers: scenario.triggers||'',
+  best_reply_shapes: listify(scenario.best_reply_shapes),
+  how_it_works: scenario.how_it_works||'',
+  roi_hypothesis: scenario.roi_hypothesis||'',
+  risk_notes: scenario.risk_notes||'',
+  tags: listify(scenario["tags (;)"]||scenario.tags),
+  archetype
+})};
+return [{...$json, scenario}];`,
+      LAYOUT.start.x + LAYOUT.stepX,
+      LAYOUT.start.y
     );
-    connect(wf, entry, classify);
-    const gate = addIf(wf, "High SLA / VIP?", "={{$json.sla}}", "equal", "high", 760, 300);
-    connect(wf, classify, gate);
-    const esc = addHTTP(wf, "Escalate (Slack/Pager)", "={{'https://example.com/escalate'}}", "={{$json}}", 1000, 200);
-    connect(wf, gate, esc, 0);
-    const create = addHTTP(wf, "Create Ticket", "={{'https://example.com/ticket/create'}}", "={{$json}}", 1000, 380);
-    connect(wf, gate, create, 1);
-    connect(wf, esc, create);
-    const ack = addCadence(wf, create, sig.channels.slice(0,1).length ? sig.channels.slice(0,1) : ["email"], 1260, 300);
-    const col = addCollector(wf, 1540, 300);
-    connect(wf, ack, col);
-  };
-
-  // 3) FEEDBACK_NPS
-  T.FEEDBACK_NPS = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo, planDepth } = ctx,
-      sig = deriveSignals(scenario);
-    const arch = "FEEDBACK_NPS";
-    const cronOrTrig = addTriggerBySignals(wf, forceTrigger ? { trigger: forceTrigger } : { trigger: "cron" }, -1180);
-    const init = addInit(wf, scenario, industry, sig.channels[0] || "email", !!demo, -940, 300, arch);
-    connect(wf, cronOrTrig, init);
-
-    const adopt = planChain(wf, init, -700, 220, { planDepth });
-
-    const mk = addHTTP(wf, "Create NPS Link", "={{$json.nps || 'https://example.com/nps/create'}}", "={{$json}}", -700, 300);
-    connect(wf, adopt, mk);
-    const comp = addCompose(wf, -460, 300);
-    connect(wf, mk, comp);
-    const sendLast = addCadence(wf, comp, sig.channels.length ? sig.channels : ["email", "sms"], -200, 300);
-    const hook = addWebhook(wf, "NPS Response (Webhook)", 60, 300);
-    connect(wf, sendLast, hook);
-    const agg = addFunction(wf, "Aggregate Scores", "const n=Number($json.score||$json.nps||0);return [{score:n||0}];", 320, 300);
-    const rpt = addHTTP(wf, "Report to BI", "={{'https://example.com/bi/nps'}}", "={{$json}}", 580, 300);
-    connect(wf, hook, agg);
-    connect(wf, agg, rpt);
-    const col = addCollector(wf, 860, 300);
-    connect(wf, rpt, col);
-  };
-
-  // 4) KNOWLEDGEBASE_FAQ
-  T.KNOWLEDGEBASE_FAQ = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo, planDepth } = ctx,
-      sig = deriveSignals(scenario);
-    const arch = "KNOWLEDGEBASE_FAQ";
-    if (forceTrigger) sig.trigger = forceTrigger;
-    const trig = addTriggerBySignals(wf, { trigger: "webhook" }, -1180);
-    const init = addInit(wf, scenario, industry, sig.channels[0] || "email", !!demo, -940, 300, arch);
     connect(wf, trig, init);
 
-    const adopt = planChain(wf, init, -700, 220, { planDepth });
-
-    const search = addHTTP(wf, "KB Search", "={{'https://example.com/kb/search'}}", "={{$json}}", -700, 300);
-    connect(wf, adopt, search);
-    const found = addIf(wf, "Found Answer?", "={{$json.kbHit || $json.answer}}", "notEmpty", "", -460, 300);
-    connect(wf, search, found);
-    const comp = addCompose(wf, -220, 200);
-    connect(wf, found, comp, 0);
-    const send = addCadence(wf, comp, sig.channels.slice(0, 1).length ? sig.channels.slice(0, 1) : ["email"], 40, 200);
-    const ticket = addHTTP(wf, "Create Ticket", "={{'https://example.com/ticket/create'}}", "={{$json}}", 40, 380);
-    connect(wf, found, ticket, 1);
-    const col = addCollector(wf, 320, 300);
-    connect(wf, send, col);
-    connect(wf, ticket, col);
-  };
-
-  // 5) SALES_OUTREACH
-  T.SALES_OUTREACH = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo, planDepth } = ctx,
-      sig = deriveSignals(scenario);
-    const arch = "SALES_OUTREACH";
-    if (forceTrigger) sig.trigger = forceTrigger;
-    const trig = addTriggerBySignals(wf, sig, -1180);
-    let init = addInit(wf, scenario, industry, sig.channels[0] || "email", !!demo, -940, 300, arch);
-    connect(wf, trig, init);
-
-    const planned = planChain(wf, init, -700, 220, { planDepth });
-
-    if (sig.features.enrich) {
-      const n = addHTTP(wf, "Enrich Lead", "={{$json.enrichUrl || 'https://example.com/enrich'}}", "={{$json}}", -700, 300);
-      connect(wf, planned, n);
-      init = n;
-    } else {
-      init = planned;
+    // Optional prefetch (tiny heuristic)
+    let cursor = init;
+    if (archetype==='APPOINTMENT_SCHEDULING') {
+      const fetch = addHTTP(wf, 'Fetch Upcoming (PMS)', `={{'${DEFAULT_HTTP.pms_upcoming}'}}`, '={{$json}}', LAYOUT.start.x + 2*LAYOUT.stepX, LAYOUT.start.y);
+      connect(wf, cursor, fetch); cursor = fetch;
     }
-    if (sig.features.dedupe) {
-      const n = addFunction(
-        wf,
-        "Deduplicate",
-        `const seen=new Set(); const items=Array.isArray($json.leads)?$json.leads:[ $json ];
-const out=[]; for(const it of items){const k=(it.email||it.company||'').toLowerCase(); if(!k||seen.has(k)) continue; seen.add(k); out.push(it);} return out.length?out:[$json];`,
-        -460,
-        300
-      );
-      connect(wf, init, n);
-      init = n;
-    }
-    if (sig.features.score) {
-      const n = addFunction(wf, "Score", `const it=$json; it.score=(it.score||0)+(/c[- ]?level|vp|director/i.test(it.title||'')?40:0); return [it];`, -220, 300);
-      connect(wf, init, n);
-      init = n;
-    }
-    const comp = addCompose(wf, 20, 300);
-    connect(wf, init, comp);
-    const seq = sig.channels.length ? sig.channels.slice(0, Math.min(3, sig.channels.length)) : ["email", "sms", "email"];
-    const last = addCadence(wf, comp, seq, 280, 300);
-    if (sig.systems.crm) {
-      const log = addHTTP(wf, "CRM Log", "={{$json.crmUrl || 'https://example.com/crm/log'}}", "={{$json}}", 280 + 260 * (seq.length + 1), 300);
-      connect(wf, last, log);
-      const col = addCollector(wf, 280 + 260 * (seq.length + 2), 300);
-      connect(wf, log, col);
-    } else {
-      const col = addCollector(wf, 280 + 260 * (seq.length + 1), 300);
-      connect(wf, last, col);
-    }
-  };
-  // 6) LEAD_QUAL_INBOUND
-  T.LEAD_QUAL_INBOUND = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo, planDepth } = ctx,
-      sig = deriveSignals(scenario);
-    const arch = "LEAD_QUAL_INBOUND";
-    const hook = addTriggerBySignals(wf, { trigger: "webhook" }, -1180);
-    const init = addInit(wf, scenario, industry, sig.channels[0] || "email", !!demo, -940, 300, arch);
-    connect(wf, hook, init);
 
-    const adopt = planChain(wf, init, -700, 220, { planDepth });
-
-    const score = addFunction(
-      wf,
-      "Score/Route",
-      `const l=$json; l.score=(l.score||0)+(/director|vp|c[- ]?level/i.test(l.title||'')?40:0);
-l.route = l.score>=60?'ae':'sdr'; return [l];`,
-      -700,
-      300
-    );
-    connect(wf, adopt, score);
-    const ifAE = addIf(wf, "Route to AE?", "={{$json.route}}", "equal", "ae", -460, 300);
-    const book = addHTTP(wf, "Book Calendar", "={{$json.calUrl || 'https://example.com/calendar/book'}}", "={{$json}}", -220, 300);
-    const crm = addHTTP(wf, "Create/Update CRM", "={{$json.crmUrl || 'https://example.com/crm/upsert'}}", "={{$json}}", 40, 300);
-    connect(wf, ifAE, book, 0);
-    connect(wf, book, crm);
-    connect(wf, ifAE, crm, 1);
-    const col = addCollector(wf, 320, 300);
-    connect(wf, crm, col);
-  };
-
-  // 7) CHURN_WINBACK
-  T.CHURN_WINBACK = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo, planDepth } = ctx,
-      sig = deriveSignals(scenario);
-    const arch = "CHURN_WINBACK";
-    if (forceTrigger) sig.trigger = forceTrigger;
-    const trig = addTriggerBySignals(wf, sig, -1180);
-    const init = addInit(wf, scenario, industry, sig.channels[0] || "email", !!demo, -940, 300, arch);
-    connect(wf, trig, init);
-
-    const adopt = planChain(wf, init, -700, 220, { planDepth });
-
-    const seg = addFunction(wf, "Segment Lapsed", `const d=$json; d.segment=(d.days_lapsed||90)>180?'deep':'light'; return [d];`, -700, 300);
-    connect(wf, adopt, seg);
-    const comp = addCompose(wf, -460, 300);
-    connect(wf, seg, comp);
-    const last = addCadence(wf, comp, sig.channels.length ? sig.channels.slice(0, 2) : ["email", "sms"], -200, 300);
-    const crm = addHTTP(wf, "Log Outcome", "={{'https://example.com/crm/winback'}}", "={{$json}}", 60, 300);
-    connect(wf, last, crm);
-    const col = addCollector(wf, 340, 300);
-    connect(wf, crm, col);
-  };
-
-  // 8) RENEWALS_CSM
-  T.RENEWALS_CSM = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo, planDepth } = ctx,
-      sig = deriveSignals(scenario);
-    const arch = "RENEWALS_CSM";
-    const cron = addTriggerBySignals(wf, { trigger: "cron" }, -1180);
-    const init = addInit(wf, scenario, industry, sig.channels[0] || "email", !!demo, -940, 300, arch);
-    connect(wf, cron, init);
-
-    const adopt = planChain(wf, init, -700, 220, { planDepth });
-
-    const fetch = addHTTP(wf, "Fetch Renewals", "={{'https://example.com/crm/renewals'}}", "={{$json}}", -700, 300);
-    connect(wf, adopt, fetch);
-    const split = addSplit(wf, -460, 300);
-    connect(wf, fetch, split);
-    const risk = addFunction(wf, "Risk Score", `const r=$json;r.risk=(r.usage<0.5? 'high' : 'low'); return [r];`, -220, 300);
-    connect(wf, split, risk);
+    // Branch selector (always present, even with 1 branch) — import-safe Switch
+    const branches = (archetype==='APPOINTMENT_SCHEDULING') ? canonicalScheduling(channels) : canonicalGeneric(archetype);
     const sw = addSwitch(
       wf,
-      "Play Selection",
-      "={{$json.risk}}",
-      [
-        { operation: "equal", value2: "high" },
-        { operation: "equal", value2: "low" },
-      ],
-      40,
-      300
+      'Branch',
+      "={{$json.__branch || 'Main'}}",
+      branches.map(b=>({ operation:'equal', value2:String(b.name||'Main').slice(0,64) })),
+      LAYOUT.switchX,
+      LAYOUT.start.y
     );
-    connect(wf, risk, sw);
-    const high = addFunction(wf, "High-Risk Play", "return [$json];", 300, 200);
-    const low = addFunction(wf, "Low-Risk Play", "return [$json];", 300, 380);
-    connect(wf, sw, high, 0);
-    connect(wf, sw, low, 1);
-    const comp = addCompose(wf, 560, 300);
-    connect(wf, high, comp);
-    connect(wf, low, comp);
-    const last = addCadence(wf, comp, sig.channels.length ? sig.channels.slice(0, 2) : ["email", "sms"], 820, 300);
-    const qbr = addHTTP(wf, "Create QBR Doc", "={{'https://example.com/qbr/create'}}", "={{$json}}", 1080, 300);
-    connect(wf, last, qbr);
-    const col = addCollector(wf, 1360, 300);
-    connect(wf, qbr, col);
-  };
+    connect(wf, cursor, sw);
 
-  // 9) AR_FOLLOWUP
-  T.AR_FOLLOWUP = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo, planDepth } = ctx,
-      sig = deriveSignals(scenario);
-    const arch = "AR_FOLLOWUP";
-    if (forceTrigger) sig.trigger = forceTrigger;
-    const trig = addTriggerBySignals(wf, sig, -1180);
-    const init = addInit(wf, scenario, industry, sig.channels[0] || "email", !!demo, -940, 300, arch);
-    connect(wf, trig, init);
+    // Communication (Stage) before channels
+    const commX = LAYOUT.start.x + Math.floor(3.5*LAYOUT.stepX);
+    const branchBaseY = (bIdx, total)=> LAYOUT.start.y - Math.floor(LAYOUT.channelY * (Math.max(total,1)-1)/2) + bIdx*LAYOUT.channelY;
 
-    const adopt = planChain(wf, init, -700, 220, { planDepth });
+    let lastCollector = null;
 
-    const aging = addHTTP(wf, "Pull Aging", "={{'https://example.com/accounting/aging'}}", "={{$json}}", -700, 300);
-    connect(wf, adopt, aging);
-    const split = addSplit(wf, -460, 300);
-    connect(wf, aging, split);
-    const bucket = addFunction(wf, "Bucket 30/60/90", `const d=$json; const n=d.days_past_due||0; d.bucket= n>=90?'90': (n>=60?'60':'30'); return [d];`, -220, 300);
-    connect(wf, split, bucket);
-    const ladder = addSwitch(
-      wf,
-      "Nudge Ladder",
-      "={{$json.bucket}}",
-      [
-        { operation: "equal", value2: "30" },
-        { operation: "equal", value2: "60" },
-        { operation: "equal", value2: "90" },
-      ],
-      40,
-      300
-    );
-    connect(wf, bucket, ladder);
-    const s30 = addFunction(wf, "30-day Nudge", "return [$json];", 300, 200);
-    const s60 = addFunction(wf, "60-day Nudge", "return [$json];", 300, 300);
-    const s90 = addFunction(wf, "90-day Escalation", "return [$json];", 300, 400);
-    connect(wf, ladder, s30, 0);
-    connect(wf, ladder, s60, 1);
-    connect(wf, ladder, s90, 2);
-    const comp = addCompose(wf, 560, 300);
-    connect(wf, s30, comp);
-    connect(wf, s60, comp);
-    connect(wf, s90, comp);
-    const last = addCadence(wf, comp, sig.channels.slice(0,2).length ? sig.channels.slice(0,2) : ["email", "sms"], 820, 300);
+    branches.forEach((b, bIdx)=>{
+      const comm = addFunction(wf, 'Communication (Stage)', 'return [$json];', commX, branchBaseY(bIdx, branches.length));
+      connect(wf, sw, comm, bIdx);
 
-    if (/dispute|discrepanc|appeal/.test(String(scenario.how_it_works || "").toLowerCase())) {
-      const ifDisp = addIf(wf, "Dispute Raised?", "={{$json.dispute}}", "notEmpty", "", 1080, 300);
-      connect(wf, last, ifDisp);
-      const resolve = addHTTP(wf, "Dispute Review", "={{'https://example.com/ar/dispute'}}", "={{$json}}", 1340, 300);
-      connect(wf, ifDisp, resolve, 0);
-      const col = addCollector(wf, 1620, 300);
-      connect(wf, resolve, col);
-    } else {
-      const col = addCollector(wf, 1080, 300);
-      connect(wf, last, col);
-    }
-  };
+      // Vertical per-channel rows for this branch
+      const chFirstY = (count)=> branchBaseY(bIdx, branches.length) - Math.floor(LAYOUT.channelY * (count-1)/2);
 
-  // 10) AP_AUTOMATION
-  T.AP_AUTOMATION = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo, planDepth } = ctx,
-      sig = deriveSignals(scenario);
-    const arch = "AP_AUTOMATION";
-    const hook = addTriggerBySignals(wf, { trigger: "webhook" }, -1180);
-    const init = addInit(wf, scenario, industry, "email", !!demo, -940, 300, arch);
-    connect(wf, hook, init);
+      let prevRowCollector = null;
+      channels.forEach((ch, chIdx)=>{
+        const rowY = chFirstY(channels.length) + chIdx*LAYOUT.channelY;
 
-    const adopt = planChain(wf, init, -700, 220, { planDepth });
+        // Enter row
+        const enterName = GUIDE.numberSteps ? `[${1}] Enter · ${b.name || 'Main'} · ${ch.toUpperCase()}` : `Enter · ${b.name||'Main'} · ${ch.toUpperCase()}`;
+        const enter = addFunction(wf, enterName, `return [{...$json,__branch:${JSON.stringify(b.name||'Main')},__channel:${JSON.stringify(ch)}}];`, commX + LAYOUT.stepX, rowY);
+        if (chIdx===0) connect(wf, comm, enter);
+        if (prevRowCollector) connect(wf, prevRowCollector, enter);
 
-    const parse = addFunction(wf, "Parse/Extract", "return [$json];", -700, 300);
-    connect(wf, adopt, parse);
-    const match = addFunction(wf, "3-Way Match", "return [$json];", -460, 300);
-    connect(wf, parse, match);
-    const ifExc = addIf(wf, "Exception?", "={{$json.exception}}", "notEmpty", "", -220, 300);
-    connect(wf, match, ifExc);
-    const appr = addFunction(wf, "Approval Path", "return [$json];", 40, 300);
-    const pay = addHTTP(wf, "Issue Payment", "={{'https://example.com/pay'}}", "={{$json}}", 300, 300);
-    connect(wf, ifExc, appr, 0);
-    connect(wf, appr, pay);
-    connect(wf, ifExc, pay, 1);
-    const col = addCollector(wf, 580, 300);
-    connect(wf, pay, col);
-  };
+        // Walk steps for this branch on this channel
+        let stepIndex = 1;
+        let prev = enter;
 
-  // 11) INVENTORY_MONITOR
-  T.INVENTORY_MONITOR = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo, planDepth } = ctx,
-      sig = deriveSignals(scenario);
-    const arch = "INVENTORY_MONITOR";
-    const trig = addTriggerBySignals(wf, sig, -1180);
-    const init = addInit(wf, scenario, industry, "email", !!demo, -940, 300, arch);
-    connect(wf, trig, init);
+        const runStep = (title, kind, x, y)=>{
+          let node;
+          if (kind==='compose'){
+            node = addFunction(wf, title, `
+const body=${JSON.stringify(composeBody(archetype, ch, scenario, industry))};
+const subject=${JSON.stringify(scenario.agent_name ? `${scenario.agent_name} — ${scenario.scenario_id||''}` : (scenario.scenario_id||'Update'))};
+return [{...$json, message: body, subject}];`, x, y);
+          } else if (kind==='book'){
+            node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.calendar_book}'}}`, '={{$json}}', x, y);
+          } else if (kind==='http' || kind==='lookup' || kind==='update' || kind==='store' || kind==='notify' || kind==='route' || kind==='score'){
+            node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.step_generic}'}}`, '={{$json}}', x, y);
+          } else {
+            node = addFunction(wf, title, 'return [$json];', x, y);
+          }
+          connect(wf, prev, node); prev = node;
+        };
 
-    const adopt = planChain(wf, init, -700, 220, { planDepth });
+        const walkSteps = (steps, baseX, baseY)=>{
+          for (let i=0; i<steps.length; i++){
+            const st = steps[i];
+            const title = GUIDE.numberSteps ? `[${++stepIndex}] ${st.name||'Step'}` : (st.name||'Step');
+            const x = baseX + i*LAYOUT.stepX;
 
-    const fetch = addHTTP(wf, "Fetch Stock (WMS/ERP)", "={{'https://example.com/wms/levels'}}", "={{$json}}", -700, 300);
-    connect(wf, adopt, fetch);
-    const split = addSplit(wf, -460, 300);
-    connect(wf, fetch, split);
-    const thresh = addFunction(wf, "Threshold Check", "const i=$json; i.low=(i.qty||0) <= (i.min||10); return [i];", -220, 300);
-    connect(wf, split, thresh);
-    const gate = addIf(wf, "Low Stock?", "={{$json.low}}", "equal", "true", 40, 300);
-    connect(wf, thresh, gate);
-    const alert = addHTTP(wf, "Notify Ops", "={{'https://example.com/slack/inventory'}}", "={{$json}}", 300, 200);
-    connect(wf, gate, alert, 1);
-    let poStart = addFunction(wf, "Prepare PO", "return [$json];", 300, 380);
-    connect(wf, gate, poStart, 0);
-    if (sig.features.approvals) {
-      const appr = addFunction(wf, "Approval", "return [$json];", 560, 380);
-      connect(wf, poStart, appr);
-      poStart = appr;
-    }
-    const createPO = addHTTP(wf, "Create PO (ERP)", "={{'https://example.com/erp/po'}}", "={{$json}}", 820, 380);
-    connect(wf, poStart, createPO);
-    const col = addCollector(wf, 1100, 300);
-    connect(wf, alert, col);
-    connect(wf, createPO, col);
-  };
+            if (String(st.kind||'').toLowerCase()==='decision' && Array.isArray(st.outcomes) && st.outcomes.length){
+              const rulz = st.outcomes.map(o=>({ operation:'equal', value2:String(o.value||'path').slice(0,64) }));
+              const dsw = addSwitch(wf, `${title} (Decision)`, "={{$json.__decision || 'default'}}", rulz, x, baseY);
+              connect(wf, prev, dsw);
 
-  // 12) REPLENISHMENT_PO
-  T.REPLENISHMENT_PO = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo, planDepth } = ctx,
-      sig = deriveSignals(scenario);
-    const arch = "REPLENISHMENT_PO";
-    const hook = addTriggerBySignals(wf, { trigger: "webhook" }, -1180);
-    const init = addInit(wf, scenario, industry, "email", !!demo, -940, 300, arch);
-    connect(wf, hook, init);
+              let chain = null;
+              st.outcomes.forEach((o, oIdx)=>{
+                const oy = baseY - Math.floor((st.outcomes.length-1)/2)*LAYOUT.outcomeRowY + oIdx*LAYOUT.outcomeRowY;
+                const oEnter = addFunction(wf, `[${stepIndex}.${oIdx+1}] Outcome: ${o.value||'path'}`, `return [{...$json,__decision:${JSON.stringify(String(o.value||'path'))}}];`, x + Math.floor(LAYOUT.stepX*0.6), oy);
+                connect(wf, dsw, oEnter, oIdx);
 
-    const adopt = planChain(wf, init, -700, 220, { planDepth });
+                let prevO = oEnter;
+                (Array.isArray(o.steps)?o.steps:[]).forEach((os, ok)=>{
+                  const ox = x + Math.floor(LAYOUT.stepX*0.6) + (ok+1)*Math.floor(LAYOUT.stepX*1.05);
+                  const ot = `[${stepIndex}.${oIdx+1}.${ok+1}] ${os.name||'Step'}`;
+                  let node;
+                  if (String(os.kind||'').toLowerCase()==='compose'){
+                    node = addFunction(wf, ot, `
+const body=${JSON.stringify(composeBody(archetype, ch, scenario, industry))};
+const subject=${JSON.stringify(scenario.agent_name ? `${scenario.agent_name} — ${scenario.scenario_id||''}` : (scenario.scenario_id||'Update'))};
+return [{...$json, message: body, subject}];`, ox, oy);
+                  } else if (['book'].includes(String(os.kind||'').toLowerCase())){
+                    node = addHTTP(wf, ot, `={{'${DEFAULT_HTTP.calendar_book}'}}`, '={{$json}}', ox, oy);
+                  } else if (['http','update','store','notify','route','lookup','score'].includes(String(os.kind||'').toLowerCase())){
+                    node = addHTTP(wf, ot, `={{'${DEFAULT_HTTP.step_generic}'}}`, '={{$json}}', ox, oy);
+                  } else {
+                    node = addFunction(wf, ot, 'return [$json];', ox, oy);
+                  }
+                  connect(wf, prevO, node); prevO = node;
+                });
 
-    const vendor = addFunction(wf, "Pick Supplier", "return [$json];", -700, 300);
-    const create = addHTTP(wf, "Create PO (ERP)", "={{'https://example.com/erp/po'}}", "={{$json}}", -460, 300);
-    const appr = addFunction(wf, "Approvals", "return [$json];", -220, 300);
-    const update = addHTTP(wf, "Update WMS", "={{'https://example.com/wms/update'}}", "={{$json}}", 40, 300);
-    connect(wf, adopt, vendor);
-    connect(wf, vendor, create);
-    connect(wf, create, appr);
-    connect(wf, appr, update);
-    const col = addCollector(wf, 320, 300);
-    connect(wf, update, col);
-  };
+                const sendX = x + Math.floor(LAYOUT.stepX*0.6) + Math.max(2, (o.steps||[]).length+1)*Math.floor(LAYOUT.stepX*1.05);
+                const sender = makeSender(wf, ch, sendX, oy, compat);
+                try{ wf.nodes[wf.nodes.findIndex(n=>n.name===sender)].name = `[${stepIndex}.${oIdx+1}] Send: ${ch.toUpperCase()}`; }catch{}
+                connect(wf, prevO, sender);
+                const oCol = addCollector(wf, sendX + Math.floor(LAYOUT.stepX*0.9), oy);
+                connect(wf, sender, oCol);
 
-  // 13) FIELD_SERVICE_DISPATCH
-  T.FIELD_SERVICE_DISPATCH = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo, planDepth } = ctx,
-      sig = deriveSignals(scenario);
-    const arch = "FIELD_SERVICE_DISPATCH";
-    const trig = addTriggerBySignals(wf, { trigger: "webhook" }, -1180);
-    const init = addInit(wf, scenario, industry, sig.channels[0] || "sms", !!demo, -940, 300, arch);
-    connect(wf, trig, init);
+                if (chain) connect(wf, chain, oCol);
+                chain = oCol;
 
-    const adopt = planChain(wf, init, -700, 220, { planDepth });
+                if (oIdx === st.outcomes.length-1){
+                  prev = chain;
+                }
+              });
+            } else {
+              runStep(title, String(st.kind||'').toLowerCase(), x, baseY);
+            }
+          }
+        };
 
-    const match = addFunction(wf, "Geo/Skills Match", "return [$json];", -700, 300);
-    const assign = addHTTP(wf, "Assign Technician", "={{'https://example.com/dispatch/assign'}}", "={{$json}}", -460, 300);
-    connect(wf, adopt, match);
-    connect(wf, match, assign);
-    const notifyTech = addCadence(wf, assign, [sig.channels[0] || "sms"], -200, 260);
-    const notifyCust = addCadence(wf, assign, [sig.channels[1] || "email"], -200, 340);
-    const cal = addHTTP(wf, "Calendar Booking", "={{'https://example.com/calendar/book'}}", "={{$json}}", 60, 300);
-    connect(wf, notifyTech, cal);
-    connect(wf, notifyCust, cal);
-    const col = addCollector(wf, 340, 300);
-    connect(wf, cal, col);
-  };
+        // Walk this branch steps
+        walkSteps(Array.isArray(b.steps)?b.steps:[], commX + 2*LAYOUT.stepX, rowY);
 
-  // 14) COMPLIANCE_AUDIT
-  T.COMPLIANCE_AUDIT = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo, planDepth } = ctx,
-      sig = deriveSignals(scenario);
-    const arch = "COMPLIANCE_AUDIT";
-    const cron = addTriggerBySignals(wf, { trigger: "cron" }, -1180);
-    const init = addInit(wf, scenario, industry, "email", !!demo, -940, 300, arch);
-    connect(wf, cron, init);
+        // If last wasn’t a decision, add send+collect here
+        const lastIsDecision = (Array.isArray(b.steps) && b.steps.some(st=>String(st.kind||'').toLowerCase()==='decision'));
+        if (!lastIsDecision){
+          const sendX = commX + 2*LAYOUT.stepX + (Math.max(1, (b.steps||[]).length))*LAYOUT.stepX;
+          const sendTitle = GUIDE.numberSteps ? `[${++stepIndex}] Send: ${ch.toUpperCase()}` : `Send: ${ch.toUpperCase()}`;
+          const sender = makeSender(wf, ch, sendX, rowY, compat);
+          try{ wf.nodes[wf.nodes.findIndex(n=>n.name===sender)].name = sendTitle; }catch{}
+          connect(wf, prev, sender);
+          const col = addCollector(wf, sendX + LAYOUT.stepX, rowY);
+          connect(wf, sender, col);
+          if (prevRowCollector) connect(wf, prevRowCollector, col);
+          prevRowCollector = col;
+        }
 
-    const adopt = planChain(wf, init, -700, 220, { planDepth });
-
-    const fetch = addHTTP(wf, "Fetch Checklist", "={{'https://example.com/compliance/list'}}", "={{$json}}", -700, 300);
-    const validate = addFunction(wf, "Validate Controls", "return [$json];", -460, 300);
-    const issues = addIf(wf, "Any Issues?", "={{$json.issues}}", "notEmpty", "", -220, 300);
-    const report = addHTTP(wf, "Generate Report", "={{'https://example.com/compliance/report'}}", "={{$json}}", 40, 300);
-    const notify = addHTTP(wf, "Notify Legal", "={{'https://example.com/legal/notify'}}", "={{$json}}", 300, 300);
-    connect(wf, adopt, fetch);
-    connect(wf, fetch, validate);
-    connect(wf, validate, issues);
-    connect(wf, issues, report, 0);
-    connect(wf, report, notify);
-    connect(wf, issues, notify, 1);
-    const col = addCollector(wf, 580, 300);
-    connect(wf, notify, col);
-  };
-
-  // 15) INCIDENT_MGMT
-  T.INCIDENT_MGMT = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo, planDepth } = ctx,
-      sig = deriveSignals(scenario);
-    const arch = "INCIDENT_MGMT";
-    const hook = addTriggerBySignals(wf, { trigger: "webhook" }, -1180);
-    const init = addInit(wf, scenario, industry, "email", !!demo, -940, 300, arch);
-    connect(wf, hook, init);
-
-    const adopt = planChain(wf, init, -700, 220, { planDepth });
-
-    const sev = addFunction(
-      wf,
-      "Severity Detect",
-      `const t=String($json.title||'').toLowerCase();$json.sev = /sev[ -:]?1|critical|major/.test(t)?'high':'normal';return [$json];`,
-      -700,
-      300
-    );
-    const ifHigh = addIf(wf, "High Severity?", "={{$json.sev}}", "equal", "high", -460, 300);
-    const comms = addHTTP(wf, "Incident Comms", "={{'https://example.com/comms'}}", "={{$json}}", -220, 300);
-    const ticket = addHTTP(wf, "Create Incident Ticket", "={{'https://example.com/itsm/ticket'}}", "={{$json}}", 40, 300);
-    const pir = addHTTP(wf, "Prep PIR Doc", "={{'https://example.com/pir/create'}}", "={{$json}}", 300, 300);
-    connect(wf, adopt, sev);
-    connect(wf, sev, ifHigh);
-    connect(wf, ifHigh, comms, 0);
-    connect(wf, comms, ticket);
-    connect(wf, ifHigh, ticket, 1);
-    connect(wf, ticket, pir);
-    const col = addCollector(wf, 580, 300);
-    connect(wf, pir, col);
-  };
-
-  // 16) DATA_PIPELINE_ETL
-  T.DATA_PIPELINE_ETL = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo, planDepth } = ctx,
-      sig = deriveSignals(scenario);
-    const arch = "DATA_PIPELINE_ETL";
-    const cron = addTriggerBySignals(wf, { trigger: "cron" }, -1180);
-    const init = addInit(wf, scenario, industry, "email", !!demo, -940, 300, arch);
-    connect(wf, cron, init);
-
-    const adopt = planChain(wf, init, -700, 220, { planDepth });
-
-    const extract = addHTTP(wf, "Extract", "={{'https://example.com/extract'}}", "={{$json}}", -700, 300);
-    const transform = addFunction(wf, "Transform", "return [$json];", -460, 300);
-    const load = addHTTP(wf, "Load (DB/Sheets)", "={{'https://example.com/load'}}", "={{$json}}", -220, 300);
-    const status = addHTTP(wf, "Status/Alert", "={{'https://example.com/alert'}}", "={{$json}}", 40, 300);
-    connect(wf, adopt, extract);
-    connect(wf, extract, transform);
-    connect(wf, transform, load);
-    connect(wf, load, status);
-    const col = addCollector(wf, 320, 300);
-    connect(wf, status, col);
-  };
-
-  // 17) REPORTING_KPI_DASH
-  T.REPORTING_KPI_DASH = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo, planDepth } = ctx,
-      sig = deriveSignals(scenario);
-    const arch = "REPORTING_KPI_DASH";
-    const cron = addTriggerBySignals(wf, { trigger: "cron" }, -1180);
-    const init = addInit(wf, scenario, industry, "email", !!demo, -940, 300, arch);
-    connect(wf, cron, init);
-
-    const adopt = planChain(wf, init, -700, 220, { planDepth });
-
-    const metrics = addHTTP(wf, "Calculate Metrics", "={{'https://example.com/metrics'}}", "={{$json}}", -700, 300);
-    const dash = addHTTP(wf, "Render Dashboard", "={{'https://example.com/dash/export'}}", "={{$json}}", -460, 300);
-    const email = addHTTP(wf, "Send Email/Slack", "={{'https://example.com/notify'}}", "={{$json}}", -220, 300);
-    connect(wf, adopt, metrics);
-    connect(wf, metrics, dash);
-    connect(wf, dash, email);
-    const col = addCollector(wf, 60, 300);
-    connect(wf, email, col);
-  };
-
-  // 18) ACCESS_GOVERNANCE
-  T.ACCESS_GOVERNANCE = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo, planDepth } = ctx,
-      sig = deriveSignals(scenario);
-    const arch = "ACCESS_GOVERNANCE";
-    const hook = addTriggerBySignals(wf, { trigger: "webhook" }, -1180);
-    const init = addInit(wf, scenario, industry, "email", !!demo, -940, 300, arch);
-    connect(wf, hook, init);
-
-    const adopt = planChain(wf, init, -700, 220, { planDepth });
-
-    const ent = addFunction(wf, "Check Entitlements", "return [$json];", -700, 300);
-    const appr = addFunction(wf, "Approval", "return [$json];", -460, 300);
-    const prov = addHTTP(wf, "Provision/Deprovision", "={{'https://example.com/iam/provision'}}", "={{$json}}", -220, 300);
-    const log = addHTTP(wf, "Log Decision", "={{'https://example.com/iam/log'}}", "={{$json}}", 40, 300);
-    connect(wf, adopt, ent);
-    connect(wf, ent, appr);
-    connect(wf, appr, prov);
-    connect(wf, prov, log);
-    const col = addCollector(wf, 320, 300);
-    connect(wf, log, col);
-  };
-
-  // 19) PRIVACY_DSR
-  T.PRIVACY_DSR = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo, planDepth } = ctx,
-      sig = deriveSignals(scenario);
-    const arch = "PRIVACY_DSR";
-    const hook = addTriggerBySignals(wf, { trigger: "webhook" }, -1180);
-    const init = addInit(wf, scenario, industry, "email", !!demo, -940, 300, arch);
-    connect(wf, hook, init);
-
-    const adopt = planChain(wf, init, -700, 220, { planDepth });
-
-    const idv = addHTTP(wf, "Identity Verify (KYC)", "={{'https://example.com/kyc'}}", "={{$json}}", -700, 300);
-    const collect = addHTTP(wf, "Collect Data", "={{'https://example.com/privacy/collect'}}", "={{$json}}", -460, 300);
-    const respond = addHTTP(wf, "Respond to Subject", "={{'https://example.com/privacy/respond'}}", "={{$json}}", -220, 300);
-    const attest = addHTTP(wf, "Attest & Close", "={{'https://example.com/privacy/attest'}}", "={{$json}}", 40, 300);
-    connect(wf, adopt, idv);
-    connect(wf, idv, collect);
-    connect(wf, collect, respond);
-    connect(wf, respond, attest);
-    const col = addCollector(wf, 320, 300);
-    connect(wf, attest, col);
-  };
-
-  // 20) RECRUITING_INTAKE
-  T.RECRUITING_INTAKE = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo, planDepth } = ctx,
-      sig = deriveSignals(scenario);
-    const arch = "RECRUITING_INTAKE";
-    const hook = addTriggerBySignals(wf, { trigger: "webhook" }, -1180);
-    const init = addInit(wf, scenario, industry, "email", !!demo, -940, 300, arch);
-    connect(wf, hook, init);
-
-    const adopt = planChain(wf, init, -700, 220, { planDepth });
-
-    const parse = addFunction(wf, "Parse Resume", "return [$json];", -700, 300);
-    const score = addFunction(wf, "Score Candidate", "return [$json];", -460, 300);
-    const stage = addSwitch(
-      wf,
-      "Stage Route",
-      "={{$json.stage||'phone'}}",
-      [
-        { operation: "equal", value2: "phone" },
-        { operation: "equal", value2: "onsite" },
-      ],
-      -220,
-      300
-    );
-    const sched = addHTTP(wf, "Schedule Interview", "={{'https://example.com/calendar/book'}}", "={{$json}}", 40, 300);
-    const ats = addHTTP(wf, "ATS Update", "={{'https://example.com/ats/update'}}", "={{$json}}", 300, 300);
-    connect(wf, adopt, parse);
-    connect(wf, parse, score);
-    connect(wf, score, stage);
-    connect(wf, stage, sched, 0);
-    connect(wf, stage, ats, 1);
-    connect(wf, sched, ats);
-    const col = addCollector(wf, 580, 300);
-    connect(wf, ats, col);
-  };
-  // ---------------- Demo tool mapping ----------------
-  function addDemoToolMapper(wf, x = -1200, y = 80) {
-    return addFunction(
-      wf,
-      "Demo Tool Mapper",
-      `
-const mapDemo = (name)=> name ? String(name).replace(/Salesforce|HubSpot|Mailchimp|Twilio|Slack|NetSuite|ServiceNow|Zendesk|Gmail|Outlook|Stripe|QuickBooks/gi, (m)=> m + ' (Demo)') : name;
-const plan = $json.plan || {};
-if (plan.tools){
-  const t = {...plan.tools};
-  for (const k of Object.keys(t)) t[k] = mapDemo(t[k]);
-  plan.tools = t;
-}
-return [{...$json, plan}];`,
-      x, y
-    );
-  }
-
-  // ---------------- builder (two lanes) ----------------
-  function buildWorkflowJSON(scenario, industry, opts = {}) {
-    const archetype = scenario?.archetype || classifyFallback(scenario);
-    const wfName = `${scenario?.scenario_id || scenario?.title || "AI Agent Workflow"} — ${industry?.name || industry?.industry_id || "Industry"}`;
-    const wf = baseWorkflow(wfName);
-    const tmpl = T[archetype] || T.SALES_OUTREACH;
-    const planDepth = (opts.planDepth || planDepthQS || 'deep');
-
-    // LANE A: PRODUCTION (top). Use real trigger. demo=false
-    withYOffset(wf, 0, () => {
-      const hdr = addLaneHeader(wf, "PRODUCTION LANE", -1320, 40);
-      tmpl(wf, { scenario, industry, demo: false, forceTrigger: null, planDepth });
-      const prodNote = addFunction(wf, "Prod Creds Placeholder", "return [$json];", -1320, 120);
-      connect(wf, hdr, prodNote);
+        // update lastCollector if this is the tail-most row
+        if (bIdx === branches.length-1 && chIdx === channels.length-1) lastCollector = prevRowCollector;
+      });
     });
 
-    // LANE B: DEMO (bottom). Force manual trigger. demo=true. Offset to avoid overlap.
-    withYOffset(wf, 900, () => {
-      const hdr = addLaneHeader(wf, "DEMO LANE (Manual Trigger + Seeded Contacts)", -1320, 40);
-      tmpl(wf, { scenario, industry, demo: true, forceTrigger: "manual", planDepth });
-      const mapper = addDemoToolMapper(wf, -1320, 120);
-      connect(wf, hdr, mapper);
-    });
+    // Static metadata
+    wf.staticData.__design = {
+      archetype, trigger, channels,
+      layout: { verticalChannels:true, commHub:true, stepX:LAYOUT.stepX, channelY:LAYOUT.channelY }
+    };
 
     return wf;
   }
-
+  // ---------- Export ----------
   window.Builder = { buildWorkflowJSON };
+
 })();

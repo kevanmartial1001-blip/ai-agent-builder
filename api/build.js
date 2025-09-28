@@ -1,7 +1,9 @@
 // api/build.js
-// Essential-only generator that keeps the external shape your UI expects.
-// Flow: Trigger → Init → Communication(Stage) → per-channel [Enter → Compose → Send → Collect]
-// Adds YES/NO hypothesis message variants (default "yes"; override by posting {"__hypothesis":"no"}).
+// Wide layout, vertical-per-channel *fan-out*, strict chronology, fully linked A→Z.
+// Adds a visible Communication (Stage) BEFORE the per-channel fan-out.
+// Per-channel gates:  Channel = X?  →  X Allowlist  →  X Allowed?  →  Send X
+// All sends converge into a single "Wait for Reply" node.
+// Uses conservative n8n node versions (every node has link handles).
 // Env: SHEET_ID, GOOGLE_API_KEY, SHEET_TAB?=Scenarios, OPENAI_API_KEY
 
 const HEADERS = {
@@ -11,7 +13,7 @@ const HEADERS = {
   "Content-Type": "application/json; charset=utf-8",
 };
 
-// ====== Layout (compatible with your UI) ======
+// ====== Layout (extra air) ======
 const LAYOUT = {
   laneGap: 3200,
   stepX: 720,
@@ -43,12 +45,28 @@ const DEFAULT_HTTP = {
   calendar_book: "https://example.com/calendar/book",
 };
 
-// ====== Light inference ======
-const CHANNEL_NORMALIZE = [
-  { k: 'whatsapp', rx: /whatsapp/i },
-  { k: 'sms', rx: /(sms|text)/i },
-  { k: 'call', rx: /(voice|call|phone)/i },
-  { k: 'email', rx: /email/i },
+// ====== Archetypes & rules ======
+const ARCH_RULES = [
+  { a:'APPOINTMENT_SCHEDULING', rx:/(appointment|appointments|scheduling|no[-_ ]?show|calendar)/i },
+  { a:'CUSTOMER_SUPPORT_INTAKE', rx:/\b(cs|support|helpdesk|ticket|sla|triage|escalation|deflection|kb)\b/i },
+  { a:'FEEDBACK_NPS', rx:/\b(nps|survey|surveys|feedback|csat|ces)\b/i },
+  { a:'KNOWLEDGEBASE_FAQ', rx:/\b(kb|faq|knowledge|self-?service)\b/i },
+  { a:'SALES_OUTREACH', rx:/\b(sales|outreach|cadence|sequence|abm|prospect|cold[-_ ]?email)\b/i },
+  { a:'LEAD_QUAL_INBOUND', rx:/\b(inbound|lead[-_ ]?qual|qualification|routing|router|forms?)\b/i },
+  { a:'CHURN_WINBACK', rx:/\b(churn|win[-_ ]?back|reactivation|retention|loyalty)\b/i },
+  { a:'RENEWALS_CSM', rx:/\b(renewal|qbr|success|csm|upsell|cross-?sell)\b/i },
+  { a:'AR_FOLLOWUP', rx:/\b(a\/?r|accounts?\s*receivable|invoice|collections?|dso|reconciliation)\b/i },
+  { a:'AP_AUTOMATION', rx:/\b(a\/?p|accounts?\s*payable|invoices?|3[-\s]?way|three[-\s]?way|matching|approvals?)\b/i },
+  { a:'INVENTORY_MONITOR', rx:/\b(inventory|stock|sku|threshold|warehouse|3pl|wms|backorder)\b/i },
+  { a:'REPLENISHMENT_PO', rx:/\b(replenishment|purchase[-_ ]?order|po|procure|procurement|vendors?|suppliers?)\b/i },
+  { a:'FIELD_SERVICE_DISPATCH', rx:/\b(dispatch|work[-_ ]?orders?|technicians?|field|geo|eta|route|yard)\b/i },
+  { a:'COMPLIANCE_AUDIT', rx:/\b(compliance|audit|audits|policy|governance|sox|iso|gdpr|hipaa|attestation)\b/i },
+  { a:'INCIDENT_MGMT', rx:/\b(incident|sev[: ]?(high|p[12])|major|rca|postmortem|downtime|uptime|slo)\b/i },
+  { a:'DATA_PIPELINE_ETL', rx:/\b(etl|pipeline|ingest|transform|load|csv|s3|gcs|orchestration)\b/i },
+  { a:'REPORTING_KPI_DASH', rx:/\b(dashboard|dashboards|kpi|scorecard|report|reporting)\b/i },
+  { a:'ACCESS_GOVERNANCE', rx:/\b(access|rbac|sso|entitlements|seats|identity|pii|dlp)\b/i },
+  { a:'PRIVACY_DSR', rx:/\b(dsr|data\s*subject|privacy\s*request|gdpr|ccpa)\b/i },
+  { a:'RECRUITING_INTAKE', rx:/\b(recruit(ing)?|ats|cv|resume|candidate|interviews?)\b/i },
 ];
 
 const TRIGGER_PREF = {
@@ -61,15 +79,26 @@ const TRIGGER_PREF = {
   RECRUITING_INTAKE: 'webhook',
 };
 
+const CHANNEL_NORMALIZE = [
+  { k: 'whatsapp', rx: /whatsapp/i },
+  { k: 'sms', rx: /(sms|text)/i },
+  { k: 'call', rx: /(voice|call|phone)/i },
+  { k: 'email', rx: /email/i },
+];
+
 // ---------- utils ----------
 const uid = (p) => `${p}_${Math.random().toString(36).slice(2, 10)}`;
 const pos = (x, y) => [x, y];
 function toObj(header, row) { return Object.fromEntries(header.map((h,i)=>[h,(row[i]??"").toString().trim()])); }
-const listify = (v) => Array.isArray(v)
-  ? v.map(x=>String(x).trim()).filter(Boolean)
-  : String(v||'').split(/[;,/|\n]+/).map(x=>x.trim()).filter(Boolean);
+const listify = (v) => Array.isArray(v) ? v.map(x=>String(x).trim()).filter(Boolean) : String(v||'').split(/[;,/|\n]+/).map(x=>x.trim()).filter(Boolean);
 
-// ---------- sheet + LLM (messages only, optional) ----------
+function chooseArchetype(row){
+  const hay=[row["scenario_id"],row["name"],row["tags"],row["triggers"],row["how_it_works"],row["tool_stack_dev"]].map(x=>String(x||'')).join(' ');
+  for(const r of ARCH_RULES) if(r.rx.test(hay)) return r.a;
+  return 'SALES_OUTREACH';
+}
+
+// ---------- sheet + llm ----------
 async function fetchSheetRowByScenarioId(scenarioId){
   const SHEET_ID=process.env.SHEET_ID; const GOOGLE_API_KEY=process.env.GOOGLE_API_KEY; const TAB=process.env.SHEET_TAB||"Scenarios";
   if(!SHEET_ID||!GOOGLE_API_KEY) throw new Error("Missing SHEET_ID or GOOGLE_API_KEY");
@@ -80,22 +109,19 @@ async function fetchSheetRowByScenarioId(scenarioId){
   return obj.find(x=>(x["scenario_id"]||"").toString().trim().toLowerCase()===scenarioId.toLowerCase());
 }
 
-async function openaiJSON(prompt){
+async function openaiJSON(prompt, schemaHint){
   const key=process.env.OPENAI_API_KEY; if(!key) return null;
   try{
     const r=await fetch("https://api.openai.com/v1/chat/completions",{
       method:"POST",
-      headers:{
-        "Authorization":`Bearer ${key}`,
-        "Content-Type":"application/json"
-      },
+      headers:{ "Authorization":`Bearer ${key}`,"Content-Type":"application/json"},
       body:JSON.stringify({
         model:"gpt-4o-mini",
         temperature:0.25,
         response_format:{type:"json_object"},
         messages:[
           {role:"system",content:"Return concise JSON only."},
-          {role:"user",content:prompt}
+          {role:"user",content:prompt+(schemaHint?("\n\nSchema:\n"+schemaHint):"")}
         ]
       })
     });
@@ -114,47 +140,45 @@ function makeMessagingPrompt(row, archetype, channels){
     `ROI_HYPOTHESIS: ${row.roi_hypothesis||''}`,
     `RISK_NOTES: ${row.risk_notes||''}`,
   ].join("\n");
-  return `Write two ultra-brief variants per channel (YES vs NO hypothesis). 3–5 lines each.
+  return `
+Write two ultra-brief variants per channel (YES vs NO hypothesis). 3–5 lines each.
 
 Return JSON:
 {
-  "yes": {
-    "email":{"subject":"...","body":"..."},
-    "sms":{"body":"..."},
-    "whatsapp":{"body":"..."},
-    "call":{"script":"..."}
-  },
-  "no": {
-    "email":{"subject":"...","body":"..."},
-    "sms":{"body":"..."},
-    "whatsapp":{"body":"..."},
-    "call":{"script":"..."}
-  }
+  "yes": { "email":{"subject":"...","body":"..."},"sms":{"body":"..."},"whatsapp":{"body":"..."},"call":{"script":"..."} },
+  "no":  { "email":{"subject":"...","body":"..."},"sms":{"body":"..."},"whatsapp":{"body":"..."},"call":{"script":"..."} }
 }
 
 Channels: ${JSON.stringify(channels)}
 Archetype: ${archetype}
 
 Context:
-${ctx}`;
+${ctx}`.trim();
 }
 
-// ---------- workflow primitives ----------
+// ---------- workflow primitives (known versions) ----------
 function baseWorkflow(name){ return { name, nodes:[], connections:{}, active:false, settings:{}, staticData:{}, __yOffset:0 }; }
 
 function uniqueName(wf, base){
   const existing = new Set((wf.nodes||[]).map(n=>String(n.name||'').toLowerCase()));
   if(!base || typeof base!=='string') base = 'Node';
-  let name = base; let i = 1;
+  let name = base;
+  let i = 1;
   while(existing.has(name.toLowerCase())){ i += 1; name = `${base} #${i}`; }
   return name;
 }
 
 function nudgeIfOverlapping(wf, x, y){
-  const EPS = 64, STEP = 72; let yy = y;
+  const EPS = 64, STEP = 72;
+  let yy = y;
   for(let i=0;i<50;i++){
-    const hit = (wf.nodes||[]).some(n=>Array.isArray(n.position)&&Math.abs(n.position[0]-x)<EPS&&Math.abs(n.position[1]-yy)<EPS);
-    if(!hit) return yy; yy += STEP;
+    const hit = (wf.nodes||[]).some(n=>{
+      if(!Array.isArray(n.position)) return false;
+      const [nx, ny] = n.position;
+      return Math.abs(nx - x) < EPS && Math.abs(ny - yy) < EPS;
+    });
+    if(!hit) return yy;
+    yy += STEP;
   }
   return yy;
 }
@@ -162,65 +186,78 @@ function nudgeIfOverlapping(wf, x, y){
 function addNode(wf,node){
   node.name = uniqueName(wf, node.name);
   if(Array.isArray(node.position)){
-    const x=node.position[0]; const y=nudgeIfOverlapping(wf,node.position[0], node.position[1]+(wf.__yOffset||0));
-    node.position=[x,y];
-  } else { node.position=[-1000,300]; }
-  wf.nodes.push(node); return node.name;
+    const x = node.position[0];
+    const y = node.position[1] + (wf.__yOffset||0);
+    const yy = nudgeIfOverlapping(wf, x, y);
+    node.position=[x, yy];
+  }
+  wf.nodes.push(node);
+  return node.name;
 }
 
 function connect(wf,from,to,outputIndex=0){
-  wf.connections[from]??={}; wf.connections[from].main??=[];
+  wf.connections[from]??={};
+  wf.connections[from].main??=[];
   for(let i=wf.connections[from].main.length;i<=outputIndex;i++) wf.connections[from].main[i]=[];
   wf.connections[from].main[outputIndex].push({node:to,type:"main",index:0});
 }
 
 function withYOffset(wf,yOffset,fn){ const prev=wf.__yOffset||0; wf.__yOffset=yOffset; try{ fn(); } finally{ wf.__yOffset=prev; } }
 
+// Section headers
 function addHeader(wf,label,x,y){
   return addNode(wf,{ id:uid("label"), name:`=== ${label} ===`, type:"n8n-nodes-base.function", typeVersion:1, position:pos(x,y), parameters:{ functionCode:"return [$json];" } });
 }
+
 function addManual(wf,x,y,label="Manual Trigger"){ return addNode(wf,{ id:uid("manual"), name:label, type:"n8n-nodes-base.manualTrigger", typeVersion:1, position:pos(x,y), parameters:{} }); }
-function addCron(wf,label,x,y,compat){ if(compat==="full"){ return addNode(wf,{ id:uid("cron"), name:label, type:"n8n-nodes-base.cron", typeVersion:1, position:pos(x,y), parameters:{ triggerTimes:{ item:[{ mode:"everyX", everyX:{ hours:0, minutes:30 } }] } } }); } return addManual(wf,x,y,`${label} (Manual)`); }
-function addWebhook(wf,label,x,y,compat){ if(compat==="full"){ return addNode(wf,{ id:uid("webhook"), name:label, type:"n8n-nodes-base.webhook", typeVersion:1, position:pos(x,y), parameters:{ path:uid("hook"), methods:["POST"], responseMode:"onReceived" } }); } return addManual(wf,x,y,`${label} (Manual)`); }
+function addCron(wf,label,x,y,compat){ if(compat==="full"){ return addNode(wf,{ id:uid("cron"), name:label, type:"n8n-nodes-base.cron", typeVersion:1, position:pos(x,y), parameters:{ triggerTimes:{ item:[{ mode:"everyX", everyX:{ hours:0, minutes:15 } }] } } }); } return addNode(wf,{ id:uid("cronph"), name:`${label} (Placeholder)`, type:"n8n-nodes-base.function", typeVersion:1, position:pos(x,y), parameters:{ functionCode:"return [$json];" } }); }
+function addWebhook(wf,label,x,y,compat){ if(compat==="full"){ return addNode(wf,{ id:uid("webhook"), name:label, type:"n8n-nodes-base.webhook", typeVersion:1, position:pos(x,y), parameters:{ path:uid("hook"), methods:["POST"], responseMode:"onReceived" } }); } return addNode(wf,{ id:uid("webph"), name:`${label} (Placeholder)`, type:"n8n-nodes-base.function", typeVersion:1, position:pos(x,y), parameters:{ functionCode:"return [$json];" } }); }
 function addHTTP(wf,name,urlExpr,bodyExpr,x,y,method="POST"){ return addNode(wf,{ id:uid("http"), name, type:"n8n-nodes-base.httpRequest", typeVersion:3, position:pos(x,y), parameters:{ url:urlExpr, method, jsonParameters:true, sendBody:true, bodyParametersJson:bodyExpr } }); }
 function addFunction(wf,name,code,x,y){ return addNode(wf,{ id:uid("func"), name, type:"n8n-nodes-base.function", typeVersion:1, position:pos(x,y), parameters:{ functionCode:code } }); }
+function addIf(wf,name,left,op,right,x,y){ return addNode(wf,{ id:uid("if"), name, type:"n8n-nodes-base.if", typeVersion:2, position:pos(x,y), parameters:{ conditions:{ number:[], string:[{ value1:left, operation:op, value2:right }] } } }); }
 function addCollector(wf,x,y){ return addFunction(wf,"Collector (Inspect)",`const now=new Date().toISOString(); const arr=Array.isArray(items)?items:[{json:$json}]; return arr.map((it,i)=>({json:{...it.json,__collected_at:now, index:i}}));`,x,y); }
+function addWait(wf,x,y){ return addNode(wf,{ id:uid("wait"), name:"Wait for Reply", type:"n8n-nodes-base.wait", typeVersion:1, position:pos(x,y), parameters:{} }); }
 
+// sender nodes
 function makeSenderNode(wf, channel, x, y, compat, demo){
   const friendly = channel.toUpperCase();
   if(compat==='full'){
     if(channel==='email'){
-      return addNode(wf,{ id:uid("email"), name: demo?"[Send  Email] (Demo)":"[Send  Email]", type:"n8n-nodes-base.emailSend", typeVersion:3, position:pos(x,y),
-        parameters:{ to: demo?"={{$json.emailTo}}":"={{$json.emailTo || 'user@example.com'}}", subject:"={{($json.msg?.[$json.hypothesis||'yes']?.email?.subject) || ($json.scenario?.agent_name) || 'Update'}}", text:"={{$json.message}}" } });
+      return addNode(wf,{ id:uid("email"), name:"Email Send", type:"n8n-nodes-base.emailSend", typeVersion:3, position:pos(x,y),
+        parameters:{ to:"={{$json.emailTo || 'user@example.com'}}", subject:"={{$json.subject || $json.scenario?.agent_name || 'Update'}}", text:"={{$json.message || 'Hello!'}}" } });
     }
     if(channel==='sms'){
-      return addNode(wf,{ id:uid("sms"), name: demo?"[Send  SMS] (Demo)":"[Send  SMS] (Twilio)", type:"n8n-nodes-base.twilio", typeVersion:3, position:pos(x,y),
-        parameters:{ resource:"message", operation:"create", from:"={{$json.smsFrom || '+10000000000'}}", to:"={{$json.to || '+10000000001'}}", message:"={{$json.message}}" } });
+      return addNode(wf,{ id:uid("sms"), name:"Twilio SMS", type:"n8n-nodes-base.twilio", typeVersion:3, position:pos(x,y),
+        parameters:{ resource:"message", operation:"create", from:"={{$json.smsFrom || '+10000000000'}}", to:"={{$json.to || '+10000000001'}}", message:"={{$json.message || 'Hello!'}}" } });
     }
     if(channel==='whatsapp'){
-      return addNode(wf,{ id:uid("wa"), name: demo?"[Send  WhatsApp] (Demo)":"[Send  WhatsApp] (Twilio)", type:"n8n-nodes-base.twilio", typeVersion:3, position:pos(x,y),
-        parameters:{ resource:"message", operation:"create", from:"={{'whatsapp:' + ($json.waFrom || '+10000000002')}}", to:"={{'whatsapp:' + ($json.to || '+10000000003')}}", message:"={{$json.message}}" } });
+      return addNode(wf,{ id:uid("wa"), name:"Twilio WhatsApp", type:"n8n-nodes-base.twilio", typeVersion:3, position:pos(x,y),
+        parameters:{ resource:"message", operation:"create", from:"={{'whatsapp:' + ($json.waFrom || '+10000000002')}}", to:"={{'whatsapp:' + ($json.to || '+10000000003')}}", message:"={{$json.message || 'Hello!'}}" } });
     }
     if(channel==='call'){
-      return addHTTP(wf, demo?"[Place Call] (Demo)":"[Place Call]", "={{$json.callWebhook || 'https://example.com/call'}}",
-        "={{ { to:$json.to, from:$json.callFrom, text: $json.message } }}", x, y, "POST");
+      return addHTTP(wf,"Twilio Call (TTS)","={{$json.callWebhook || 'https://example.com/call'}}","={{ { to:$json.to, from:$json.callFrom, text: ($json.message || 'Hello!') } }}",x,y,"POST");
     }
   }
   return addFunction(wf, `Demo Send ${friendly}`, "return [$json];", x, y);
 }
 
+// ---------- sanitization ----------
 function sanitizeWorkflow(wf){
   const REQUIRED_TYPE="n8n-nodes-base.function";
   const byName=new Map();
+
   wf.nodes=(wf.nodes||[]).map((n,idx)=>{
     if(!n.name||typeof n.name!=='string') n.name=`Node ${idx+1}`;
     if(!n.type||typeof n.type!=='string'||!n.type.trim()){ n.type=REQUIRED_TYPE; n.typeVersion=1; n.parameters={ functionCode:"return [$json];" }; }
     if(typeof n.typeVersion!=='number') n.typeVersion=1;
     if(!Array.isArray(n.position)||n.position.length!==2){ n.position=[-1000, 300+(idx*40)]; }
     if(!n.parameters||typeof n.parameters!=='object') n.parameters={};
-    if(n.type==="n8n-nodes-base.function" && !n.parameters.functionCode){ n.parameters.functionCode = "return [$json];"; }
+    if(n.type==="n8n-nodes-base.function" && !n.parameters.functionCode){
+      n.parameters.functionCode = "return [$json];";
+    }
     byName.set(n.name,n); return n;
   });
+
   const conns=wf.connections||{};
   for(const [from,m] of Object.entries(conns)){
     if(!byName.has(from)){ delete conns[from]; continue; }
@@ -228,48 +265,44 @@ function sanitizeWorkflow(wf){
     if(!Array.isArray(m.main)) m.main=[];
     m.main=m.main.map(arr=>Array.isArray(arr)?arr.filter(link=>byName.has(link?.node)):[]);
   }
-  wf.connections=conns; wf.name=String(wf.name||"AI Agent Workflow (Essential)");
+  wf.connections=conns;
+  wf.name=String(wf.name||"AI Agent Workflow");
   return wf;
 }
 
-// ---------- core build (ESSENTIAL, with YES/NO hypothesis) ----------
+// ---------- LLM orchestration ----------
+function makeDesigner(row){
+  return openaiJSON(
+    makeMessagingPrompt(row, 'GENERAL', ['email']),
+    `{"email":{"subject":string,"body":string},"sms":{"body":string},"whatsapp":{"body":string},"call":{"script":string}}`
+  );
+}
+function makeMessages(row, archetype, channels){
+  return openaiJSON(
+    makeMessagingPrompt(row, archetype, channels),
+    `{"yes":{"email":{"subject":string,"body":string},"sms":{"body":string},"whatsapp":{"body":string},"call":{"script":string}},"no":{"email":{"subject":string,"body":string},"sms":{"body":string},"whatsapp":{"body":string},"call":{"script":string}}}`
+  );
+}
+
+// ---------- core build ----------
 async function buildWorkflowFromRow(row, opts){
   const compat=(opts.compat||'safe')==='full'?'full':'safe';
-  const includeDemo = !!opts.includeDemo;
 
-  // channels from best_reply_shapes (fallback email)
+  // channels from best_reply_shapes
   const channels=[]; const shapes=listify(row.best_reply_shapes);
   for(const sh of shapes){ for(const norm of CHANNEL_NORMALIZE){ if(norm.rx.test(sh) && !channels.includes(norm.k)) channels.push(norm.k); } }
   if(!channels.length) channels.push('email');
 
-  // pick a simple archetype label for the prompt
-  const archetypeGuess = /appointment|schedule|calendar/i.test(`${row.tags||''} ${row.triggers||''} ${row.name||''}`) ? 'APPOINTMENT_SCHEDULING' : 'GENERAL';
+  // choose archetype/trigger
+  let archetype=chooseArchetype(row);
+  let prodTrigger=TRIGGER_PREF[archetype]||'manual';
 
-  // light trigger inference; allow override by TRIGGER_PREF if we matched a known archetype
-  let trigger = 'manual';
-  const tagBag = `${row.tags||''} ${row.triggers||''} ${row.how_it_works||''} ${row.name||''}`.toLowerCase();
-  if(/webhook|inbound|form|ticket|lead|privacy|dsr|faq|chat/.test(tagBag)) trigger='webhook';
-  else if(/daily|cron|schedule|nps|renewal|report|kpi/.test(tagBag)) trigger='cron';
-  if(TRIGGER_PREF[archetypeGuess]) trigger = TRIGGER_PREF[archetypeGuess];
-
-  // ask for YES/NO variants; fall back to a tiny default
-  let msg = await openaiJSON(makeMessagingPrompt(row, archetypeGuess, channels));
-  if(!msg || typeof msg!== 'object' || (!msg.yes && !msg.no)){
-    msg = {
-      yes: {
-        email: { subject: "Quick confirmation", body: "Hi — confirming we’re good to proceed. Reply if you need changes." },
-        sms: { body: "All set ✅ — reply if you need changes." },
-        whatsapp: { body: "All set ✅ — reply if you need changes." },
-        call: { script: "Calling to confirm we are good to proceed. Any changes needed?" }
-      },
-      no: {
-        email: { subject: "Need a quick correction", body: "Hi — looks like we need a small change. Can you share your preference?" },
-        sms: { body: "Small change needed. What works for you?" },
-        whatsapp: { body: "Small change needed. What works for you?" },
-        call: { script: "Calling because we need a small change. What works for you?" }
-      }
-    };
-  }
+  // messages (YES/NO)
+  const designMsgs=(await makeMessages(row, archetype, channels))||{};
+  const msgVariants = designMsgs && typeof designMsgs==='object' ? designMsgs : {
+    yes:{ email:{subject:"Quick confirmation", body:"All set — confirming plan."}, sms:{body:"All set ✅"}, whatsapp:{body:"All set ✅"}, call:{script:"Calling to confirm we’re set."} },
+    no:{  email:{subject:"Need a small change", body:"Looks like we need a tweak — what works?"}, sms:{body:"Small change needed. What works?"}, whatsapp:{body:"Small change needed. What works?"}, call:{script:"We need a quick change. What works?"} }
+  };
 
   const title=`${row.scenario_id||'Scenario'} — ${row.name||''}`.trim();
   const wf=baseWorkflow(title);
@@ -280,11 +313,12 @@ async function buildWorkflowFromRow(row, opts){
 
     // Trigger
     let trig;
-    if (trigger==='cron') trig = addCron(wf, "Cron", LAYOUT.prodStart.x, LAYOUT.prodStart.y - 160, compat);
-    else if (trigger==='webhook') trig = addWebhook(wf, "Webhook", LAYOUT.prodStart.x, LAYOUT.prodStart.y, compat);
+    if (prodTrigger==='cron') trig = addCron(wf, "Cron (from LLM)", LAYOUT.prodStart.x, LAYOUT.prodStart.y - 160, compat);
+    else if (prodTrigger==='webhook') trig = addWebhook(wf, "Webhook (from LLM)", LAYOUT.prodStart.x, LAYOUT.prodStart.y, compat);
+    else if (prodTrigger==='imap') trig = addFunction(wf, "IMAP Intake (Placeholder)", "return [$json];", LAYOUT.prodStart.x, LAYOUT.prodStart.y);
     else trig = addManual(wf, LAYOUT.prodStart.x, LAYOUT.prodStart.y, "Manual Trigger");
 
-    // Init (+ hypothesis selection)
+    // Init context (incl. hypothesis YES/NO selection)
     const init = addFunction(wf, "Init Context (PROD)", `
 const scenario=${JSON.stringify({
   scenario_id: row.scenario_id || '',
@@ -295,14 +329,20 @@ const scenario=${JSON.stringify({
   roi_hypothesis: row.roi_hypothesis || '',
   risk_notes: row.risk_notes || '',
   tags: listify(row["tags (;)"] || row.tags),
-  archetype: archetypeGuess,
+  archetype,
 })};
 const channels=${JSON.stringify(channels)};
-const systems=${JSON.stringify([])};
-const messages=${JSON.stringify(msg)};
-const hypothesis = String($json.__hypothesis || 'yes').toLowerCase()==='no' ? 'no' : 'yes';
-const demo=${JSON.stringify(DEMO)};
-return [{...$json, scenario, channels, systems, msg: messages, hypothesis, ...demo}];`,
+const systems=${JSON.stringify(['email','twilio'])};
+const messages=${JSON.stringify(msgVariants)};
+const hypothesis = (String($json.__hypothesis||'yes').toLowerCase()==='no') ? 'no' : 'yes';
+const payload = {...$json, scenario, channels, systems, msg:messages, hypothesis,
+  emailTo: $json.emailTo || ${JSON.stringify(DEMO.emailTo)},
+  to: $json.to || ${JSON.stringify(DEMO.to)},
+  smsFrom: $json.smsFrom || ${JSON.stringify(DEMO.smsFrom)},
+  waFrom: $json.waFrom || ${JSON.stringify(DEMO.waFrom)},
+  callFrom: $json.callFrom || ${JSON.stringify(DEMO.callFrom)}
+};
+return [payload];`,
       LAYOUT.prodStart.x+LAYOUT.stepX, LAYOUT.prodStart.y);
     connect(wf, trig, init);
 
@@ -311,51 +351,79 @@ return [{...$json, scenario, channels, systems, msg: messages, hypothesis, ...de
     const commHub = addFunction(wf, "Communication (Stage)", "return [$json];", commHubX, LAYOUT.prodStart.y);
     connect(wf, init, commHub);
 
-    // Channels laid out vertically, chained linearly
-    let prev = commHub;
+    // Compose Message (shared)
+    const compose = addFunction(wf, "[1] Compose Message", `
+const hyp=$json.hypothesis||'yes'; const m=$json.msg?.[hyp]||{};
+const chBodies={ email:(m.email?.body)||'', sms:(m.sms?.body)||'', whatsapp:(m.whatsapp?.body)||'', call:(m.call?.script)||''};
+const subject=(m.email?.subject)||'Update';
+return [{...$json, subject, chBodies}];`, LAYOUT.prodStart.x + 3*LAYOUT.stepX, LAYOUT.prodStart.y);
+    connect(wf, commHub, compose);
+
+    // Wait for Reply (merge target)
+    const waitNode = addWait(wf, LAYOUT.prodStart.x + 7*LAYOUT.stepX, LAYOUT.prodStart.y);
+
+    // Build per-channel GATING lanes in parallel (fan-out from Compose; converge into Wait)
     const chCount = Math.max(channels.length,1);
     const firstChY = LAYOUT.prodStart.y - Math.floor(LAYOUT.channelY * (chCount-1)/2);
 
     channels.forEach((ch, chIdx)=>{
       const rowY = firstChY + chIdx*LAYOUT.channelY;
-      let stepNo=0;
 
-      const enterName = GUIDE.numberSteps ? `[${++stepNo}] Enter · ${ch.toUpperCase()}` : `Enter · ${ch.toUpperCase()}`;
-      const enter = addFunction(wf, enterName, `return [{...$json,__channel:${JSON.stringify(ch)}}];`, LAYOUT.prodStart.x + 3*LAYOUT.stepX, rowY);
-      connect(wf, prev, enter);
-
-      // Compose from YES/NO variant
-      const compose = addFunction(wf, GUIDE.numberSteps?`[${++stepNo}] Compose Message`:`Compose Message`, `
-const ch=${JSON.stringify(ch)};
-const hyp = $json.hypothesis || 'yes';
-const m = ($json.msg && $json.msg[hyp]) ? $json.msg[hyp] : {};
-const choose = (obj, key) => (obj && obj[key] && typeof obj[key].body==='string') ? obj[key].body : '';
-const text = choose(m, ch) || choose(m, 'email') || 'Hello!';
-const subject = (m.email && m.email.subject) ? m.email.subject : 'Update';
-return [{...$json, message:text, subject}];`,
+      // 1) Channel = X? (enabled)
+      const enabledIf = addIf(wf, `Channel = ${ch.toUpperCase()}?`,
+        "={{ $json.channels && ($json.channels.indexOf('"+ch+"')>-1 ? 'yes':'no') }}", "equal", "yes",
         LAYOUT.prodStart.x + 4*LAYOUT.stepX, rowY);
-      connect(wf, enter, compose);
+      connect(wf, compose, enabledIf);
 
-      const sender = makeSenderNode(wf, ch, LAYOUT.prodStart.x + 5*LAYOUT.stepX, rowY, compat, includeDemo);
-      connect(wf, compose, sender);
+      // 2) X Allowlist (compute flags)
+      const allowFn = addFunction(wf, `${ch.toUpperCase()} Allowlist`, `
+const flags=$json.flags||{};
+if('${ch}'==='email'){ flags.emailAllowed = !!$json.emailTo; }
+if('${ch}'==='sms'){ flags.phoneAllowed = !!$json.to; }
+if('${ch}'==='whatsapp'){ flags.waAllowed = !!$json.to; }
+if('${ch}'==='call'){ flags.callAllowed = !!$json.to; }
+return [{...$json, flags}];`,
+        LAYOUT.prodStart.x + 5*LAYOUT.stepX, rowY);
+      connect(wf, enabledIf, allowFn, 0); // true branch
 
-      const collector = addCollector(wf, LAYOUT.prodStart.x + 6*LAYOUT.stepX, rowY);
-      connect(wf, sender, collector);
+      // 3) X Allowed? (IF)
+      const condExprMap = {
+        email: "={{ $json.flags?.emailAllowed ? 'yes':'no' }}",
+        sms: "={{ $json.flags?.phoneAllowed ? 'yes':'no' }}",
+        whatsapp: "={{ $json.flags?.waAllowed ? 'yes':'no' }}",
+        call: "={{ $json.flags?.callAllowed ? 'yes':'no' }}",
+      };
+      const allowedIf = addIf(wf, `${ch.toUpperCase()} Allowed?`,
+        condExprMap[ch] || "={{ 'no' }}", "equal", "yes",
+        LAYOUT.prodStart.x + 6*LAYOUT.stepX, rowY);
+      connect(wf, allowFn, allowedIf);
 
-      prev = collector;
+      // 4) Sender
+      const sender = makeSenderNode(wf, ch, LAYOUT.prodStart.x + 6.8*LAYOUT.stepX, rowY, compat, false);
+      // Prepare message for this channel from composed bodies
+      const prep = addFunction(wf, `Prepare ${ch.toUpperCase()} Body`, `
+const bodies=$json.chBodies||{};
+const txt = bodies['${ch}'] || bodies.email || 'Hello!';
+return [{...$json, message: txt}];`,
+        LAYOUT.prodStart.x + 6.2*LAYOUT.stepX, rowY);
+      connect(wf, allowedIf, prep, 0);          // true → prepare
+      connect(wf, prep, sender);                 // then send
+      connect(wf, sender, waitNode);             // converge into Wait
+
+      // false branches just drop through (no send)
     });
 
-    // decorate staticData to satisfy UI expectations
+    // static design (kept to avoid UI fallback)
     wf.staticData=wf.staticData||{};
     wf.staticData.__design={
-      archetype: archetypeGuess,
-      prodTrigger: trigger,
+      archetype,
+      prodTrigger,
       channels,
-      systems: [],
-      branches: [{ name: 'Main', condition: 'Essential path', steps: [] }],
-      errors: [],
+      systems:['email','twilio'],
+      branches:[{ name:'Main', condition:'Essential comms', steps:[] }],
+      errors:[],
       guide: GUIDE,
-      layout: { verticalChannels: true, decisions: "none", spacing: LAYOUT, antiOverlap: true, commHub: true },
+      layout: { verticalChannels:true, decisions:"if-gates", spacing: LAYOUT, antiOverlap:true, commHub:true },
       zones: ZONE
     };
   });
@@ -370,20 +438,18 @@ module.exports = async (req,res)=>{
 
   try{
     if(req.method!=="POST"){
-      return res.status(200).json({ ok:true, usage:'POST {"scenario_id":"<id>", "compat":"safe|full", "__hypothesis":"yes|no", "includeDemo":true }' });
+      return res.status(200).json({ ok:true, usage:'POST {"scenario_id":"<id>", "compat":"safe|full", "__hypothesis":"yes|no"}' });
     }
     const body=await new Promise(resolve=>{
       const chunks=[]; req.on("data",c=>chunks.push(c)); req.on("end",()=>{ try{ resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); }catch{ resolve({}); } });
     });
     const wanted=(body.scenario_id||"").toString().trim(); if(!wanted) throw new Error("Missing scenario_id");
     const compat=(body.compat||'safe').toLowerCase()==='full'?'full':'safe';
-    const includeDemo = !!body.includeDemo;
 
     const row=await fetchSheetRowByScenarioId(wanted);
     if(!row) return res.status(404).json({ ok:false, error:`scenario_id not found: ${wanted}` });
 
-    // pass hypothesis through the pipeline (Init picks it up)
-    const wf=await buildWorkflowFromRow({ ...row }, { compat, includeDemo });
+    const wf=await buildWorkflowFromRow(row,{ compat });
 
     res.status(200);
     res.setHeader("Content-Type","application/json; charset=utf-8");

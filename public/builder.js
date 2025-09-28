@@ -1,24 +1,23 @@
 // public/builder.js
-// Clean + detailed builder:
-// - One lane, strict left→right chronology
-// - Manual Trigger + Simulated Trigger node so every flow is runnable
+// Compact, fully-linked builder (two channels: WhatsApp + Call)
+// - Tight spacing so the graph isn't huge
+// - Manual Trigger → Simulated Trigger so you can run locally
 // - Communication (Stage) before per-channel fan-out
-// - Vertical per-channel rows, explicit chaining, no junction/merge nodes
-// - No "?" in node names; import-safe Switch/If (string value2)
-// - Robust anti-overlap so icons/text never stack
-// Exposes: window.Builder.buildWorkflowJSON(s, industry, { selectedChannel, forcePresentation, compat:'safe'|'full' })
+// - Vertical per-channel rows (whatsapp, call) with explicit chaining
+// - Import-safe Switch/If (string value2); no "?" in labels
+// Exposes: window.Builder.buildWorkflowJSON(s, industry, { selectedChannel, compat:'safe'|'full' })
 
 (function(){
   "use strict";
 
-  // ---------- Layout ----------
+  // ---------- Compact layout (pulled-in distances) ----------
   const LAYOUT = {
-    stepX: 640,
-    channelY: 460,
-    outcomeRowY: 340,
-    header: { x: -1600, y: 40 },
-    start:  { x: -1460, y: 300 },
-    switchX: -820
+    stepX: 420,         // (was 640)
+    channelY: 300,      // (was 460)
+    outcomeRowY: 220,   // (was 340)
+    header: { x: -1200, y: 40 }, // bring closer to center
+    start:  { x: -1080, y: 260 },
+    switchX: -520
   };
 
   const GUIDE = { numberSteps: true };
@@ -30,7 +29,7 @@
     step_generic: "https://example.com/step"
   };
 
-  // ---------- Archetype rules ----------
+  // ---------- Archetype rules (same as before, compact) ----------
   const ARCH_RULES = [
     { a:'APPOINTMENT_SCHEDULING', rx:/(appointment|appointments|scheduling|no[-_ ]?show|calendar)/i },
     { a:'CUSTOMER_SUPPORT_INTAKE', rx:/\b(cs|support|helpdesk|ticket|sla|triage|escalation|deflection|kb)\b/i },
@@ -64,12 +63,8 @@
     RECRUITING_INTAKE: 'webhook',
   };
 
-  const CHANNEL_MAP = [
-    { k:'whatsapp', rx:/whatsapp/i },
-    { k:'sms',      rx:/(sms|text)/i },
-    { k:'call',     rx:/(voice|call|phone)/i },
-    { k:'email',    rx:/email/i },
-  ];
+  // Only these 2 channels are permitted in the rendered graph
+  const TWO_CHANNELS = ['whatsapp', 'call'];
 
   // ---------- Utils ----------
   const uid = (p)=>`${p}_${Math.random().toString(36).slice(2,10)}`;
@@ -84,21 +79,26 @@
     return 'SALES_OUTREACH';
   }
 
-  function normalizeChannels(s, selected){
-    const fromShapes = listify(s.best_reply_shapes||[])
-      .map(t=>{
-        for(const m of CHANNEL_MAP) if(m.rx.test(t)) return m.k;
-        return null;
-      })
-      .filter(Boolean);
-    let channels = Array.from(new Set(fromShapes));
-    if(!channels.length) channels = ['email'];
-    if(selected && channels.includes(selected)) {
-      channels = [selected].concat(channels.filter(c=>c!==selected));
-    } else if (selected && !channels.includes(selected)) {
-      channels = [selected].concat(channels);
-    }
-    return channels;
+  // Force exactly two channels: whatsapp (sms/sms-like) + call
+  function normalizeChannels(_s, selected){
+    const pick = (v)=>{
+      if(!v) return null;
+      const t = String(v).toLowerCase();
+      if (/whatsapp|sms|text/.test(t)) return 'whatsapp';
+      if (/call|voice|phone/.test(t)) return 'call';
+      return null;
+    };
+
+    const chosen = new Set();
+    // honor selected first
+    const sel = pick(selected);
+    if (sel) chosen.add(sel);
+
+    // always ensure both exist in order whatsapp → call
+    if (!chosen.has('whatsapp')) chosen.add('whatsapp');
+    if (!chosen.has('call')) chosen.add('call');
+
+    return Array.from(chosen);
   }
 
   function preferredTrigger(archetype, s){
@@ -108,7 +108,7 @@
     if (/imap|inbox|email/.test(t)) return 'imap';
     return TRIGGER_PREF[archetype] || 'manual';
   }
-  // ---------- n8n primitives with robust anti-overlap ----------
+  // ---------- n8n primitives with compact anti-overlap ----------
   function baseWorkflow(name){ return { name, nodes:[], connections:{}, active:false, settings:{}, staticData:{} }; }
 
   function uniqueName(wf, base){
@@ -118,24 +118,22 @@
     return name;
   }
 
-  // grid occupancy to avoid stacked icons/text
-  const GRID = { cellH: 72, cellW: 640 }; // rows ~72px, columns match stepX for clarity
+  // grid tuned to compact layout
+  const GRID = { cellH: 64, cellW: 420 }; // cellW = stepX
   function snapRow(y){ return Math.round(y / GRID.cellH); }
 
   function nudge(wf,x,y){
-    const col = Math.round(x / GRID.cellW); // coarse column bucket
-    const used = new Set(
-      (wf.nodes||[]).map(n=>{
-        const p=n.position||[]; return `${col}:${snapRow(p[1]||0)}`;
-      })
-    );
+    const col = Math.round(x / GRID.cellW);
+    const used = new Set((wf.nodes||[]).map(n=>{
+      const p=n.position||[]; return `${col}:${snapRow(p[1]||0)}`;
+    }));
     let r = snapRow(y);
-    for(let k=0;k<200;k++){
+    for(let k=0;k<160;k++){
       const key = `${col}:${r}`;
       if(!used.has(key)) return r*GRID.cellH;
-      r += 1; // push downward if taken
+      r += 1;
     }
-    return y + 200; // extreme fallback
+    return y + 160; // extreme fallback
   }
 
   function addNode(wf,node){
@@ -161,12 +159,9 @@
   function addManual(wf,x,y,label='Manual Trigger'){
     return addNode(wf,{ id:uid('manual'), name:label, type:'n8n-nodes-base.manualTrigger', typeVersion:1, position:pos(x,y), parameters:{} });
   }
-
-  // we always simulate the intended trigger as a Function so flows are runnable end-to-end
   function addSimTrigger(wf, kind, x, y){
-    return addFunction(wf, `Simulated Trigger: ${String(kind||'manual').toUpperCase()}`, 'return [$json];', x, y);
+    return addFunction(wf, `Simulated Trigger · ${String(kind||'manual').toUpperCase()}`, 'return [$json];', x, y);
   }
-
   function addHTTP(wf,name,urlExpr,bodyExpr,x,y,method='POST'){
     return addNode(wf,{ id:uid('http'), name, type:'n8n-nodes-base.httpRequest', typeVersion:4, position:pos(x,y),
       parameters:{ url:urlExpr, method, jsonParameters:true, sendBody:true, bodyParametersJson:bodyExpr } });
@@ -174,11 +169,6 @@
   function addFunction(wf,name,code,x,y){
     return addNode(wf,{ id:uid('func'), name, type:'n8n-nodes-base.function', typeVersion:2, position:pos(x,y),
       parameters:{ functionCode:code }});
-  }
-  // import-safe IF / SWITCH: force string value2
-  function addIf(wf,name,left,op,right,x,y){
-    return addNode(wf,{ id:uid('if'), name, type:'n8n-nodes-base.if', typeVersion:2, position:pos(x,y),
-      parameters:{ conditions:{ number:[], string:[{ value1:left, operation:op, value2:String(right??'') }] } }});
   }
   function addSwitch(wf,name,valueExpr,rules,x,y){
     const safe = (rules||[]).map(r=>({ operation:r.operation||'equal', value2:String(r.value2??'') }));
@@ -193,16 +183,8 @@ const arr=Array.isArray(items)?items:[{json:$json}];
 return arr.map((it,i)=>({json:{...it.json,__collected_at:now,index:i}}));`, x, y);
   }
 
-  // ---------- Channel sender (link-friendly) ----------
+  // Channel senders (Twilio/email placeholders still linkable)
   function makeSender(wf, channel, x, y){
-    if(channel==='email'){
-      return addNode(wf,{ id:uid('email'), name:'Send Email', type:'n8n-nodes-base.emailSend', typeVersion:3, position:pos(x,y),
-        parameters:{ to:"={{$json.emailTo||'user@example.com'}}", subject:"={{$json.subject||'Update'}}", text:"={{$json.message||'Hello!'}}" }, credentials:{} });
-    }
-    if(channel==='sms'){
-      return addNode(wf,{ id:uid('sms'), name:'Send SMS (Twilio)', type:'n8n-nodes-base.twilio', typeVersion:3, position:pos(x,y),
-        parameters:{ resource:'message', operation:'create', from:"={{$json.smsFrom||'+10000000000'}}", to:"={{$json.to||'+10000000001'}}", message:"={{$json.message||'Hello!'}}" }, credentials:{} });
-    }
     if(channel==='whatsapp'){
       return addNode(wf,{ id:uid('wa'), name:'Send WhatsApp (Twilio)', type:'n8n-nodes-base.twilio', typeVersion:3, position:pos(x,y),
         parameters:{ resource:'message', operation:'create', from:"={{'whatsapp:' + ($json.waFrom||'+10000000002')}}", to:"={{'whatsapp:' + ($json.to||'+10000000003')}}", message:"={{$json.message||'Hello!'}}" }, credentials:{} });
@@ -211,10 +193,11 @@ return arr.map((it,i)=>({json:{...it.json,__collected_at:now,index:i}}));`, x, y
       return addHTTP(wf, 'Place Call', "={{$json.callWebhook||'https://example.com/call'}}",
         "={{ { to:$json.to, from:$json.callFrom, text: ($json.message||'Hello!') } }}", x, y, 'POST');
     }
+    // fallback (shouldn't hit)
     return addFunction(wf, `Demo Send ${channel.toUpperCase()}`, "return [$json];", x, y);
   }
 
-  // ---------- Compact channel-aware composer (no '?') ----------
+  // ---------- Short, channel-aware composer (no '?') ----------
   function composeBody(archetype, channel, s, industry){
     const ctx = {
       trig: String(s.triggers||'').trim(),
@@ -223,8 +206,8 @@ return arr.map((it,i)=>({json:{...it.json,__collected_at:now,index:i}}));`, x, y
       risk: String(s.risk_notes||'').trim(),
       tone: (industry?.agent_language_prompt || industry?.vocabulary || '').trim()
     };
-    const opener = { email:'Hi — quick note:', sms:'Quick update:', whatsapp:'Heads up:', call:'Talk track:' }[channel] || 'Note:';
-    const cta = { email:'Reply or click to confirm.', sms:'Reply 1=confirm, 2=change.', whatsapp:'Reply here to confirm or change.', call:'Say “confirm” or “reschedule”.' }[channel] || 'Reply to proceed.';
+    const opener = { whatsapp:'Heads up:', call:'Talk track:' }[channel] || 'Note:';
+    const cta = { whatsapp:'Reply to confirm or change.', call:'Say “confirm” or “reschedule”.' }[channel] || 'Reply to proceed.';
 
     function block(lines, max=5){ return lines.filter(Boolean).slice(0, max).join('\n'); }
 
@@ -235,7 +218,6 @@ return arr.map((it,i)=>({json:{...it.json,__collected_at:now,index:i}}));`, x, y
           ctx.trig && `Why now: ${ctx.trig}`,
           ctx.how && `Plan: ${ctx.how}`,
           ctx.roi && `Impact: ${ctx.roi}`,
-          ctx.risk && `Note: ${ctx.risk}`,
           ctx.tone && ctx.tone,
           cta
         ]);
@@ -243,7 +225,6 @@ return arr.map((it,i)=>({json:{...it.json,__collected_at:now,index:i}}));`, x, y
         return block([
           `${opener}`,
           `We received your request and opened a ticket.`,
-          ctx.trig && `Context: ${ctx.trig}`,
           ctx.how && `Next: ${ctx.how}`,
           ctx.tone && ctx.tone,
           cta
@@ -259,7 +240,7 @@ return arr.map((it,i)=>({json:{...it.json,__collected_at:now,index:i}}));`, x, y
         ]);
     }
   }
-  // ---------- Canonical branches (labels without '?') ----------
+  // ---------- Canonical branches (clean labels) ----------
   function canonicalScheduling(){
     return [{
       name: 'Scheduling',
@@ -290,7 +271,7 @@ return arr.map((it,i)=>({json:{...it.json,__collected_at:now,index:i}}));`, x, y
     }];
   }
 
-  function canonicalGeneric(archetype){
+  function canonicalGeneric(){
     return [{
       name: 'Main',
       steps: [
@@ -301,20 +282,20 @@ return arr.map((it,i)=>({json:{...it.json,__collected_at:now,index:i}}));`, x, y
     }];
   }
 
-  // ---------- Core builder ----------
+  // ---------- Core builder (two channels only: whatsapp + call) ----------
   function buildWorkflowJSON(scenario, industry, opts={}){
     const selectedChannel = (opts.selectedChannel||'').toLowerCase().trim();
     const archetype = (scenario?.archetype) ? String(scenario.archetype).toUpperCase() : chooseArchetype(scenario);
-    const channels = normalizeChannels(scenario, selectedChannel);
+    const channels = normalizeChannels(scenario, selectedChannel); // guaranteed ['whatsapp','call'] order
     const intendedTrigger = preferredTrigger(archetype, scenario);
 
     const title = `${scenario?.scenario_id||'Scenario'} — ${scenario?.name||''}`.trim();
     const wf = baseWorkflow(title);
 
-    // Header + single Manual entry + Simulated Trigger (linkable)
+    // Header + Manual + Simulated Trigger (compact spacing)
     addHeader(wf, 'FLOW AREA · PRODUCTION', LAYOUT.header.x, LAYOUT.header.y);
     const manual = addManual(wf, LAYOUT.start.x, LAYOUT.start.y, 'Manual Trigger');
-    const simTrig = addSimTrigger(wf, intendedTrigger, LAYOUT.start.x + Math.floor(LAYOUT.stepX*0.9), LAYOUT.start.y);
+    const simTrig = addSimTrigger(wf, intendedTrigger, LAYOUT.start.x + Math.floor(LAYOUT.stepX*0.7), LAYOUT.start.y);
     connect(wf, manual, simTrig);
 
     // Init context
@@ -340,7 +321,7 @@ return [{...$json, scenario}];`,
     );
     connect(wf, simTrig, init);
 
-    // Optional prefetch for certain archetypes
+    // Optional prefetch (less distance)
     let cursor = init;
     if (archetype==='APPOINTMENT_SCHEDULING') {
       const fetch = addHTTP(wf, 'Fetch · Upcoming (PMS)', `={{'${DEFAULT_HTTP.pms_upcoming}'}}`, '={{$json}}', LAYOUT.start.x + 3*LAYOUT.stepX, LAYOUT.start.y);
@@ -348,7 +329,7 @@ return [{...$json, scenario}];`,
     }
 
     // Branch selector
-    const branches = (archetype==='APPOINTMENT_SCHEDULING') ? canonicalScheduling() : canonicalGeneric(archetype);
+    const branches = (archetype==='APPOINTMENT_SCHEDULING') ? canonicalScheduling() : canonicalGeneric();
     const sw = addSwitch(
       wf,
       'Branch',
@@ -359,8 +340,8 @@ return [{...$json, scenario}];`,
     );
     connect(wf, cursor, sw);
 
-    // Communication hub
-    const commX = LAYOUT.start.x + Math.floor(3.6*LAYOUT.stepX);
+    // Communication hub nearer (2.4 * stepX from start)
+    const commX = LAYOUT.start.x + Math.floor(2.4*LAYOUT.stepX);
     const branchBaseY = (bIdx, total)=> LAYOUT.start.y - Math.floor(LAYOUT.channelY * (Math.max(total,1)-1)/2) + bIdx*LAYOUT.channelY;
 
     let lastCollector = null;
@@ -369,7 +350,7 @@ return [{...$json, scenario}];`,
       const comm = addFunction(wf, 'Communication (Stage)', 'return [$json];', commX, branchBaseY(bIdx, branches.length));
       connect(wf, sw, comm, bIdx);
 
-      // Vertical per-channel rows
+      // Per-branch vertical rows (whatsapp, call)
       const chFirstY = (count)=> branchBaseY(bIdx, branches.length) - Math.floor(LAYOUT.channelY * (count-1)/2);
       let prevRowCollector = null;
 
@@ -445,7 +426,7 @@ return [{...$json, message: body, subject}];`, ox, oy);
                 const sender = makeSender(wf, ch, sendX, oy);
                 try{ wf.nodes[wf.nodes.findIndex(n=>n.name===sender)].name = `[${stepIndex}.${oIdx+1}] Send · ${ch.toUpperCase()}`; }catch{}
                 connect(wf, prevO, sender);
-                const oCol = addCollector(wf, sendX + Math.floor(LAYOUT.stepX*0.9), oy);
+                const oCol = addCollector(wf, sendX + Math.floor(LAYOUT.stepX*0.8), oy);
                 connect(wf, sender, oCol);
 
                 if (chain) connect(wf, chain, oCol);
@@ -472,7 +453,7 @@ return [{...$json, message: body, subject}];`, ox, oy);
           const sender = makeSender(wf, ch, sendX, rowY);
           try{ wf.nodes[wf.nodes.findIndex(n=>n.name===sender)].name = sendTitle; }catch{}
           connect(wf, prev, sender);
-          const col = addCollector(wf, sendX + LAYOUT.stepX, rowY);
+          const col = addCollector(wf, sendX + Math.floor(LAYOUT.stepX*0.9), rowY);
           connect(wf, sender, col);
           if (prevRowCollector) connect(wf, prevRowCollector, col);
           prevRowCollector = col;
@@ -482,10 +463,9 @@ return [{...$json, message: body, subject}];`, ox, oy);
       });
     });
 
-    // Static meta
+    // Meta
     wf.staticData.__design = {
-      archetype, trigger:intendedTrigger, channels,
-      layout: { verticalChannels:true, commHub:true, antiOverlap:'grid+nudge' }
+      archetype, trigger:intendedTrigger, channels, layout:{ stepX:LAYOUT.stepX, channelY:LAYOUT.channelY, outcomeRowY:LAYOUT.outcomeRowY, commHub:true, antiOverlap:'grid' }
     };
 
     return wf;

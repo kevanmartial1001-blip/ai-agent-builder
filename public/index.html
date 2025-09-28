@@ -38,12 +38,12 @@
         <select id="scenario"><option value="">Loading…</option></select>
       </div>
       <div>
-        <label for="channel">Channel (auto)</label>
+        <!-- CHANGED: label + options aligned with presentation builder -->
+        <label for="channel">Channel</label>
         <select id="channel">
-          <option value="email">Email</option>
-          <option value="sms">SMS (Twilio)</option>
-          <option value="whatsapp">WhatsApp (Twilio)</option>
-          <option value="call">Voice Call (Twilio)</option>
+          <option value="whatsapp">WhatsApp</option>
+          <option value="voice">Voice</option>
+          <option value="web">Web</option>
         </select>
       </div>
     </div>
@@ -57,7 +57,7 @@
 
     <div class="row" style="margin-top:10px">
       <button id="build" class="primary">Create workflow</button>
-      <div class="hint">Creates a per-scenario n8n workflow (Prod + Demo). When ready: “Download .n8n.json”.</div>
+      <div class="hint">Creates a per-scenario n8n workflow (presentation style). Then: “Download .n8n.json”.</div>
     </div>
     <div id="dbg" class="dbg"></div>
   </div>
@@ -95,19 +95,21 @@ async function getJSON(url, opts){
   catch { return { ok:r.ok, status:r.status, json:null, raw }; }
 }
 
+/* CHANGED: map catalog shapes to whatsapp | voice | web */
 function recommendedChannel(row){
   const shapes = listify(row.best_reply_shapes).map(x=>x.toLowerCase());
   const set = new Set(shapes.map(s =>
-    s.includes('whatsapp')?'whatsapp':
-    (s.includes('sms')||s.includes('text'))?'sms':
-    (s.includes('voice')||s.includes('call'))?'call':
-    s.includes('email')?'email':s));
-  if (set.has('sms')) return 'sms';
+    s.includes('whatsapp') ? 'whatsapp' :
+    (s.includes('sms') || s.includes('text')) ? 'whatsapp' :     // map sms→whatsapp
+    (s.includes('voice') || s.includes('call') || s.includes('phone')) ? 'voice' :
+    (s.includes('email') || s.includes('web') || s.includes('chat')) ? 'web' :
+    'web'
+  ));
   if (set.has('whatsapp')) return 'whatsapp';
-  if (set.has('email')) return 'email';
-  if (set.has('call')) return 'call';
-  return 'email';
+  if (set.has('voice')) return 'voice';
+  return 'web';
 }
+
 function matchIndustryForScenario(s){
   const key = (s.name||'').toLowerCase();
   return IND_MAP[key] || null;
@@ -136,12 +138,17 @@ function setBtn(state){
   if (state==='ready'){ buildBtn.disabled=false; buildBtn.textContent='Download .n8n.json'; }
 }
 
+/* CHANGED: pass selectedChannel + forcePresentation to local builder fallback */
 function previewLocalJSON(s, industry){
-  const wf = window.Builder.buildWorkflowJSON(s, industry, { recommendedChannel: channelSel.value });
+  const wf = window.Builder.buildWorkflowJSON(
+    s,
+    industry,
+    { selectedChannel: channelSel.value, forcePresentation: true } // CHANGED
+  );
   bpTA.value = JSON.stringify(wf, null, 2);
   LAST_JSON = wf;
   setBtn('ready');
-  setStatus('Built locally via fallback (no /api/build).', 'ok');
+  setStatus('Built locally (presentation style).', 'ok');
 }
 
 function applyScenario(id){
@@ -219,7 +226,13 @@ searchEl.addEventListener('keydown', e=>{
   }
 });
 scenarioSel.addEventListener('change', ()=> applyScenario(scenarioSel.value));
-channelSel.addEventListener('change', ()=> applyScenario(scenarioSel.value));
+/* CHANGED: changing channel clears preview + last json */
+channelSel.addEventListener('change', ()=>{
+  LAST_JSON = null;
+  bpTA.value = '';
+  setBtn('idle');
+  setStatus('Channel changed. Click “Create workflow” to rebuild.');
+});
 
 /* ========== Create / Download flow ========== */
 function downloadJSON(obj, filename){
@@ -235,7 +248,8 @@ buildBtn.addEventListener('click', async ()=>{
 
     // If already created, this click means "Download"
     if (LAST_JSON){
-      downloadJSON(LAST_JSON, `${sid}-workflow.n8n.json`);
+      // CHANGED: include channel in filename
+      downloadJSON(LAST_JSON, `${sid}-${channelSel.value}.n8n.json`);
       return;
     }
 
@@ -243,27 +257,39 @@ buildBtn.addEventListener('click', async ()=>{
     setBtn('working');
     setStatus('Creating per-scenario workflow via /api/build…');
 
+    /* CHANGED: include channel + presentation=true */
     const res = await getJSON('/api/build?debug=1', {
       method:'POST',
       headers:{ 'Content-Type':'application/json', 'X-Preview':'1' },
-      body: JSON.stringify({ scenario_id: sid, compat: 'safe', includeDemo: true })
+      body: JSON.stringify({
+        scenario_id: sid,
+        channel: channelSel.value,          // CHANGED
+        presentation: true,                 // CHANGED
+        compat: 'safe',
+        includeDemo: true
+      })
     });
 
     if (res.ok && res.json && res.json.name && Array.isArray(res.json.nodes)) {
       LAST_JSON = res.json;
       bpTA.value = JSON.stringify(res.json, null, 2);
       setBtn('ready');
-      setStatus('<span class="ok">Created via /api/build.</span>');
+      setStatus('<span class="ok">Created via /api/build (presentation style).</span>');
       return;
     }
 
     setStatus(`api/build failed (${res.status}). Using local builder fallback…`);
     assertBuilder();
-    const wf = window.Builder.buildWorkflowJSON(s, matchIndustryForScenario(s), { recommendedChannel: channelSel.value });
+    /* CHANGED: local fallback passes selectedChannel + forcePresentation */
+    const wf = window.Builder.buildWorkflowJSON(
+      s,
+      matchIndustryForScenario(s),
+      { selectedChannel: channelSel.value, forcePresentation: true }
+    );
     LAST_JSON = wf;
     bpTA.value = JSON.stringify(wf, null, 2);
     setBtn('ready');
-    setStatus('<span class="ok">Built locally via fallback.</span>');
+    setStatus('<span class="ok">Built locally (presentation style).</span>');
   }catch(e){
     setBtn('idle');
     setStatus('<span class="err">Create failed:</span> ' + (e.message||String(e)));

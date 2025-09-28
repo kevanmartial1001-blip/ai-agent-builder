@@ -1,8 +1,10 @@
 // public/builder.js
 // Two lanes per workflow: PRODUCTION (top) + DEMO (bottom), no overlap.
 // Demo lane uses Manual Trigger + seeded test contacts; Prod lane uses real signal trigger.
-// Archetype-aware message composer (uses scenario.triggers/how_it_works/roi_hypothesis).
+// Archetype-aware message composer (uses scenario.triggers/how_it_works/roi_hypothesis + risk_notes + LLM plan).
 // Import-safe: all If/Switch rule values are stringified to avoid n8n "toLowerCase" errors.
+// Adds LLM planning: uses 4 "context" columns to propose trigger, channels, branches, tools, and error paths.
+// In compat="full" it will call a planning endpoint; in compat="safe" it synthesizes a plan locally.
 // Attach global: window.Builder = { buildWorkflowJSON }
 
 (function () {
@@ -17,16 +19,13 @@
     Array.isArray(v)
       ? v.map((x) => String(x).trim()).filter(Boolean)
       : String(v || "")
-          .split(/[;,\n|]+/)
-          .map((x) => x.trim())
-          .filter(Boolean);
+          .split(/[;,\n|]+/).map((x) => x.trim()).filter(Boolean);
 
   function baseWorkflow(name) {
     return { name, nodes: [], connections: {}, active: false, settings: {}, staticData: {}, __yOffset: 0 };
   }
 
   function addNode(wf, node) {
-    // apply lane Y offset so Prod vs Demo don't overlap
     if (Array.isArray(node.position) && node.position.length === 2) {
       node.position = [node.position[0], node.position[1] + (wf.__yOffset || 0)];
     }
@@ -36,22 +35,16 @@
 
   function connect(wf, from, to, outputIndex = 0) {
     wf.connections[from] ??= { main: [] };
-    // ensure index exists
     while (wf.connections[from].main.length <= outputIndex) {
       wf.connections[from].main.push([]);
     }
     wf.connections[from].main[outputIndex].push({ node: to, type: "main", index: 0 });
   }
 
-  // helper to build a lane at a given Y offset
   function withYOffset(wf, yOffset, fn) {
     const prev = wf.__yOffset || 0;
     wf.__yOffset = yOffset;
-    try {
-      fn();
-    } finally {
-      wf.__yOffset = prev;
-    }
+    try { fn(); } finally { wf.__yOffset = prev; }
   }
 
   // ---------------- shared nodes ----------------
@@ -136,7 +129,6 @@
       parameters: { functionCode: code },
     });
   }
-  // IMPORT-SAFE If: force string for value2 so importer never lowercases undefined/number
   function addIf(wf, name, left, op, right, x, y) {
     return addNode(wf, {
       id: uid("if"),
@@ -152,7 +144,6 @@
       },
     });
   }
-  // IMPORT-SAFE Switch: force rule value2 to string
   function addSwitch(wf, name, valueExpr, rules, x, y) {
     const safeRules = (rules || []).map((r) => ({
       operation: r.operation || "equal",
@@ -188,6 +179,23 @@
     });
   }
 
+  // ---------------- context extractor ----------------
+  function buildContextObj(s) {
+    const out = {
+      triggers: String(s?.triggers || "").trim(),
+      best_reply_shapes: listify(s?.best_reply_shapes || []),
+      risk_notes: String(s?.risk_notes || "").trim(),
+      roi_hypothesis: String(s?.roi_hypothesis || "").trim(),
+    };
+    out.summary = [
+      out.triggers && `Triggers: ${out.triggers}`,
+      out.best_reply_shapes?.length && `Shapes: ${out.best_reply_shapes.join(", ")}`,
+      out.risk_notes && `Risks: ${out.risk_notes}`,
+      out.roi_hypothesis && `ROI: ${out.roi_hypothesis}`,
+    ].filter(Boolean).join(" | ");
+    return out;
+  }
+
   // ---------------- demo/init/collector ----------------
   function addInit(wf, scenario, industry, primaryChannel, demoFlag = true, x = -920, y = 300, archetypeName = null) {
     const seed = {
@@ -202,6 +210,9 @@
       archetype: archetypeName || scenario?.archetype || "UNKNOWN",
       scenario,
       industry,
+      context: buildContextObj(scenario),
+      // Planning endpoint overridable at runtime:
+      llmPlanUrl: "https://example.com/llm/plan"
     };
     return addNode(wf, {
       id: uid("init"),
@@ -212,6 +223,7 @@
       parameters: { functionCode: `const seed=${JSON.stringify(seed, null, 2)}; return [seed];` },
     });
   }
+
   function addCollector(wf, x = 1600, y = 300) {
     return addFunction(
       wf,
@@ -220,6 +232,101 @@
 const now=new Date().toISOString();
 const arr=Array.isArray(items)?items:[{json:$json}];
 return arr.map((it,i)=>({json:{...it.json,__collected_at:now, index:i}}));`,
+      x,
+      y
+    );
+  }
+
+  // ---------------- LLM planning (schema map) ----------------
+  function addLLMPlan(wf, x = -700, y = 220) {
+    if (compat === "full") {
+      // Call your planning backend; expects { plan, messages? }
+      return addHTTP(
+        wf,
+        "LLM Plan (Schema Map)",
+        "={{$json.llmPlanUrl || 'https://example.com/llm/plan'}}",
+        `={{{
+  industry: $json.industry,
+  scenario: $json.scenario,
+  context: $json.context,
+  want: {
+    trigger: true,
+    channels: true,
+    branches: true,
+    tools: true,
+    errors: true,
+    messages: true
+  }
+}}}`,
+        x,
+        y,
+        "POST"
+      );
+    }
+    // Safe-mode synthesizer (no external calls)
+    return addFunction(
+      wf,
+      "LLM Plan (Synthesize)",
+      `
+const ctx = $json.context||{};
+const scen = $json.scenario||{};
+const text = (k)=>String(scen[k]||'').toLowerCase();
+let trigger='manual';
+if(/real[- ]?time|webhook|event|incoming/.test(ctx.triggers||'')) trigger='webhook';
+else if(/daily|weekly|monthly|cron|every\\s+\\d+\\s*(min|hour|day)/.test(ctx.triggers||'')) trigger='cron';
+
+const channelsGuess = (ctx.best_reply_shapes||[]).map(s=>String(s).toLowerCase()).map(s=>
+  s.includes('whatsapp')?'whatsapp' : s.includes('sms')||s.includes('text')?'sms' :
+  s.includes('voice')||s.includes('call')?'call' : 'email'
+);
+const uniq = (a)=>Array.from(new Set(a));
+const channels = uniq(channelsGuess.length?channelsGuess:['email']);
+
+const tools = { crm: 'CRM', messaging: 'MAILING', telephony: 'TELCO', kb: 'KB', bi: 'BI' };
+const errors = [
+  { code:'AUTH_MISSING', hint:'Credential not connected' },
+  { code:'RATE_LIMIT', hint:'Backoff + retry with jitter' },
+  { code:'INVALID_INPUT', hint:'Validate/normalize input fields' }
+];
+
+const messages = {
+  defaults: { tone:'natural-professional', avoid:'robotic menus' }
+};
+
+const branches = [
+  { id:'happy_path', title:'Happy Path', steps:['compose','send','update_crm'] },
+  { id:'error_path', title:'Error Path', steps:['log_error','notify_ops'] }
+];
+
+return [{ plan:{ trigger, channels, tools, errors, branches }, messages }];
+`,
+      x,
+      y
+    );
+  }
+
+  function addAdoptPlan(wf, x = -460, y = 220) {
+    return addFunction(
+      wf,
+      "Adopt Plan → JSON",
+      `
+const p = $json.plan || $json.body || $json.data || {};
+const plan = p.plan || ($json.plan ? $json.plan : p);
+const messages = p.messages || $json.messages || {};
+let channels = Array.isArray(plan?.channels) && plan.channels.length ? plan.channels : ($json.channels||[]);
+if (!channels || !channels.length) channels = ['email'];
+const recommendedChannel = channels[0];
+
+return [{
+  ...$json,
+  plan,
+  messages,
+  channels,
+  recommendedChannel,
+  // Honor plan trigger if present
+  trigger: plan?.trigger || $json.trigger || 'manual'
+}];
+`,
       x,
       y
     );
@@ -252,8 +359,12 @@ return [payload];`,
         type: "n8n-nodes-base.emailSend",
         typeVersion: 3,
         position: pos(x, y),
-        parameters: { to: "={{$json.emailTo}}", subject: "={{$json.scenario?.agent_name || 'AI Outreach'}}", text: "={{$json.message}}" },
-        credentials: {},
+        parameters: {
+          to: "={{$json.emailTo}}",
+          subject: "={{$json.subject || $json.scenario?.agent_name || 'AI Outreach'}}",
+          text: "={{$json.message}}"
+        },
+        credentials: {} // Select real or demo creds in n8n UI
       });
     return demoLeaf("Email")(wf, x, y);
   }
@@ -266,7 +377,7 @@ return [payload];`,
         typeVersion: 3,
         position: pos(x, y),
         parameters: { resource: "message", operation: "create", from: "={{$json.smsFrom}}", to: "={{$json.to}}", message: "={{$json.message}}" },
-        credentials: {},
+        credentials: {}
       });
     return demoLeaf("SMS")(wf, x, y);
   }
@@ -285,7 +396,7 @@ return [payload];`,
           to: "={{'whatsapp:' + ($json.to)}}",
           message: "={{$json.message}}",
         },
-        credentials: {},
+        credentials: {}
       });
     return demoLeaf("WhatsApp")(wf, x, y);
   }
@@ -297,14 +408,20 @@ return [payload];`,
         type: "n8n-nodes-base.httpRequest",
         typeVersion: 4,
         position: pos(x, y),
-        parameters: { url: "={{$json.callWebhook}}", method: "POST", jsonParameters: true, sendBody: true, bodyParametersJson: "={{ { to:$json.to, from:$json.callFrom, text:$json.message } }}" },
+        parameters: {
+          url: "={{$json.callWebhook}}",
+          method: "POST",
+          jsonParameters: true,
+          sendBody: true,
+          bodyParametersJson: "={{ { to:$json.to, from:$json.callFrom, text:$json.message } }}"
+        },
       });
     return demoLeaf("Call")(wf, x, y);
   }
 
   const CHANNEL_BUILDERS = { email: addEmailNode, sms: addSMSNode, whatsapp: addWANode, call: addCallNode };
 
-  // ---------------- derive signals ----------------
+  // ---------------- derive signals (static fallback) ----------------
   function deriveSignals(scenario) {
     const text = (k) => String(scenario[k] || "").toLowerCase();
     const inText = (k, ...rxs) => rxs.some((rx) => new RegExp(rx, "i").test(text(k)));
@@ -370,56 +487,146 @@ return [payload];`,
   // ---------------- triggers ----------------
   function addTriggerBySignals(wf, sig, x = -1180) {
     switch (sig.trigger) {
-      case "cron":
-        return addCron(wf, "Cron (from triggers)", x, 140);
-      case "webhook":
-        return addWebhook(wf, "Webhook (from triggers)", x, 300);
-      case "imap":
-        return addFunction(wf, "IMAP Intake (Placeholder)", "return [$json];", x, 300);
-      default:
-        return addManual(wf, x, 300, "Manual Trigger");
+      case "cron":    return addCron(wf, "Cron (from triggers)", x, 140);
+      case "webhook": return addWebhook(wf, "Webhook (from triggers)", x, 300);
+      case "imap":    return addFunction(wf, "IMAP Intake (Placeholder)", "return [$json];", x, 300);
+      default:        return addManual(wf, x, 300, "Manual Trigger");
     }
   }
 
-  // ---------------- message composer (archetype-aware) ----------------
+  // ---------------- message composer (context + plan aware) ----------------
   function composeMessageFunctionBody() {
     return `
 const s = $json.scenario || {};
 const ind = $json.industry || {};
 const archetype = String($json.archetype || '').toUpperCase();
 const ch = String($json.recommendedChannel || 'email').toLowerCase();
+const ctx = $json.context || {};
+const plan = $json.plan || {};
+const planMsgs = ($json.messages && $json.messages.bundles) || ($json.messages || {});
 const trim = (t, n=240) => (String(t||'').replace(/\\s+/g,' ').trim()).slice(0,n);
 const line = (lbl, v) => v ? \`\${lbl}: \${trim(v)}\\n\` : '';
 const emoji = { email:'📧', sms:'📱', whatsapp:'🟢', call:'📞' }[ch] || '💬';
-
 const industryLine = ind.name || ind.industry_id ? \`Industry: \${ind.name||ind.industry_id}\\n\` : '';
-const triggers = trim(s.triggers, 180);
+
+const triggers = trim(ctx.triggers || s.triggers, 200);
 const how = trim(s.how_it_works, 260);
-const roi = trim(s.roi_hypothesis, 160);
+const roi = trim(ctx.roi_hypothesis || s.roi_hypothesis, 180);
+const risks = trim(ctx.risk_notes, 160);
 
 const openers = { email: 'Hi there — quick note:', sms: 'Quick update:', whatsapp: 'Heads up:', call: 'Talk track:' };
 const cta = { email: 'Reply or click the link to confirm.', sms: 'Reply with 1 to confirm, 2 to reschedule.', whatsapp: 'Reply here to confirm or change.', call: 'Confirm during IVR or say “reschedule”.' };
 
-function msgScheduling(){ return \`\${emoji} \${openers[ch]}\\n\${industryLine}\${line('Why now', triggers)}\${line('Plan', how)}\${roi?line('Impact', roi):''}\\n\${cta[ch]}\`; }
-function msgSupport(){ return \`\${emoji} \${openers[ch]}\\n\${industryLine}We received your request and created a ticket.\\n\${line('Context', triggers)}\${line('What happens next', how)}Priority: auto-routed by SLA/VIP.\\n\${cta[ch]}\`; }
-function msgNps(){ return \`\${emoji} \${openers[ch]}\\n\${industryLine}We’d value your feedback after the recent interaction.\\n\${line('Context', triggers)}\${roi?line('Why this matters', roi):''}Please rate us 0–10: link enclosed.\\nThanks!\`; }
-function msgFaq(){ return \`\${emoji} \${openers[ch]}\\n\${industryLine}\${line('We found an answer', how || 'Your question matches our knowledge base.')}\${cta[ch]}\`; }
-function msgSales(){ return \`\${emoji} \${openers[ch]}\\n\${industryLine}\${line('Problem we solve', triggers)}\${line('How it works', how)}\${roi?line('Expected ROI', roi):''}\\nInterested in a quick demo?\`; }
-function msgLeadQual(){ return \`\${emoji} \${openers[ch]}\\n\${industryLine}Got your details — qualifying now.\\n\${line('Form intent', triggers)}If you’re ready, grab a time on the calendar.\`; }
-function msgChurn(){ return \`\${emoji} \${openers[ch]}\\n\${industryLine}\${line('We noticed inactivity', triggers)}\${line('What you’ll get back', roi)}Reply to re-activate or claim an offer.\`; }
-function msgRenewals(){ return \`\${emoji} \${openers[ch]}\\n\${industryLine}Your renewal is coming up.\\n\${line('Usage summary', triggers)}\${line('Success plan', how)}\${roi?line('Outcomes', roi):''}Shall we book a QBR?\`; }
-function msgAR(){ return \`\${emoji} \${openers[ch]}\\n\${industryLine}Friendly reminder: an invoice is past due.\\n\${line('Context', triggers)}\${line('Resolution path', how)}If there’s a dispute, reply “dispute”.\`; }
-function msgAP(){ return \`\${emoji} \${openers[ch]}\\n\${industryLine}We received an invoice.\\n\${line('Matching rules', how)}Exceptions go to approval.\\nYou’ll get a confirmation once paid.\`; }
-function msgInventory(){ return \`\${emoji} \${openers[ch]}\\n\${industryLine}Low stock detected on key SKUs.\\n\${line('Signal', triggers)}\${line('Replenishment flow', how)}We can auto-raise a PO if approved.\`; }
-function msgReplenishment(){ return \`\${emoji} \${openers[ch]}\\n\${industryLine}Low-stock event — preparing PO.\\n\${line('Selection logic', how)}Approve to release the order.\`; }
-function msgDispatch(){ return \`\${emoji} \${openers[ch]}\\n\${industryLine}We’re assigning a technician now.\\n\${line('Routing logic', how)}You’ll receive ETA + calendar invite.\`; }
-function msgCompliance(){ return \`\${emoji} \${openers[ch]}\\n\${industryLine}Compliance sweep in progress.\\n\${line('Controls', how)}Issues will be reported with remediation steps.\`; }
-function msgIncident(){ return \`\${emoji} \${openers[ch]}\\n\${industryLine}Incident triage active.\\n\${line('Detection', triggers)}\${line('Runbook', how)}High severity routes to on-call.\`; }
-function msgETL(){ return \`\${emoji} \${openers[ch]}\\n\${industryLine}Data pipeline execution.\\n\${line('Source → Transform', how || triggers)}You’ll get status + load confirmation.\`; }
-function msgReporting(){ return \`\${emoji} \${openers[ch]}\\n\${industryLine}Reporting job complete.\\n\${line('KPIs', triggers || how)}Dashboard export is attached/linked.\`; }
-function msgAccess(){ return \`\${emoji} \${openers[ch]}\\n\${industryLine}Access request received.\\n\${line('Entitlements check', how)}Awaiting approval before provisioning.\`; }
-function msgPrivacy(){ return \`\${emoji} \${openers[ch]}\\n\${industryLine}We received your data subject request.\\n\${line('Verification', how)}We’ll respond within the required window.\`; }
-function msgRecruiting(){ return \`\${emoji} \${openers[ch]}\\n\${industryLine}Thanks for applying — reviewing your details now.\\n\${line('Screening', how)}We’ll reach out to book an interview.\`; }
+function pickFromPlan(kind){
+  try {
+    const b = planMsgs[kind];
+    if (!b) return null;
+    const arr = Array.isArray(b) ? b : (Array.isArray(b?.[ch]) ? b[ch] : null);
+    if (!arr || !arr.length) return null;
+    return String(arr[0]);
+  } catch(e){ return null; }
+}
+
+function msgScheduling(){
+  const fromPlan = pickFromPlan('APPOINTMENT_SCHEDULING');
+  if (fromPlan) return fromPlan;
+  return \`\${emoji} \${openers[ch]}\\n\${industryLine}\${line('Why now', triggers)}\${line('Plan', how)}\${roi?line('Impact', roi):''}\${risks?line('Keep in mind', risks):''}\\n\${cta[ch]}\`;
+}
+function msgSupport(){
+  const fromPlan = pickFromPlan('CUSTOMER_SUPPORT_INTAKE');
+  if (fromPlan) return fromPlan;
+  return \`\${emoji} \${openers[ch]}\\n\${industryLine}We received your request and created a ticket.\\n\${line('Context', triggers)}\${line('What happens next', how)}Priority auto-routed by SLA/VIP.\\n\${cta[ch]}\`;
+}
+function msgNps(){
+  const fromPlan = pickFromPlan('FEEDBACK_NPS');
+  if (fromPlan) return fromPlan;
+  return \`\${emoji} \${openers[ch]}\\n\${industryLine}We’d value your feedback after the recent interaction.\\n\${line('Context', triggers)}\${roi?line('Why this matters', roi):''}Please rate us 0–10: link enclosed.\\nThanks!\`;
+}
+function msgFaq(){
+  const fromPlan = pickFromPlan('KNOWLEDGEBASE_FAQ');
+  if (fromPlan) return fromPlan;
+  return \`\${emoji} \${openers[ch]}\\n\${industryLine}\${line('We found an answer', how || 'Your question matches our knowledge base.')}\${cta[ch]}\`;
+}
+function msgSales(){
+  const fromPlan = pickFromPlan('SALES_OUTREACH');
+  if (fromPlan) return fromPlan;
+  return \`\${emoji} \${openers[ch]}\\n\${industryLine}\${line('Problem we solve', triggers)}\${line('How it works', how)}\${roi?line('Expected ROI', roi):''}\\nInterested in a quick demo?\`;
+}
+function msgLeadQual(){
+  const fromPlan = pickFromPlan('LEAD_QUAL_INBOUND');
+  if (fromPlan) return fromPlan;
+  return \`\${emoji} \${openers[ch]}\\n\${industryLine}Got your details — qualifying now.\\n\${line('Form intent', triggers)}If you’re ready, grab a time on the calendar.\`;
+}
+function msgChurn(){
+  const fromPlan = pickFromPlan('CHURN_WINBACK');
+  if (fromPlan) return fromPlan;
+  return \`\${emoji} \${openers[ch]}\\n\${industryLine}\${line('We noticed inactivity', triggers)}\${line('What you’ll get back', roi)}Reply to re-activate or claim an offer.\`;
+}
+function msgRenewals(){
+  const fromPlan = pickFromPlan('RENEWALS_CSM');
+  if (fromPlan) return fromPlan;
+  return \`\${emoji} \${openers[ch]}\\n\${industryLine}Your renewal is coming up.\\n\${line('Usage summary', triggers)}\${line('Success plan', how)}\${roi?line('Outcomes', roi):''}Shall we book a QBR?\`;
+}
+function msgAR(){
+  const fromPlan = pickFromPlan('AR_FOLLOWUP');
+  if (fromPlan) return fromPlan;
+  return \`\${emoji} \${openers[ch]}\\n\${industryLine}Friendly reminder: an invoice is past due.\\n\${line('Context', triggers)}\${line('Resolution path', how)}If there’s a dispute, reply “dispute”.\`;
+}
+function msgAP(){
+  const fromPlan = pickFromPlan('AP_AUTOMATION');
+  if (fromPlan) return fromPlan;
+  return \`\${emoji} \${openers[ch]}\\n\${industryLine}We received an invoice.\\n\${line('Matching rules', how)}Exceptions go to approval.\\nYou’ll get a confirmation once paid.\`;
+}
+function msgInventory(){
+  const fromPlan = pickFromPlan('INVENTORY_MONITOR');
+  if (fromPlan) return fromPlan;
+  return \`\${emoji} \${openers[ch]}\\n\${industryLine}Low stock detected on key SKUs.\\n\${line('Signal', triggers)}\${line('Replenishment flow', how)}We can auto-raise a PO if approved.\`;
+}
+function msgReplenishment(){
+  const fromPlan = pickFromPlan('REPLENISHMENT_PO');
+  if (fromPlan) return fromPlan;
+  return \`\${emoji} \${openers[ch]}\\n\${industryLine}Low-stock event — preparing PO.\\n\${line('Selection logic', how)}Approve to release the order.\`;
+}
+function msgDispatch(){
+  const fromPlan = pickFromPlan('FIELD_SERVICE_DISPATCH');
+  if (fromPlan) return fromPlan;
+  return \`\${emoji} \${openers[ch]}\\n\${industryLine}We’re assigning a technician now.\\n\${line('Routing logic', how)}You’ll receive ETA + calendar invite.\`;
+}
+function msgCompliance(){
+  const fromPlan = pickFromPlan('COMPLIANCE_AUDIT');
+  if (fromPlan) return fromPlan;
+  return \`\${emoji} \${openers[ch]}\\n\${industryLine}Compliance sweep in progress.\\n\${line('Controls', how)}Issues will be reported with remediation steps.\`;
+}
+function msgIncident(){
+  const fromPlan = pickFromPlan('INCIDENT_MGMT');
+  if (fromPlan) return fromPlan;
+  return \`\${emoji} \${openers[ch]}\\n\${industryLine}Incident triage active.\\n\${line('Detection', triggers)}\${line('Runbook', how)}High severity routes to on-call.\`;
+}
+function msgETL(){
+  const fromPlan = pickFromPlan('DATA_PIPELINE_ETL');
+  if (fromPlan) return fromPlan;
+  return \`\${emoji} \${openers[ch]}\\n\${industryLine}Data pipeline execution.\\n\${line('Source → Transform', how || triggers)}You’ll get status + load confirmation.\`;
+}
+function msgReporting(){
+  const fromPlan = pickFromPlan('REPORTING_KPI_DASH');
+  if (fromPlan) return fromPlan;
+  return \`\${emoji} \${openers[ch]}\\n\${industryLine}Reporting job complete.\\n\${line('KPIs', triggers || how)}Dashboard export is attached/linked.\`;
+}
+function msgAccess(){
+  const fromPlan = pickFromPlan('ACCESS_GOVERNANCE');
+  if (fromPlan) return fromPlan;
+  return \`\${emoji} \${openers[ch]}\\n\${industryLine}Access request received.\\n\${line('Entitlements check', how)}Awaiting approval before provisioning.\`;
+}
+function msgPrivacy(){
+  const fromPlan = pickFromPlan('PRIVACY_DSR');
+  if (fromPlan) return fromPlan;
+  return \`\${emoji} \${openers[ch]}\\n\${industryLine}We received your data subject request.\\n\${line('Verification', how)}We’ll respond within the required window.\`;
+}
+function msgRecruiting(){
+  const fromPlan = pickFromPlan('RECRUITING_INTAKE');
+  if (fromPlan) return fromPlan;
+  return \`\${emoji} \${openers[ch]}\\n\${industryLine}Thanks for applying — reviewing your details now.\\n\${line('Screening', how)}We’ll reach out to book an interview.\`;
+}
 
 let body;
 switch(String($json.archetype||'').toUpperCase()){
@@ -487,8 +694,7 @@ return [{ message: body, subject }];
   ];
   function classifyFallback(s) {
     const hay = [String(s.scenario_id || ""), String(s.name || ""), ...(Array.isArray(s.tags) ? s.tags : listify(s.tags))]
-      .join(" ")
-      .toLowerCase();
+      .join(" ").toLowerCase();
     for (const r of RULES) {
       const match = r.inc?.some((rx) => rx.test(hay));
       const blocked = r.exc?.some((rx) => rx.test(hay));
@@ -501,22 +707,36 @@ return [{ message: body, subject }];
   const T = {};
   const addCompose = (wf, x, y) => addFunction(wf, "Compose Message", composeMessageFunctionBody(), x, y);
 
+  // Helper: inject LLM planning early in each template
+  function planChain(wf, entryName, x = -700, y = 220) {
+    const plan = addLLMPlan(wf, x, y);
+    connect(wf, entryName, plan);
+    const adopt = addAdoptPlan(wf, x + 240, y);
+    connect(wf, plan, adopt);
+    return adopt; // downstream can use $json.plan, $json.channels, $json.recommendedChannel
+  }
+
   // 1) APPOINTMENT_SCHEDULING
   T.APPOINTMENT_SCHEDULING = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo } = ctx,
-      sig = deriveSignals(scenario);
+    const { scenario, industry, forceTrigger, demo } = ctx, sig = deriveSignals(scenario);
     const arch = "APPOINTMENT_SCHEDULING";
     if (forceTrigger) sig.trigger = forceTrigger;
     const trig = addTriggerBySignals(wf, sig, -1180);
     const init = addInit(wf, scenario, industry, sig.channels[0] || "sms", !!demo, -940, 300, arch);
     connect(wf, trig, init);
+
+    const adopt = planChain(wf, init, -700, 220);
+
     const fetch = addHTTP(wf, "Fetch Upcoming (PMS)", "={{$json.pms_upcoming || 'https://example.com/pms/upcoming'}}", "={{$json}}", -700, 300);
-    connect(wf, init, fetch);
+    connect(wf, adopt, fetch);
     const split = addSplit(wf, -460, 300);
     connect(wf, fetch, split);
     const personalize = addCompose(wf, -220, 300);
     connect(wf, split, personalize);
-    const lastSend = addCadence(wf, personalize, sig.channels.length ? sig.channels : ["sms", "email"], 20, 300);
+
+    const ch = (sig.channels.length ? sig.channels : ["sms","email"]);
+    const lastSend = addCadence(wf, personalize, ch, 20, 300);
+
     let post = lastSend;
     if (sig.features.waitlist) {
       const detectCancel = addIf(wf, "Canceled?", "={{$json.status}}", "equal", "canceled", 20, 140);
@@ -543,23 +763,24 @@ return [{ message: body, subject }];
 
   // 2) CUSTOMER_SUPPORT_INTAKE
   T.CUSTOMER_SUPPORT_INTAKE = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo } = ctx,
-      sig = deriveSignals(scenario);
+    const { scenario, industry, forceTrigger, demo } = ctx, sig = deriveSignals(scenario);
     const arch = "CUSTOMER_SUPPORT_INTAKE";
     if (forceTrigger) sig.trigger = forceTrigger;
     const trig = addTriggerBySignals(wf, sig, -1180);
     const init = addInit(wf, scenario, industry, sig.channels[0] || "email", !!demo, -940, 300, arch);
     connect(wf, trig, init);
 
-    let entry = init;
+    const adopt = planChain(wf, init, -700, 220);
+
+    let entry = adopt;
     if (sig.features.faq_search || sig.systems.kb) {
       const kb = addHTTP(wf, "KB Search", "={{'https://example.com/kb/search'}}", "={{$json}}", -700, 300);
       const found = addIf(wf, "Found Answer?", "={{$json.kbHit || $json.answer}}", "notEmpty", "", -460, 300);
-      connect(wf, init, kb);
+      connect(wf, adopt, kb);
       connect(wf, kb, found);
       const defl = addCompose(wf, -220, 200);
       connect(wf, found, defl, 0);
-      const deflSend = addCadence(wf, defl, sig.channels.slice(0, 1).length ? sig.channels.slice(0, 1) : ["email"], 20, 200);
+      const deflSend = addCadence(wf, defl, sig.channels.slice(0,1).length ? sig.channels.slice(0,1) : ["email"], 20, 200);
       const merge = addMerge(wf, "Merge (Deflection/Ticket)", 260, 260, "append");
       connect(wf, deflSend, merge);
       entry = addFunction(wf, "No KB Hit → Ticket", "return [$json];", -220, 380);
@@ -586,22 +807,23 @@ return [{...$json,vip,sla}];`,
     const create = addHTTP(wf, "Create Ticket", "={{'https://example.com/ticket/create'}}", "={{$json}}", 1000, 380);
     connect(wf, gate, create, 1);
     connect(wf, esc, create);
-    const ack = addCadence(wf, create, sig.channels.slice(0, 1).length ? sig.channels.slice(0, 1) : ["email"], 1260, 300);
+    const ack = addCadence(wf, create, sig.channels.slice(0,1).length ? sig.channels.slice(0,1) : ["email"], 1260, 300);
     const col = addCollector(wf, 1540, 300);
     connect(wf, ack, col);
   };
 
   // 3) FEEDBACK_NPS
   T.FEEDBACK_NPS = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo } = ctx,
-      sig = deriveSignals(scenario);
+    const { scenario, industry, forceTrigger, demo } = ctx, sig = deriveSignals(scenario);
     const arch = "FEEDBACK_NPS";
-    if (forceTrigger) sig.trigger = forceTrigger;
     const cronOrTrig = addTriggerBySignals(wf, forceTrigger ? { trigger: forceTrigger } : { trigger: "cron" }, -1180);
     const init = addInit(wf, scenario, industry, sig.channels[0] || "email", !!demo, -940, 300, arch);
     connect(wf, cronOrTrig, init);
+
+    const adopt = planChain(wf, init, -700, 220);
+
     const mk = addHTTP(wf, "Create NPS Link", "={{$json.nps || 'https://example.com/nps/create'}}", "={{$json}}", -700, 300);
-    connect(wf, init, mk);
+    connect(wf, adopt, mk);
     const comp = addCompose(wf, -460, 300);
     connect(wf, mk, comp);
     const sendLast = addCadence(wf, comp, sig.channels.length ? sig.channels : ["email", "sms"], -200, 300);
@@ -617,20 +839,22 @@ return [{...$json,vip,sla}];`,
 
   // 4) KNOWLEDGEBASE_FAQ
   T.KNOWLEDGEBASE_FAQ = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo } = ctx,
-      sig = deriveSignals(scenario);
+    const { scenario, industry, forceTrigger, demo } = ctx, sig = deriveSignals(scenario);
     const arch = "KNOWLEDGEBASE_FAQ";
     if (forceTrigger) sig.trigger = forceTrigger;
     const trig = addTriggerBySignals(wf, { trigger: "webhook" }, -1180);
     const init = addInit(wf, scenario, industry, sig.channels[0] || "email", !!demo, -940, 300, arch);
     connect(wf, trig, init);
+
+    const adopt = planChain(wf, init, -700, 220);
+
     const search = addHTTP(wf, "KB Search", "={{'https://example.com/kb/search'}}", "={{$json}}", -700, 300);
-    connect(wf, init, search);
+    connect(wf, adopt, search);
     const found = addIf(wf, "Found Answer?", "={{$json.kbHit || $json.answer}}", "notEmpty", "", -460, 300);
     connect(wf, search, found);
     const comp = addCompose(wf, -220, 200);
     connect(wf, found, comp, 0);
-    const send = addCadence(wf, comp, sig.channels.slice(0, 1).length ? sig.channels.slice(0, 1) : ["email"], 40, 200);
+    const send = addCadence(wf, comp, sig.channels.slice(0,1).length ? sig.channels.slice(0,1) : ["email"], 40, 200);
     const ticket = addHTTP(wf, "Create Ticket", "={{'https://example.com/ticket/create'}}", "={{$json}}", 40, 380);
     connect(wf, found, ticket, 1);
     const col = addCollector(wf, 320, 300);
@@ -640,17 +864,21 @@ return [{...$json,vip,sla}];`,
 
   // 5) SALES_OUTREACH
   T.SALES_OUTREACH = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo } = ctx,
-      sig = deriveSignals(scenario);
+    const { scenario, industry, forceTrigger, demo } = ctx, sig = deriveSignals(scenario);
     const arch = "SALES_OUTREACH";
     if (forceTrigger) sig.trigger = forceTrigger;
     const trig = addTriggerBySignals(wf, sig, -1180);
     let init = addInit(wf, scenario, industry, sig.channels[0] || "email", !!demo, -940, 300, arch);
     connect(wf, trig, init);
+
+    const adopt = planChain(wf, init, -700, 220);
+
     if (sig.features.enrich) {
       const n = addHTTP(wf, "Enrich Lead", "={{$json.enrichUrl || 'https://example.com/enrich'}}", "={{$json}}", -700, 300);
-      connect(wf, init, n);
+      connect(wf, adopt, n);
       init = n;
+    } else {
+      init = adopt;
     }
     if (sig.features.dedupe) {
       const n = addFunction(
@@ -686,13 +914,14 @@ const out=[]; for(const it of items){const k=(it.email||it.company||'').toLowerC
 
   // 6) LEAD_QUAL_INBOUND
   T.LEAD_QUAL_INBOUND = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo } = ctx,
-      sig = deriveSignals(scenario);
+    const { scenario, industry, forceTrigger, demo } = ctx, sig = deriveSignals(scenario);
     const arch = "LEAD_QUAL_INBOUND";
-    if (forceTrigger) sig.trigger = forceTrigger;
     const hook = addTriggerBySignals(wf, { trigger: "webhook" }, -1180);
     const init = addInit(wf, scenario, industry, sig.channels[0] || "email", !!demo, -940, 300, arch);
     connect(wf, hook, init);
+
+    const adopt = planChain(wf, init, -700, 220);
+
     const score = addFunction(
       wf,
       "Score/Route",
@@ -701,7 +930,7 @@ l.route = l.score>=60?'ae':'sdr'; return [l];`,
       -700,
       300
     );
-    connect(wf, init, score);
+    connect(wf, adopt, score);
     const ifAE = addIf(wf, "Route to AE?", "={{$json.route}}", "equal", "ae", -460, 300);
     const book = addHTTP(wf, "Book Calendar", "={{$json.calUrl || 'https://example.com/calendar/book'}}", "={{$json}}", -220, 300);
     const crm = addHTTP(wf, "Create/Update CRM", "={{$json.crmUrl || 'https://example.com/crm/upsert'}}", "={{$json}}", 40, 300);
@@ -714,15 +943,17 @@ l.route = l.score>=60?'ae':'sdr'; return [l];`,
 
   // 7) CHURN_WINBACK
   T.CHURN_WINBACK = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo } = ctx,
-      sig = deriveSignals(scenario);
+    const { scenario, industry, forceTrigger, demo } = ctx, sig = deriveSignals(scenario);
     const arch = "CHURN_WINBACK";
     if (forceTrigger) sig.trigger = forceTrigger;
     const trig = addTriggerBySignals(wf, sig, -1180);
     const init = addInit(wf, scenario, industry, sig.channels[0] || "email", !!demo, -940, 300, arch);
     connect(wf, trig, init);
+
+    const adopt = planChain(wf, init, -700, 220);
+
     const seg = addFunction(wf, "Segment Lapsed", `const d=$json; d.segment=(d.days_lapsed||90)>180?'deep':'light'; return [d];`, -700, 300);
-    connect(wf, init, seg);
+    connect(wf, adopt, seg);
     const comp = addCompose(wf, -460, 300);
     connect(wf, seg, comp);
     const last = addCadence(wf, comp, sig.channels.length ? sig.channels.slice(0, 2) : ["email", "sms"], -200, 300);
@@ -734,15 +965,16 @@ l.route = l.score>=60?'ae':'sdr'; return [l];`,
 
   // 8) RENEWALS_CSM
   T.RENEWALS_CSM = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo } = ctx,
-      sig = deriveSignals(scenario);
+    const { scenario, industry, forceTrigger, demo } = ctx, sig = deriveSignals(scenario);
     const arch = "RENEWALS_CSM";
-    if (forceTrigger) sig.trigger = forceTrigger;
     const cron = addTriggerBySignals(wf, { trigger: "cron" }, -1180);
     const init = addInit(wf, scenario, industry, sig.channels[0] || "email", !!demo, -940, 300, arch);
     connect(wf, cron, init);
+
+    const adopt = planChain(wf, init, -700, 220);
+
     const fetch = addHTTP(wf, "Fetch Renewals", "={{'https://example.com/crm/renewals'}}", "={{$json}}", -700, 300);
-    connect(wf, init, fetch);
+    connect(wf, adopt, fetch);
     const split = addSplit(wf, -460, 300);
     connect(wf, fetch, split);
     const risk = addFunction(wf, "Risk Score", `const r=$json;r.risk=(r.usage<0.5? 'high' : 'low'); return [r];`, -220, 300);
@@ -775,15 +1007,17 @@ l.route = l.score>=60?'ae':'sdr'; return [l];`,
 
   // 9) AR_FOLLOWUP
   T.AR_FOLLOWUP = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo } = ctx,
-      sig = deriveSignals(scenario);
+    const { scenario, industry, forceTrigger, demo } = ctx, sig = deriveSignals(scenario);
     const arch = "AR_FOLLOWUP";
     if (forceTrigger) sig.trigger = forceTrigger;
     const trig = addTriggerBySignals(wf, sig, -1180);
     const init = addInit(wf, scenario, industry, sig.channels[0] || "email", !!demo, -940, 300, arch);
     connect(wf, trig, init);
+
+    const adopt = planChain(wf, init, -700, 220);
+
     const aging = addHTTP(wf, "Pull Aging", "={{'https://example.com/accounting/aging'}}", "={{$json}}", -700, 300);
-    connect(wf, init, aging);
+    connect(wf, adopt, aging);
     const split = addSplit(wf, -460, 300);
     connect(wf, aging, split);
     const bucket = addFunction(wf, "Bucket 30/60/90", `const d=$json; const n=d.days_past_due||0; d.bucket= n>=90?'90': (n>=60?'60':'30'); return [d];`, -220, 300);
@@ -811,7 +1045,8 @@ l.route = l.score>=60?'ae':'sdr'; return [l];`,
     connect(wf, s30, comp);
     connect(wf, s60, comp);
     connect(wf, s90, comp);
-    const last = addCadence(wf, comp, sig.channels.slice(0, 2).length ? sig.channels.slice(0, 2) : ["email", "sms"], 820, 300);
+    const last = addCadence(wf, comp, sig.channels.slice(0,2).length ? sig.channels.slice(0,2) : ["email", "sms"], 820, 300);
+
     if (/dispute|discrepanc|appeal/.test(String(scenario.how_it_works || "").toLowerCase())) {
       const ifDisp = addIf(wf, "Dispute Raised?", "={{$json.dispute}}", "notEmpty", "", 1080, 300);
       connect(wf, last, ifDisp);
@@ -827,15 +1062,16 @@ l.route = l.score>=60?'ae':'sdr'; return [l];`,
 
   // 10) AP_AUTOMATION
   T.AP_AUTOMATION = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo } = ctx,
-      sig = deriveSignals(scenario);
+    const { scenario, industry, forceTrigger, demo } = ctx, sig = deriveSignals(scenario);
     const arch = "AP_AUTOMATION";
-    if (forceTrigger) sig.trigger = forceTrigger;
     const hook = addTriggerBySignals(wf, { trigger: "webhook" }, -1180);
     const init = addInit(wf, scenario, industry, "email", !!demo, -940, 300, arch);
     connect(wf, hook, init);
+
+    const adopt = planChain(wf, init, -700, 220);
+
     const parse = addFunction(wf, "Parse/Extract", "return [$json];", -700, 300);
-    connect(wf, init, parse);
+    connect(wf, adopt, parse);
     const match = addFunction(wf, "3-Way Match", sig.features.three_way_match ? "return [$json];" : "return [$json];", -460, 300);
     connect(wf, parse, match);
     const ifExc = addIf(wf, "Exception?", "={{$json.exception}}", "notEmpty", "", -220, 300);
@@ -851,15 +1087,16 @@ l.route = l.score>=60?'ae':'sdr'; return [l];`,
 
   // 11) INVENTORY_MONITOR
   T.INVENTORY_MONITOR = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo } = ctx,
-      sig = deriveSignals(scenario);
+    const { scenario, industry, forceTrigger, demo } = ctx, sig = deriveSignals(scenario);
     const arch = "INVENTORY_MONITOR";
-    if (forceTrigger) sig.trigger = forceTrigger;
     const trig = addTriggerBySignals(wf, sig, -1180);
     const init = addInit(wf, scenario, industry, "email", !!demo, -940, 300, arch);
     connect(wf, trig, init);
+
+    const adopt = planChain(wf, init, -700, 220);
+
     const fetch = addHTTP(wf, "Fetch Stock (WMS/ERP)", "={{'https://example.com/wms/levels'}}", "={{$json}}", -700, 300);
-    connect(wf, init, fetch);
+    connect(wf, adopt, fetch);
     const split = addSplit(wf, -460, 300);
     connect(wf, fetch, split);
     const thresh = addFunction(wf, "Threshold Check", "const i=$json; i.low=(i.qty||0) <= (i.min||10); return [i];", -220, 300);
@@ -884,18 +1121,19 @@ l.route = l.score>=60?'ae':'sdr'; return [l];`,
 
   // 12) REPLENISHMENT_PO
   T.REPLENISHMENT_PO = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo } = ctx,
-      sig = deriveSignals(scenario);
+    const { scenario, industry, forceTrigger, demo } = ctx, sig = deriveSignals(scenario);
     const arch = "REPLENISHMENT_PO";
-    if (forceTrigger) sig.trigger = forceTrigger;
     const hook = addTriggerBySignals(wf, { trigger: "webhook" }, -1180);
     const init = addInit(wf, scenario, industry, "email", !!demo, -940, 300, arch);
     connect(wf, hook, init);
+
+    const adopt = planChain(wf, init, -700, 220);
+
     const vendor = addFunction(wf, "Pick Supplier", "return [$json];", -700, 300);
     const create = addHTTP(wf, "Create PO (ERP)", "={{'https://example.com/erp/po'}}", "={{$json}}", -460, 300);
     const appr = addFunction(wf, "Approvals", "return [$json];", -220, 300);
     const update = addHTTP(wf, "Update WMS", "={{'https://example.com/wms/update'}}", "={{$json}}", 40, 300);
-    connect(wf, init, vendor);
+    connect(wf, adopt, vendor);
     connect(wf, vendor, create);
     connect(wf, create, appr);
     connect(wf, appr, update);
@@ -905,16 +1143,17 @@ l.route = l.score>=60?'ae':'sdr'; return [l];`,
 
   // 13) FIELD_SERVICE_DISPATCH
   T.FIELD_SERVICE_DISPATCH = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo } = ctx,
-      sig = deriveSignals(scenario);
+    const { scenario, industry, forceTrigger, demo } = ctx, sig = deriveSignals(scenario);
     const arch = "FIELD_SERVICE_DISPATCH";
-    if (forceTrigger) sig.trigger = forceTrigger;
     const trig = addTriggerBySignals(wf, { trigger: "webhook" }, -1180);
     const init = addInit(wf, scenario, industry, sig.channels[0] || "sms", !!demo, -940, 300, arch);
     connect(wf, trig, init);
+
+    const adopt = planChain(wf, init, -700, 220);
+
     const match = addFunction(wf, "Geo/Skills Match", "return [$json];", -700, 300);
     const assign = addHTTP(wf, "Assign Technician", "={{'https://example.com/dispatch/assign'}}", "={{$json}}", -460, 300);
-    connect(wf, init, match);
+    connect(wf, adopt, match);
     connect(wf, match, assign);
     const notifyTech = addCadence(wf, assign, [sig.channels[0] || "sms"], -200, 260);
     const notifyCust = addCadence(wf, assign, [sig.channels[1] || "email"], -200, 340);
@@ -927,19 +1166,20 @@ l.route = l.score>=60?'ae':'sdr'; return [l];`,
 
   // 14) COMPLIANCE_AUDIT
   T.COMPLIANCE_AUDIT = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo } = ctx,
-      sig = deriveSignals(scenario);
+    const { scenario, industry, forceTrigger, demo } = ctx, sig = deriveSignals(scenario);
     const arch = "COMPLIANCE_AUDIT";
-    if (forceTrigger) sig.trigger = forceTrigger;
     const cron = addTriggerBySignals(wf, { trigger: "cron" }, -1180);
     const init = addInit(wf, scenario, industry, "email", !!demo, -940, 300, arch);
     connect(wf, cron, init);
+
+    const adopt = planChain(wf, init, -700, 220);
+
     const fetch = addHTTP(wf, "Fetch Checklist", "={{'https://example.com/compliance/list'}}", "={{$json}}", -700, 300);
     const validate = addFunction(wf, "Validate Controls", "return [$json];", -460, 300);
     const issues = addIf(wf, "Any Issues?", "={{$json.issues}}", "notEmpty", "", -220, 300);
     const report = addHTTP(wf, "Generate Report", "={{'https://example.com/compliance/report'}}", "={{$json}}", 40, 300);
     const notify = addHTTP(wf, "Notify Legal", "={{'https://example.com/legal/notify'}}", "={{$json}}", 300, 300);
-    connect(wf, init, fetch);
+    connect(wf, adopt, fetch);
     connect(wf, fetch, validate);
     connect(wf, validate, issues);
     connect(wf, issues, report, 0);
@@ -951,13 +1191,14 @@ l.route = l.score>=60?'ae':'sdr'; return [l];`,
 
   // 15) INCIDENT_MGMT
   T.INCIDENT_MGMT = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo } = ctx,
-      sig = deriveSignals(scenario);
+    const { scenario, industry, forceTrigger, demo } = ctx, sig = deriveSignals(scenario);
     const arch = "INCIDENT_MGMT";
-    if (forceTrigger) sig.trigger = forceTrigger;
     const hook = addTriggerBySignals(wf, { trigger: "webhook" }, -1180);
     const init = addInit(wf, scenario, industry, "email", !!demo, -940, 300, arch);
     connect(wf, hook, init);
+
+    const adopt = planChain(wf, init, -700, 220);
+
     const sev = addFunction(
       wf,
       "Severity Detect",
@@ -969,7 +1210,7 @@ l.route = l.score>=60?'ae':'sdr'; return [l];`,
     const comms = addHTTP(wf, "Incident Comms", "={{'https://example.com/comms'}}", "={{$json}}", -220, 300);
     const ticket = addHTTP(wf, "Create Incident Ticket", "={{'https://example.com/itsm/ticket'}}", "={{$json}}", 40, 300);
     const pir = addHTTP(wf, "Prep PIR Doc", "={{'https://example.com/pir/create'}}", "={{$json}}", 300, 300);
-    connect(wf, init, sev);
+    connect(wf, adopt, sev);
     connect(wf, sev, ifHigh);
     connect(wf, ifHigh, comms, 0);
     connect(wf, comms, ticket);
@@ -981,18 +1222,19 @@ l.route = l.score>=60?'ae':'sdr'; return [l];`,
 
   // 16) DATA_PIPELINE_ETL
   T.DATA_PIPELINE_ETL = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo } = ctx,
-      sig = deriveSignals(scenario);
+    const { scenario, industry, forceTrigger, demo } = ctx, sig = deriveSignals(scenario);
     const arch = "DATA_PIPELINE_ETL";
-    if (forceTrigger) sig.trigger = forceTrigger;
     const cron = addTriggerBySignals(wf, { trigger: "cron" }, -1180);
     const init = addInit(wf, scenario, industry, "email", !!demo, -940, 300, arch);
     connect(wf, cron, init);
+
+    const adopt = planChain(wf, init, -700, 220);
+
     const extract = addHTTP(wf, "Extract", "={{'https://example.com/extract'}}", "={{$json}}", -700, 300);
     const transform = addFunction(wf, "Transform", "return [$json];", -460, 300);
     const load = addHTTP(wf, "Load (DB/Sheets)", "={{'https://example.com/load'}}", "={{$json}}", -220, 300);
     const status = addHTTP(wf, "Status/Alert", "={{'https://example.com/alert'}}", "={{$json}}", 40, 300);
-    connect(wf, init, extract);
+    connect(wf, adopt, extract);
     connect(wf, extract, transform);
     connect(wf, transform, load);
     connect(wf, load, status);
@@ -1002,17 +1244,18 @@ l.route = l.score>=60?'ae':'sdr'; return [l];`,
 
   // 17) REPORTING_KPI_DASH
   T.REPORTING_KPI_DASH = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo } = ctx,
-      sig = deriveSignals(scenario);
+    const { scenario, industry, forceTrigger, demo } = ctx, sig = deriveSignals(scenario);
     const arch = "REPORTING_KPI_DASH";
-    if (forceTrigger) sig.trigger = forceTrigger;
     const cron = addTriggerBySignals(wf, { trigger: "cron" }, -1180);
     const init = addInit(wf, scenario, industry, "email", !!demo, -940, 300, arch);
     connect(wf, cron, init);
+
+    const adopt = planChain(wf, init, -700, 220);
+
     const metrics = addHTTP(wf, "Calculate Metrics", "={{'https://example.com/metrics'}}", "={{$json}}", -700, 300);
     const dash = addHTTP(wf, "Render Dashboard", "={{'https://example.com/dash/export'}}", "={{$json}}", -460, 300);
     const email = addHTTP(wf, "Send Email/Slack", "={{'https://example.com/notify'}}", "={{$json}}", -220, 300);
-    connect(wf, init, metrics);
+    connect(wf, adopt, metrics);
     connect(wf, metrics, dash);
     connect(wf, dash, email);
     const col = addCollector(wf, 60, 300);
@@ -1021,18 +1264,19 @@ l.route = l.score>=60?'ae':'sdr'; return [l];`,
 
   // 18) ACCESS_GOVERNANCE
   T.ACCESS_GOVERNANCE = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo } = ctx,
-      sig = deriveSignals(scenario);
+    const { scenario, industry, forceTrigger, demo } = ctx, sig = deriveSignals(scenario);
     const arch = "ACCESS_GOVERNANCE";
-    if (forceTrigger) sig.trigger = forceTrigger;
     const hook = addTriggerBySignals(wf, { trigger: "webhook" }, -1180);
     const init = addInit(wf, scenario, industry, "email", !!demo, -940, 300, arch);
     connect(wf, hook, init);
+
+    const adopt = planChain(wf, init, -700, 220);
+
     const ent = addFunction(wf, "Check Entitlements", "return [$json];", -700, 300);
     const appr = addFunction(wf, "Approval", "return [$json];", -460, 300);
     const prov = addHTTP(wf, "Provision/Deprovision", "={{'https://example.com/iam/provision'}}", "={{$json}}", -220, 300);
     const log = addHTTP(wf, "Log Decision", "={{'https://example.com/iam/log'}}", "={{$json}}", 40, 300);
-    connect(wf, init, ent);
+    connect(wf, adopt, ent);
     connect(wf, ent, appr);
     connect(wf, appr, prov);
     connect(wf, prov, log);
@@ -1042,18 +1286,19 @@ l.route = l.score>=60?'ae':'sdr'; return [l];`,
 
   // 19) PRIVACY_DSR
   T.PRIVACY_DSR = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo } = ctx,
-      sig = deriveSignals(scenario);
+    const { scenario, industry, forceTrigger, demo } = ctx, sig = deriveSignals(scenario);
     const arch = "PRIVACY_DSR";
-    if (forceTrigger) sig.trigger = forceTrigger;
     const hook = addTriggerBySignals(wf, { trigger: "webhook" }, -1180);
     const init = addInit(wf, scenario, industry, "email", !!demo, -940, 300, arch);
     connect(wf, hook, init);
+
+    const adopt = planChain(wf, init, -700, 220);
+
     const idv = addHTTP(wf, "Identity Verify (KYC)", "={{'https://example.com/kyc'}}", "={{$json}}", -700, 300);
     const collect = addHTTP(wf, "Collect Data", "={{'https://example.com/privacy/collect'}}", "={{$json}}", -460, 300);
     const respond = addHTTP(wf, "Respond to Subject", "={{'https://example.com/privacy/respond'}}", "={{$json}}", -220, 300);
     const attest = addHTTP(wf, "Attest & Close", "={{'https://example.com/privacy/attest'}}", "={{$json}}", 40, 300);
-    connect(wf, init, idv);
+    connect(wf, adopt, idv);
     connect(wf, idv, collect);
     connect(wf, collect, respond);
     connect(wf, respond, attest);
@@ -1063,13 +1308,14 @@ l.route = l.score>=60?'ae':'sdr'; return [l];`,
 
   // 20) RECRUITING_INTAKE
   T.RECRUITING_INTAKE = (wf, ctx) => {
-    const { scenario, industry, forceTrigger, demo } = ctx,
-      sig = deriveSignals(scenario);
+    const { scenario, industry, forceTrigger, demo } = ctx, sig = deriveSignals(scenario);
     const arch = "RECRUITING_INTAKE";
-    if (forceTrigger) sig.trigger = forceTrigger;
     const hook = addTriggerBySignals(wf, { trigger: "webhook" }, -1180);
     const init = addInit(wf, scenario, industry, "email", !!demo, -940, 300, arch);
     connect(wf, hook, init);
+
+    const adopt = planChain(wf, init, -700, 220);
+
     const parse = addFunction(wf, "Parse Resume", "return [$json];", -700, 300);
     const score = addFunction(wf, "Score Candidate", "return [$json];", -460, 300);
     const stage = addSwitch(
@@ -1085,7 +1331,7 @@ l.route = l.score>=60?'ae':'sdr'; return [l];`,
     );
     const sched = addHTTP(wf, "Schedule Interview", "={{'https://example.com/calendar/book'}}", "={{$json}}", 40, 300);
     const ats = addHTTP(wf, "ATS Update", "={{'https://example.com/ats/update'}}", "={{$json}}", 300, 300);
-    connect(wf, init, parse);
+    connect(wf, adopt, parse);
     connect(wf, parse, score);
     connect(wf, score, stage);
     connect(wf, stage, sched, 0);
@@ -1094,6 +1340,24 @@ l.route = l.score>=60?'ae':'sdr'; return [l];`,
     const col = addCollector(wf, 580, 300);
     connect(wf, ats, col);
   };
+
+  // ---------------- Demo tool mapping ----------------
+  function addDemoToolMapper(wf, x = -1200, y = 80) {
+    return addFunction(
+      wf,
+      "Demo Tool Mapper",
+      `
+const mapDemo = (name)=> name ? String(name).replace(/Salesforce|HubSpot|Mailchimp|Twilio|Slack|NetSuite|ServiceNow|Zendesk|Gmail|Outlook|Stripe|QuickBooks/gi, (m)=> m + ' (Demo)') : name;
+const plan = $json.plan || {};
+if (plan.tools){
+  const t = {...plan.tools};
+  for (const k of Object.keys(t)) t[k] = mapDemo(t[k]);
+  plan.tools = t;
+}
+return [{...$json, plan}];`,
+      x, y
+    );
+  }
 
   // ---------------- builder (two lanes) ----------------
   function buildWorkflowJSON(scenario, industry, opts = {}) {
@@ -1104,14 +1368,21 @@ l.route = l.score>=60?'ae':'sdr'; return [l];`,
 
     // LANE A: PRODUCTION (top). Use real trigger. demo=false
     withYOffset(wf, 0, () => {
-      addLaneHeader(wf, "PRODUCTION LANE", -1320, 40);
+      const hdr = addLaneHeader(wf, "PRODUCTION LANE", -1320, 40);
       tmpl(wf, { scenario, industry, demo: false, forceTrigger: null });
+      // (Optional) Place a placeholder where you’ll select real creds in n8n
+      // No-op node keeps lanes symmetric:
+      const prodNote = addFunction(wf, "Prod Creds Placeholder", "return [$json];", -1320, 120);
+      connect(wf, hdr, prodNote);
     });
 
     // LANE B: DEMO (bottom). Force manual trigger. demo=true. Offset to avoid overlap.
     withYOffset(wf, 900, () => {
-      addLaneHeader(wf, "DEMO LANE (Manual Trigger + Seeded Contacts)", -1320, 40);
+      const hdr = addLaneHeader(wf, "DEMO LANE (Manual Trigger + Seeded Contacts)", -1320, 40);
       tmpl(wf, { scenario, industry, demo: true, forceTrigger: "manual" });
+      // Map tools to (Demo) so you can visually test end-to-end
+      const mapper = addDemoToolMapper(wf, -1320, 120);
+      connect(wf, hdr, mapper);
     });
 
     return wf;

@@ -1,701 +1,1068 @@
-// api/build.js
-// Single-channel, strictly chronological, fully linked A→Z.
-// "Communication (Stage)" sits BEFORE the channel flow.
-// Collectors are used as *data gates* right after steps that produce/need data,
-// so the chain reads: Step → Collector (if needed) → Next Step … → Send → End.
-// No demo lane. No junction nodes.
-// Uses conservative n8n node versions (all nodes have link handles).
-// Env: SHEET_ID, GOOGLE_API_KEY, SHEET_TAB?=Scenarios, OPENAI_API_KEY
+#!/usr/bin/env node
+/**
+ * build.js
+ * Universal workflow file generator (presentation style, per-scenario, per-channel)
+ *
+ * Usage examples:
+ *   node build.js --scenarios=appointments,proposal --channel=whatsapp
+ *   UI can call with process.env.BUILD_SCENARIOS and process.env.BUILD_CHANNEL
+ * Outputs:
+ *   ./dist/<Scenario>-<Channel>.json
+ *
+ * No external deps.
+ */
 
-const HEADERS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
-  "Content-Type": "application/json; charset=utf-8",
-};
+const fs = require('fs');
+const path = require('path');
 
-// ====== Layout (spacious) ======
-const LAYOUT = {
-  stepX: 720,       // horizontal spacing
-  branchY: 820,     // (kept for future multi-branches)
-  channelY: 520,
-  outcomeRowY: 380,
-  prodHeader: { x: -1700, y: 40 },
-  prodStart:  { x: -1560, y: 300 },
-  switchX: -760,
-  errorRowYPad: 760,
-};
+/* --------------------------- ARG / ENV PARSING --------------------------- */
 
-const GUIDE = { showWaypoints: false, numberSteps: true };
-const ZONE  = { FLOW: "FLOW AREA", ERR: "ERROR AREA" };
-
-const DEFAULT_HTTP = {
-  pms_upcoming: "https://example.com/pms/upcoming",
-  ticket_create: "https://example.com/ticket/create",
-  calendar_book: "https://example.com/calendar/book",
-};
-
-// ====== Archetypes & rules ======
-const ARCH_RULES = [
-  { a:'APPOINTMENT_SCHEDULING', rx:/(appointment|appointments|scheduling|no[-_ ]?show|calendar)/i },
-  { a:'CUSTOMER_SUPPORT_INTAKE', rx:/\b(cs|support|helpdesk|ticket|sla|triage|escalation|deflection|kb)\b/i },
-  { a:'FEEDBACK_NPS', rx:/\b(nps|survey|surveys|feedback|csat|ces)\b/i },
-  { a:'KNOWLEDGEBASE_FAQ', rx:/\b(kb|faq|knowledge|self-?service)\b/i },
-  { a:'SALES_OUTREACH', rx:/\b(sales|outreach|cadence|sequence|abm|prospect|cold[-_ ]?email)\b/i },
-  { a:'LEAD_QUAL_INBOUND', rx:/\b(inbound|lead[-_ ]?qual|qualification|routing|router|forms?)\b/i },
-  { a:'CHURN_WINBACK', rx:/\b(churn|win[-_ ]?back|reactivation|retention|loyalty)\b/i },
-  { a:'RENEWALS_CSM', rx:/\b(renewal|qbr|success|csm|upsell|cross-?sell)\b/i },
-  { a:'AR_FOLLOWUP', rx:/\b(a\/?r|accounts?\s*receivable|invoice|collections?|dso|reconciliation)\b/i },
-  { a:'AP_AUTOMATION', rx:/\b(a\/?p|accounts?\s*payable|invoices?|3[-\s]?way|three[-\s]?way|matching|approvals?)\b/i },
-  { a:'INVENTORY_MONITOR', rx:/\b(inventory|stock|sku|threshold|warehouse|3pl|wms|backorder)\b/i },
-  { a:'REPLENISHMENT_PO', rx:/\b(replenishment|purchase[-_ ]?order|po|procure|procurement|vendors?|suppliers?)\b/i },
-  { a:'FIELD_SERVICE_DISPATCH', rx:/\b(dispatch|work[-_ ]?orders?|technicians?|field|geo|eta|route|yard)\b/i },
-  { a:'COMPLIANCE_AUDIT', rx:/\b(compliance|audit|audits|policy|governance|sox|iso|gdpr|hipaa|attestation)\b/i },
-  { a:'INCIDENT_MGMT', rx:/\b(incident|sev[: ]?(high|p[12])|major|rca|postmortem|downtime|uptime|slo)\b/i },
-  { a:'DATA_PIPELINE_ETL', rx:/\b(etl|pipeline|ingest|transform|load|csv|s3|gcs|orchestration)\b/i },
-  { a:'REPORTING_KPI_DASH', rx:/\b(dashboard|dashboards|kpi|scorecard|report|reporting)\b/i },
-  { a:'ACCESS_GOVERNANCE', rx:/\b(access|rbac|sso|entitlements|seats|identity|pii|dlp)\b/i },
-  { a:'PRIVACY_DSR', rx:/\b(dsr|data\s*subject|privacy\s*request|gdpr|ccpa)\b/i },
-  { a:'RECRUITING_INTAKE', rx:/\b(recruit(ing)?|ats|cv|resume|candidate|interviews?)\b/i },
-];
-
-const TRIGGER_PREF = {
-  APPOINTMENT_SCHEDULING: 'cron', CUSTOMER_SUPPORT_INTAKE: 'webhook', FEEDBACK_NPS: 'cron',
-  KNOWLEDGEBASE_FAQ: 'webhook', SALES_OUTREACH: 'manual', LEAD_QUAL_INBOUND: 'webhook',
-  CHURN_WINBACK: 'cron', RENEWALS_CSM: 'cron', AR_FOLLOWUP: 'cron', AP_AUTOMATION: 'webhook',
-  INVENTORY_MONITOR: 'cron', REPLENISHMENT_PO: 'webhook', FIELD_SERVICE_DISPATCH: 'webhook',
-  COMPLIANCE_AUDIT: 'cron', INCIDENT_MGMT: 'webhook', DATA_PIPELINE_ETL: 'cron',
-  REPORTING_KPI_DASH: 'cron', ACCESS_GOVERNANCE: 'webhook', PRIVACY_DSR: 'webhook',
-  RECRUITING_INTAKE: 'webhook',
-};
-
-const CHANNEL_NORMALIZE = [
-  { k: 'whatsapp', rx: /whatsapp/i },
-  { k: 'sms', rx: /(sms|text)/i },
-  { k: 'call', rx: /(voice|call|phone)/i },
-  { k: 'email', rx: /email/i },
-];
-
-const ALLOWED_CHANNELS = ['email','sms','whatsapp','call'];
-function normalizeChannel(v){
-  if(!v) return null;
-  const s = String(v).toLowerCase().trim();
-  return ALLOWED_CHANNELS.includes(s) ? s : null;
-}
-
-// ---------- utils ----------
-const uid = (p) => `${p}_${Math.random().toString(36).slice(2, 10)}`;
-const pos = (x, y) => [x, y];
-function toObj(header, row) { return Object.fromEntries(header.map((h,i)=>[h,(row[i]??"").toString().trim()])); }
-const listify = (v) => Array.isArray(v) ? v.map(x=>String(x).trim()).filter(Boolean) : String(v||'').split(/[;,/|\n]+/).map(x=>x.trim()).filter(Boolean);
-
-function chooseArchetype(row){
-  const hay=[row["scenario_id"],row["name"],row["tags"],row["triggers"],row["how_it_works"],row["tool_stack_dev"]].map(x=>String(x||'')).join(' ');
-  for(const r of ARCH_RULES) if(r.rx.test(hay)) return r.a;
-  return 'SALES_OUTREACH';
-}
-
-// ---------- Collector policy helpers ----------
-function requiresCollector(kind, name=''){
-  const k = String(kind||'').toLowerCase();
-  const n = String(name||'').toLowerCase();
-  if (['lookup','http','score','wait'].includes(k)) return true;   // fetch/compute -> data gate
-  if (k==='book' || k==='ticket') return true;                     // returns confirmation payload
-  if (['store','update','route','notify','compose'].includes(k)) return false;
-  return false; // unknown kinds keep graph light
-}
-function collectorPosX(x){ return x + Math.floor(LAYOUT.stepX * 0.35); }
-
-// ---------- sheet + llm ----------
-async function fetchSheetRowByScenarioId(scenarioId){
-  const SHEET_ID=process.env.SHEET_ID; const GOOGLE_API_KEY=process.env.GOOGLE_API_KEY; const TAB=process.env.SHEET_TAB||"Scenarios";
-  if(!SHEET_ID||!GOOGLE_API_KEY) throw new Error("Missing SHEET_ID or GOOGLE_API_KEY");
-  const url=`https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(TAB)}?key=${GOOGLE_API_KEY}`;
-  const r=await fetch(url,{cache:"no-store"}); if(!r.ok) throw new Error(`Sheets API error: ${r.status} ${r.statusText}`);
-  const data=await r.json(); const rows=data.values||[]; if(!rows.length) throw new Error("Sheet has no rows");
-  const header=rows[0].map(h=>h.trim()); const obj=rows.slice(1).map(rw=>toObj(header,rw));
-  return obj.find(x=>(x["scenario_id"]||"").toString().trim().toLowerCase()===scenarioId.toLowerCase());
-}
-
-async function openaiJSON(prompt, schemaHint){
-  const key=process.env.OPENAI_API_KEY; if(!key) return null;
-  try{
-    const r=await fetch("https://api.openai.com/v1/chat/completions",{
-      method:"POST",
-      headers:{ "Authorization":`Bearer ${key}`,"Content-Type":"application/json"},
-      body:JSON.stringify({
-        model:"gpt-4o-mini",
-        temperature:0.35,
-        response_format:{type:"json_object"},
-        messages:[
-          {role:"system",content:"You are an expert workflow designer for n8n. Enumerate outcomes exhaustively. Always return valid JSON."},
-          {role:"user",content:prompt+(schemaHint?("\n\nSchema:\n"+schemaHint):"")}
-        ]
-      })
-    });
-    const j=await r.json(); const txt=j.choices?.[0]?.message?.content?.trim(); if(!txt) return null;
-    try{ return JSON.parse(txt); }catch{ return null; }
-  }catch{ return null; }
-}
-
-function makeDesignerPrompt(row, forcedChannel){
-  const ctx=[
-    `SCENARIO_ID: ${row.scenario_id||''}`,
-    `AGENT_NAME: ${row.agent_name||''}`,
-    `INDUSTRY (name): ${row.name||''}`,
-    `TRIGGERS: ${row.triggers||''}`,
-    `BEST_REPLY_SHAPES: ${row.best_reply_shapes||''}`,
-    `HOW_IT_WORKS: ${row.how_it_works||''}`,
-    `ROI_HYPOTHESIS: ${row.roi_hypothesis||''}`,
-    `RISK_NOTES: ${row.risk_notes||''}`,
-    `TAGS: ${row["tags (;)"]||row.tags||''}`,
-    `FORCED_CHANNEL: ${forcedChannel||'(none)'}`,
-  ].join("\n");
-  return `
-Design a bullet-proof, strictly chronological n8n workflow. We will auto-insert a
-"Communication (Stage)" node right before the per-channel flow. Do NOT output any
-junction/merge/placeholder nodes—only steps & decisions.
-
-If FORCED_CHANNEL is provided, assume ONLY that channel is used for all comms.
-Tailor steps and content (e.g., call vs sms).
-
-Rules:
-- "trigger": one of ["cron","webhook","imap","manual"].
-- "channels": ordered subset of ["email","sms","whatsapp","call"]. If FORCED_CHANNEL is set, use [FORCED_CHANNEL].
-- "branches": ≤6. Each branch is a high-level path.
-- Step kinds: "compose" | "http" | "update" | "route" | "wait" | "score" | "lookup" | "book" | "ticket" | "notify" | "store" | "decision".
-- A "decision" step MUST include exhaustive "outcomes". Each outcome: { "value": string, "steps": Step[] }.
-- Preserve strict left-to-right chronological order.
-
-Return JSON:
-{
-  "archetype": "...",
-  "trigger": "cron|webhook|imap|manual",
-  "channels": ["email","sms","whatsapp","call"],
-  "branches": [
-    { "name":"...", "condition":"...", "steps":[
-        { "name":"...", "kind":"compose|http|update|route|wait|score|lookup|book|ticket|notify|store" },
-        { "name":"...", "kind":"decision", "outcomes":[
-          { "value":"...", "steps":[{ "name":"...","kind":"..." }, ...] }, ...
-        ] }
-    ] }
-  ],
-  "errors": [{ "name":"...", "mitigation":"..." }],
-  "systems": ["pms","crm","calendar","kb","twilio","email"]
-}
-
-Context:
-${ctx}`;
-}
-
-function makeMessagingPrompt(row, archetype, channels){
-  const ctx=[
-    `SCENARIO_ID: ${row.scenario_id||''}`,
-    `AGENT_NAME: ${row.agent_name||''}`,
-    `INDUSTRY (name): ${row.name||''}`,
-    `TRIGGERS: ${row.triggers||''}`,
-    `HOW_IT_WORKS: ${row.how_it_works||''}`,
-    `ROI_HYPOTHESIS: ${row.roi_hypothesis||''}`,
-    `RISK_NOTES: ${row.risk_notes||''}`,
-  ].join("\n");
-  return `
-Write concise outreach content ONLY for ${JSON.stringify(channels)} for archetype ${archetype}.
-No IVR "press 1". 3–6 short lines each.
-
-Return JSON (omit unused channels): { "email": { "subject":"...", "body":"..." }, "sms": {"body":"..."}, "whatsapp":{"body":"..."}, "call":{"script":"..."} }
-
-Context:
-${ctx}`;
-}
-
-// ---------- workflow primitives ----------
-function baseWorkflow(name){ return { name, nodes:[], connections:{}, active:false, settings:{}, staticData:{}, __yOffset:0 }; }
-
-function uniqueName(wf, base){
-  const existing = new Set((wf.nodes||[]).map(n=>String(n.name||'').toLowerCase()));
-  if(!base || typeof base!=='string') base = 'Node';
-  let name = base, i = 1;
-  while(existing.has(name.toLowerCase())){ i += 1; name = `${base} #${i}`; }
-  return name;
-}
-
-function nudgeIfOverlapping(wf, x, y){
-  const EPS = 64, STEP = 72;
-  let yy = y;
-  for(let i=0;i<50;i++){
-    const hit = (wf.nodes||[]).some(n=>{
-      if(!Array.isArray(n.position)) return false;
-      const [nx, ny] = n.position;
-      return Math.abs(nx - x) < EPS && Math.abs(ny - yy) < EPS;
-    });
-    if(!hit) return yy;
-    yy += STEP;
+function parseArgs() {
+  const args = process.argv.slice(2);
+  const out = {};
+  for (const a of args) {
+    const [k, v] = a.split('=');
+    const key = k.replace(/^--/, '').trim();
+    out[key] = v ?? true;
   }
-  return yy;
+  return out;
 }
 
-function addNode(wf,node){
-  node.name = uniqueName(wf, node.name);
-  if(Array.isArray(node.position)){
-    const x = node.position[0];
-    const y = node.position[1] + (wf.__yOffset||0);
-    node.position=[x, nudgeIfOverlapping(wf, x, y)];
-  }
-  wf.nodes.push(node);
-  return node.name;
+const argv = parseArgs();
+const SCENARIOS =
+  (argv.scenarios || process.env.BUILD_SCENARIOS || 'appointments')
+    .split(',')
+    .map(s => s.trim().toLowerCase())
+    .filter(Boolean);
+
+const CHANNEL =
+  (argv.channel || process.env.BUILD_CHANNEL || 'web').trim().toLowerCase();
+
+const VALID_CHANNELS = new Set(['whatsapp', 'voice', 'web']);
+
+if (!VALID_CHANNELS.has(CHANNEL)) {
+  console.error(
+    `[build] Invalid --channel="${CHANNEL}". Use one of: whatsapp | voice | web`
+  );
+  process.exit(1);
 }
 
-function connect(wf,from,to,outputIndex=0){
-  wf.connections[from]??={};
-  wf.connections[from].main??=[];
-  for(let i=wf.connections[from].main.length;i<=outputIndex;i++) wf.connections[from].main[i]=[];
-  wf.connections[from].main[outputIndex].push({node:to,type:"main",index:0});
+/* --------------------------- UTIL: N8N HELPERS --------------------------- */
+
+let autoId = 0;
+function nid() {
+  // quick unique-ish id
+  return `n${Date.now().toString(36)}_${(autoId++).toString(36)}`;
 }
 
-function withYOffset(wf,yOffset,fn){ const prev=wf.__yOffset||0; wf.__yOffset=yOffset; try{ fn(); } finally{ wf.__yOffset=prev; } }
-
-function addHeader(wf,label,x,y){
-  return addNode(wf,{ id:uid("label"), name:`=== ${label} ===`, type:"n8n-nodes-base.function", typeVersion:1, position:pos(x,y), parameters:{ functionCode:"return [$json];" } });
+function sticky(content, { x, y, color = 7, w = 900, h = 200 }) {
+  return {
+    id: nid(),
+    name: 'Sticky Note',
+    type: 'n8n-nodes-base.stickyNote',
+    position: [x, y],
+    parameters: { color, width: w, height: h, content },
+    typeVersion: 1,
+  };
 }
 
-function addManual(wf,x,y,label="Manual Trigger"){ return addNode(wf,{ id:uid("manual"), name:label, type:"n8n-nodes-base.manualTrigger", typeVersion:1, position:pos(x,y), parameters:{} }); }
-function addCron(wf,label,x,y,compat){ if(compat==="full"){ return addNode(wf,{ id:uid("cron"), name:label, type:"n8n-nodes-base.cron", typeVersion:1, position:pos(x,y), parameters:{ triggerTimes:{ item:[{ mode:"everyX", everyX:{ hours:0, minutes:15 } }] } } }); } return addNode(wf,{ id:uid("cronph"), name:`${label} (Placeholder)`, type:"n8n-nodes-base.function", typeVersion:1, position:pos(x,y), parameters:{ functionCode:"return [$json];" } }); }
-function addWebhook(wf,label,x,y,compat){ if(compat==="full"){ return addNode(wf,{ id:uid("webhook"), name:label, type:"n8n-nodes-base.webhook", typeVersion:1, position:pos(x,y), parameters:{ path:uid("hook"), methods:["POST"], responseMode:"onReceived" } }); } return addNode(wf,{ id:uid("webph"), name:`${label} (Placeholder)`, type:"n8n-nodes-base.function", typeVersion:1, position:pos(x,y), parameters:{ functionCode:"return [$json];" } }); }
-function addHTTP(wf,name,urlExpr,bodyExpr,x,y,method="POST"){ return addNode(wf,{ id:uid("http"), name, type:"n8n-nodes-base.httpRequest", typeVersion:3, position:pos(x,y), parameters:{ url:urlExpr, method, jsonParameters:true, sendBody:true, bodyParametersJson:bodyExpr } }); }
-function addFunction(wf,name,code,x,y){ return addNode(wf,{ id:uid("func"), name, type:"n8n-nodes-base.function", typeVersion:1, position:pos(x,y), parameters:{ functionCode:code } }); }
-function addIf(wf,name,left,op,right,x,y){ return addNode(wf,{ id:uid("if"), name, type:"n8n-nodes-base.if", typeVersion:2, position:pos(x,y), parameters:{ conditions:{ number:[], string:[{ value1:left, operation:op, value2:right }] } } }); }
-function addSwitch(wf,name,valueExpr,rules,x,y){ return addNode(wf,{ id:uid("switch"), name, type:"n8n-nodes-base.switch", typeVersion:2, position:pos(x,y), parameters:{ value1:valueExpr, rules } }); }
-function addSplit(wf,x,y,size=20){ return addNode(wf,{ id:uid("split"), name:"Split In Batches", type:"n8n-nodes-base.splitInBatches", typeVersion:1, position:pos(x,y), parameters:{ batchSize:size } }); }
-function addCollector(wf,x,y){ return addFunction(wf,"Collector (Inspect)",`const now=new Date().toISOString(); const arr=Array.isArray(items)?items:[{json:$json}]; return arr.map((it,i)=>({json:{...it.json,__collected_at:now, index:i}}));`,x,y); }
-
-// sender nodes
-function makeSenderNode(wf, channel, x, y, compat){
-  const friendly = channel.toUpperCase();
-  if(compat==='full'){
-    if(channel==='email'){
-      return addNode(wf,{ id:uid("email"), name:"[Send  Email]", type:"n8n-nodes-base.emailSend", typeVersion:3, position:pos(x,y),
-        parameters:{ to:"={{$json.emailTo || 'user@example.com'}}", subject:"={{$json.msg?.email?.subject || $json.scenario?.agent_name || 'Update'}}", text:"={{$json.message || $json.msg?.email?.body || 'Hello!'}}" }, credentials:{} });
-    }
-    if(channel==='sms'){
-      return addNode(wf,{ id:uid("sms"), name:"[Send  SMS] (Twilio)", type:"n8n-nodes-base.twilio", typeVersion:3, position:pos(x,y),
-        parameters:{ resource:"message", operation:"create", from:"={{$json.smsFrom || '+10000000000'}}", to:"={{$json.to || '+10000000001'}}", message:"={{$json.message || $json.msg?.sms?.body || 'Hello!'}}" }, credentials:{} });
-    }
-    if(channel==='whatsapp'){
-      return addNode(wf,{ id:uid("wa"), name:"[Send  WhatsApp] (Twilio)", type:"n8n-nodes-base.twilio", typeVersion:3, position:pos(x,y),
-        parameters:{ resource:"message", operation:"create", from:"={{'whatsapp:' + ($json.waFrom || '+10000000002')}}", to:"={{'whatsapp:' + ($json.to || '+10000000003')}}", message:"={{$json.message || $json.msg?.whatsapp?.body || 'Hello!'}}" }, credentials:{} });
-    }
-    if(channel==='call'){
-      return addHTTP(wf, "[Place Call]", "={{$json.callWebhook || 'https://example.com/call'}}",
-        "={{ { to:$json.to, from:$json.callFrom, text: ($json.message || $json.msg?.call?.script || 'Hello!') } }}", x, y, "POST");
-    }
-  }
-  return addFunction(wf, `Demo Send ${friendly}`, "return [$json];", x, y);
+function webhookNode({ name, pathSuffix, x, y, respond = true }) {
+  return {
+    id: nid(),
+    name,
+    type: 'n8n-nodes-base.webhook',
+    position: [x, y],
+    parameters: {
+      path: pathSuffix,
+      httpMethod: 'POST',
+      responseMode: respond ? 'responseNode' : 'onReceived',
+      options: {},
+    },
+    typeVersion: 2,
+  };
 }
 
-// ---------- sanitization ----------
-function sanitizeWorkflow(wf){
-  const REQUIRED_TYPE="n8n-nodes-base.function";
-  const byName=new Map();
+function setNode({ name, x, y, assignments = [] }) {
+  return {
+    id: nid(),
+    name,
+    type: 'n8n-nodes-base.set',
+    position: [x, y],
+    parameters: {
+      options: {},
+      assignments: { assignments },
+    },
+    typeVersion: 3.4,
+  };
+}
 
-  wf.nodes=(wf.nodes||[]).map((n,idx)=>{
-    if(!n.name||typeof n.name!=='string') n.name=`Node ${idx+1}`;
-    if(!n.type||typeof n.type!=='string'||!n.type.trim()){ n.type=REQUIRED_TYPE; n.typeVersion=1; n.parameters={ functionCode:"return [$json];" }; }
-    if(typeof n.typeVersion!=='number') n.typeVersion=1;
-    if(!Array.isArray(n.position)||n.position.length!==2){ n.position=[-1000, 300+(idx*40)]; }
-    if(!n.parameters||typeof n.parameters!=='object') n.parameters={};
-    if(n.type==="n8n-nodes-base.function" && !n.parameters.functionCode){
-      n.parameters.functionCode = "return [$json];";
-    }
-    byName.set(n.name,n); return n;
+function codeNode({ name, x, y, js }) {
+  return {
+    id: nid(),
+    name,
+    type: 'n8n-nodes-base.code',
+    position: [x, y],
+    parameters: { jsCode: js, mode: 'runOnceForAllItems' },
+    typeVersion: 2,
+  };
+}
+
+function switchNode({ name, x, y, rules }) {
+  return {
+    id: nid(),
+    name,
+    type: 'n8n-nodes-base.switch',
+    position: [x, y],
+    parameters: {
+      rules: { values: rules },
+      options: {},
+    },
+    typeVersion: 3.2,
+  };
+}
+
+function ifNode({ name, x, y, conditions }) {
+  return {
+    id: nid(),
+    name,
+    type: 'n8n-nodes-base.if',
+    position: [x, y],
+    parameters: {
+      options: {},
+      conditions,
+      looseTypeValidation: false,
+    },
+    typeVersion: 2.2,
+  };
+}
+
+function respondNode({ name, x, y, bodyExpr }) {
+  return {
+    id: nid(),
+    name,
+    type: 'n8n-nodes-base.respondToWebhook',
+    position: [x, y],
+    parameters: {
+      options: {},
+      respondWith: 'json',
+      responseBody: bodyExpr,
+    },
+    typeVersion: 1.1,
+  };
+}
+
+function gcalNode({ name, x, y, params }) {
+  return {
+    id: nid(),
+    name,
+    type: 'n8n-nodes-base.googleCalendar',
+    position: [x, y],
+    parameters: params,
+    typeVersion: 1.3,
+    credentials: {},
+  };
+}
+
+function airtableNode({ name, x, y, params }) {
+  return {
+    id: nid(),
+    name,
+    type: 'n8n-nodes-base.airtable',
+    position: [x, y],
+    parameters: params,
+    typeVersion: 2.1,
+    credentials: {},
+  };
+}
+
+function whatsappSendNode({ name, x, y }) {
+  return {
+    id: nid(),
+    name,
+    type: 'n8n-nodes-base.whatsApp',
+    position: [x, y],
+    parameters: {
+      operation: 'send',
+      messageType: 'text',
+      recipientPhoneNumber: "={{ $json.payload.customer_number || 'REPLACE_ME' }}",
+      phoneNumberId: "={{ $json.whatsapp_phone_number_id || 'REPLACE_ME' }}",
+      text:
+        "={{ $json.message + ($json.alternatives ? '\\n' + ($json.alternatives.map(a => '- ' + a.start).join('\\n')) : '') }}",
+    },
+    typeVersion: 1,
+    credentials: { whatsAppApi: { id: 'REPLACE_ME', name: 'WhatsApp Creds' } },
+  };
+}
+
+/* --------------------------- APPOINTMENTS SCENARIO --------------------------- */
+
+function buildAppointmentsWorkflow(selectedChannel) {
+  // NODES
+  const nodes = [];
+
+  // Overview sticky
+  nodes.push(
+    sticky(
+      `## Universal Channel Appointments (Collectors First)
+**Channel:** ${selectedChannel}
+**Intents:** book | update | cancel
+
+**Collectors:** Contact → Time | Reschedule | Cancel
+
+**Terminal Actions:** GCal create/update/delete + Airtable log + Channel-specific response`,
+      { x: -1060, y: -160, color: 7, w: 1400, h: 220 }
+    )
+  );
+
+  // Trigger
+  const nTrigger = webhookNode({
+    name: 'Universal Trigger (UI/Server)',
+    pathSuffix: 'universal-channel',
+    x: -820,
+    y: 140,
+    respond: true,
+  });
+  nodes.push(nTrigger);
+
+  // Normalize
+  const nNormalize = setNode({
+    name: 'Normalize & Defaults',
+    x: -580,
+    y: 140,
+    assignments: [
+      { id: 'a1', name: 'selected_channel', type: 'string', value: `=${JSON.stringify(selectedChannel)}` },
+      { id: 'a2', name: 'intent', type: 'string', value: "={{ ($json.intent || '').toLowerCase() }}" },
+      { id: 'a3', name: 'payload', type: 'object', value: '={{ $json.payload || {} }}' },
+      { id: 'a4', name: 'timezone', type: 'string', value: '=America/Chicago' },
+      { id: 'a5', name: 'business_hours', type: 'string', value: "={{ 'Mon-Fri 08:00-17:00' }}" },
+    ],
+  });
+  nodes.push(nNormalize);
+
+  // Intent switch
+  const nIntent = switchNode({
+    name: 'Switch: Intent (book/update/cancel)',
+    x: -300,
+    y: 140,
+    rules: [
+      {
+        outputKey: 'book',
+        conditions: {
+          combinator: 'and',
+          options: { version: 2, typeValidation: 'strict' },
+          conditions: [
+            {
+              id: 'i1',
+              operator: { type: 'string', operation: 'equals' },
+              leftValue: '={{ $json.intent }}',
+              rightValue: 'book',
+            },
+          ],
+        },
+      },
+      {
+        outputKey: 'update',
+        conditions: {
+          combinator: 'and',
+          options: { version: 2, typeValidation: 'strict' },
+          conditions: [
+            {
+              id: 'i2',
+              operator: { type: 'string', operation: 'equals' },
+              leftValue: '={{ $json.intent }}',
+              rightValue: 'update',
+            },
+          ],
+        },
+      },
+      {
+        outputKey: 'cancel',
+        conditions: {
+          combinator: 'and',
+          options: { version: 2, typeValidation: 'strict' },
+          conditions: [
+            {
+              id: 'i3',
+              operator: { type: 'string', operation: 'equals' },
+              leftValue: '={{ $json.intent }}',
+              rightValue: 'cancel',
+            },
+          ],
+        },
+      },
+    ],
+  });
+  nodes.push(nIntent);
+
+  // Collectors
+  const nContact = codeNode({
+    name: 'Collector: Contact Info',
+    x: 60,
+    y: -40,
+    js: `
+const p = $json.payload || {};
+const missing = [];
+if (!p.name) missing.push('name');
+if (!p.email || !(p.email + '').includes('@')) missing.push('email');
+return { json: { ...$json, collectDone: missing.length===0, missing, prompt: missing.length ? \`I need \${missing.join(' & ')}.\` : '' } };
+`.trim(),
+  });
+  nodes.push(nContact);
+
+  const nTime = codeNode({
+    name: 'Collector: Time Window',
+    x: 60,
+    y: 120,
+    js: `
+const p = $json.payload || {};
+const missing = [];
+if (!p.starttime) missing.push('starttime');
+if (!p.endtime) missing.push('endtime');
+return { json: { ...$json, collectDone: missing.length===0, missing, prompt: missing.length ? \`I need \${missing.join(' & ')} (ISO).\` : '' } };
+`.trim(),
+  });
+  nodes.push(nTime);
+
+  const nReschedule = codeNode({
+    name: 'Collector: Reschedule Window',
+    x: 60,
+    y: 300,
+    js: `
+const p = $json.payload || {};
+const missing = [];
+if (!p.starttime) missing.push('starttime');
+if (!p.rescheduled_starttime) missing.push('rescheduled_starttime');
+if (!p.rescheduled_endtime) missing.push('rescheduled_endtime');
+return { json: { ...$json, collectDone: missing.length===0, missing, prompt: missing.length ? \`I need \${missing.join(' & ')} (ISO).\` : '' } };
+`.trim(),
+  });
+  nodes.push(nReschedule);
+
+  const nCancel = codeNode({
+    name: 'Collector: Cancel Info',
+    x: 60,
+    y: 480,
+    js: `
+const p = $json.payload || {};
+const missing = [];
+if (!p.starttime) missing.push('starttime');
+return { json: { ...$json, collectDone: missing.length===0, missing, prompt: missing.length ? \`I need \${missing.join(' & ')} (ISO).\` : '' } };
+`.trim(),
+  });
+  nodes.push(nCancel);
+
+  // Sticky: Book
+  nodes.push(
+    sticky(
+      '## Book Flow\n1) Contact → Time\n2) GCal freebusy\n3) If free → Create + Airtable + Respond\n4) Else → Alternatives + Respond',
+      { x: -40, y: -200, color: 4, w: 520, h: 160 }
+    )
+  );
+
+  // GCal freebusy
+  const nFreebusy = gcalNode({
+    name: 'Check Availability (GCal)',
+    x: 360,
+    y: 120,
+    params: {
+      resource: 'calendar',
+      timeMin: '={{ $json.payload.starttime }}',
+      timeMax: '={{ $json.payload.endtime }}',
+      operation: 'getAvailability',
+      options: {},
+      calendar: {
+        '__rl': true,
+        mode: 'list',
+        value: 'your-calendar@example.com',
+        cachedResultName: 'your-calendar@example.com',
+      },
+    },
+  });
+  nodes.push(nFreebusy);
+
+  const nAvailBool = codeNode({
+    name: 'Freebusy → Available?',
+    x: 580,
+    y: 120,
+    js: `
+const busy = ($json.busy || []).length;
+return { json: { ...$json, available: busy === 0 } };
+`.trim(),
+  });
+  nodes.push(nAvailBool);
+
+  const nIfAvail = ifNode({
+    name: 'If available == true',
+    x: 800,
+    y: 120,
+    conditions: {
+      combinator: 'and',
+      options: { version: 2 },
+      conditions: [
+        {
+          id: 'av',
+          operator: { type: 'boolean', operation: 'true', singleValue: true },
+          leftValue: '={{ $json.available }}',
+        },
+      ],
+    },
+  });
+  nodes.push(nIfAvail);
+
+  const nCreate = gcalNode({
+    name: 'Create Event (GCal)',
+    x: 1020,
+    y: 60,
+    params: {
+      operation: 'create',
+      start: '={{ $json.payload.starttime }}',
+      end: '={{ $json.payload.endtime }}',
+      calendar: { '__rl': true, mode: 'list', value: 'your-calendar@example.com' },
+      additionalFields: {
+        summary: "={{ $json.payload.Title || 'Service Appointment' }}",
+        description: '={{ $json.payload.notes || "" }}',
+        allday: 'no',
+        attendees: ['={{ $json.payload.email }}'],
+      },
+    },
+  });
+  nodes.push(nCreate);
+
+  const nAirLog = airtableNode({
+    name: 'Airtable: Log Booking',
+    x: 1240,
+    y: 60,
+    params: {
+      base: { '__rl': true, mode: 'list', value: 'appXXXXXXXXXXXXXX' },
+      table: { '__rl': true, mode: 'list', value: 'tblXXXXXXXXXXXXXX' },
+      operation: 'create',
+      columns: {
+        value: {
+          Name: '={{ $json.payload.name }}',
+          Email: '={{ $json.payload.email }}',
+          'Phone Number': '={{ $json.payload.customer_number || "" }}',
+          starttime: '={{ $json.payload.starttime }}',
+          endtime: '={{ $json.payload.endtime }}',
+          'Booking Status': 'confirmed',
+          meetdescription: '={{ $json.payload.notes || "" }}',
+          eventId: '={{ $json.id }}',
+        },
+        mappingMode: 'defineBelow',
+        matchingColumns: ['eventId'],
+      },
+    },
+  });
+  nodes.push(nAirLog);
+
+  const nBuildSuccess = setNode({
+    name: 'Build Success Payload',
+    x: 1460,
+    y: 60,
+    assignments: [
+      { id: 's1', name: 'status', type: 'string', value: '=ok' },
+      {
+        id: 's2',
+        name: 'message',
+        type: 'string',
+        value: '=Appointment confirmed.',
+      },
+    ],
+  });
+  nodes.push(nBuildSuccess);
+
+  // Alternatives branch
+  const nAlt = codeNode({
+    name: 'Build Alternatives (next 5 slots)',
+    x: 1020,
+    y: 180,
+    js: `
+const start = new Date($json.payload.starttime);
+const slots = [];
+for (let i=1;i<=5;i++){
+  const d=new Date(start);
+  d.setMinutes(d.getMinutes()+30*i);
+  const e=new Date(d);
+  e.setMinutes(e.getMinutes()+30);
+  slots.push({start:d.toISOString(), end:e.toISOString()});
+}
+return { json: { ...$json, alternatives: slots } };
+`.trim(),
+  });
+  nodes.push(nAlt);
+
+  const nBuildAltPayload = setNode({
+    name: 'Build Alternatives Payload',
+    x: 1240,
+    y: 180,
+    assignments: [
+      { id: 'a10', name: 'status', type: 'string', value: '=not_available' },
+      {
+        id: 'a11',
+        name: 'message',
+        type: 'string',
+        value: '=The requested time is not available. Here are options:',
+      },
+      {
+        id: 'a12',
+        name: 'alternatives',
+        type: 'array',
+        value: '={{ $json.alternatives || [] }}',
+      },
+    ],
+  });
+  nodes.push(nBuildAltPayload);
+
+  // Sticky: Update
+  nodes.push(
+    sticky(
+      '## Update Flow\n1) Contact → Reschedule\n2) Find Airtable by phone → Update GCal → Update Airtable\n3) Respond (channel)',
+      { x: -40, y: 240, color: 5, w: 520, h: 140 }
+    )
+  );
+
+  const nFindByPhone = airtableNode({
+    name: 'Airtable: Find Event by Phone',
+    x: 360,
+    y: 300,
+    params: {
+      base: { '__rl': true, mode: 'list', value: 'appXXXXXXXXXXXXXX' },
+      table: { '__rl': true, mode: 'list', value: 'tblXXXXXXXXXXXXXX' },
+      operation: 'search',
+      filterByFormula: '={Phone Number} = ("{{ $json.payload.customer_number }}")',
+      options: { fields: ['eventId', 'Email', 'Name', 'starttime'] },
+    },
+  });
+  nodes.push(nFindByPhone);
+
+  const nSetEventId = setNode({
+    name: 'Set eventId from Airtable',
+    x: 580,
+    y: 300,
+    assignments: [
+      { id: 'e1', name: 'eventId', type: 'string', value: '={{ $json.eventId }}' },
+    ],
+  });
+  nodes.push(nSetEventId);
+
+  const nUpdate = gcalNode({
+    name: 'Update Event (GCal)',
+    x: 800,
+    y: 300,
+    params: {
+      operation: 'update',
+      eventId: '={{ $json.eventId }}',
+      calendar: { '__rl': true, mode: 'list', value: 'your-calendar@example.com' },
+      updateFields: {
+        start: '={{ $json.payload.rescheduled_starttime }}',
+        end: '={{ $json.payload.rescheduled_endtime }}',
+        allday: 'no',
+      },
+    },
+  });
+  nodes.push(nUpdate);
+
+  const nAirUpdate = airtableNode({
+    name: 'Airtable: Update Row',
+    x: 1020,
+    y: 300,
+    params: {
+      base: { '__rl': true, mode: 'list', value: 'appXXXXXXXXXXXXXX' },
+      table: { '__rl': true, mode: 'list', value: 'tblXXXXXXXXXXXXXX' },
+      operation: 'update',
+      columns: {
+        value: {
+          eventId: '={{ $json.eventId }}',
+          starttime:
+            '={{ $json.start?.dateTime || $json.payload.rescheduled_starttime }}',
+          endtime:
+            '={{ $json.end?.dateTime || $json.payload.rescheduled_endtime }}',
+          'Booking Status': 'Updated/Rescheduled',
+        },
+        mappingMode: 'defineBelow',
+        matchingColumns: ['eventId'],
+      },
+    },
+  });
+  nodes.push(nAirUpdate);
+
+  const nBuildSuccess2 = setNode({
+    name: 'Build Success Payload (Update)',
+    x: 1240,
+    y: 300,
+    assignments: [
+      { id: 'su1', name: 'status', type: 'string', value: '=ok' },
+      {
+        id: 'su2',
+        name: 'message',
+        type: 'string',
+        value: '=Appointment rescheduled.',
+      },
+    ],
+  });
+  nodes.push(nBuildSuccess2);
+
+  // Sticky: Cancel
+  nodes.push(
+    sticky(
+      '## Cancel Flow\n1) Contact → Cancel info\n2) Find Airtable → Delete GCal → Update Airtable\n3) Respond (channel)',
+      { x: -40, y: 420, color: 3, w: 520, h: 140 }
+    )
+  );
+
+  const nFindCancel = airtableNode({
+    name: 'Airtable: Find for Cancel',
+    x: 360,
+    y: 480,
+    params: {
+      base: { '__rl': true, mode: 'list', value: 'appXXXXXXXXXXXXXX' },
+      table: { '__rl': true, mode: 'list', value: 'tblXXXXXXXXXXXXXX' },
+      operation: 'search',
+      filterByFormula: '={Phone Number} = ("{{ $json.payload.customer_number }}")',
+      options: { fields: ['eventId', 'Email', 'Name', 'starttime'] },
+    },
+  });
+  nodes.push(nFindCancel);
+
+  const nDelete = gcalNode({
+    name: 'Delete Event (GCal)',
+    x: 580,
+    y: 480,
+    params: {
+      operation: 'delete',
+      eventId: '={{ $json.eventId }}',
+      calendar: { '__rl': true, mode: 'list', value: 'your-calendar@example.com' },
+      options: { sendUpdates: 'all' },
+    },
+  });
+  nodes.push(nDelete);
+
+  const nAirCancel = airtableNode({
+    name: 'Airtable: Mark Canceled',
+    x: 800,
+    y: 480,
+    params: {
+      base: { '__rl': true, mode: 'list', value: 'appXXXXXXXXXXXXXX' },
+      table: { '__rl': true, mode: 'list', value: 'tblXXXXXXXXXXXXXX' },
+      operation: 'update',
+      columns: {
+        value: {
+          eventId: '={{ $json.eventId }}',
+          'Booking Status': 'Canceled',
+        },
+        mappingMode: 'defineBelow',
+        matchingColumns: ['eventId'],
+      },
+    },
+  });
+  nodes.push(nAirCancel);
+
+  const nBuildSuccess3 = setNode({
+    name: 'Build Success Payload (Cancel)',
+    x: 1020,
+    y: 480,
+    assignments: [
+      { id: 'sc1', name: 'status', type: 'string', value: '=ok' },
+      { id: 'sc2', name: 'message', type: 'string', value: '=Appointment canceled.' },
+    ],
+  });
+  nodes.push(nBuildSuccess3);
+
+  // Channel responders (gates + respond)
+  const gateExpr = (want) => ({
+    combinator: 'and',
+    options: { version: 2 },
+    conditions: [
+      {
+        id: 'cg1',
+        operator: { type: 'string', operation: 'equals' },
+        leftValue: '={{ $json.selected_channel }}',
+        rightValue: want,
+      },
+    ],
   });
 
-  const conns=wf.connections||{};
-  for(const [from,m] of Object.entries(conns)){
-    if(!byName.has(from)){ delete conns[from]; continue; }
-    if(!m||typeof m!=="object"){ delete conns[from]; continue; }
-    if(!Array.isArray(m.main)) m.main=[];
-    m.main=m.main.map(arr=>Array.isArray(arr)?arr.filter(link=>byName.has(link?.node)):[]);
-  }
-  wf.connections=conns;
-  wf.name=String(wf.name||"AI Agent Workflow");
-  return wf;
-}
+  const nGateWhatsApp = ifNode({
+    name: 'Gate: Only WhatsApp',
+    x: 1240,
+    y: 140,
+    conditions: gateExpr('whatsapp'),
+  });
+  nodes.push(nGateWhatsApp);
 
-// ---------- LLM orchestration ----------
-function makeDesigner(row, forcedChannel){
-  return openaiJSON(
-    makeDesignerPrompt(row, forcedChannel),
-    `{"archetype":string,"trigger":"cron|webhook|imap|manual","channels":string[],"branches":[{"name":string,"condition":string,"steps":[{"name":string,"kind":string,"outcomes"?:Array}]}],"errors":[{"name":string,"mitigation":string}],"systems":string[]}`
-  );
-}
-function makeMessages(row, archetype, channels){
-  return openaiJSON(
-    makeMessagingPrompt(row, archetype, channels),
-    `{"email":{"subject":string,"body":string},"sms":{"body":string},"whatsapp":{"body":string},"call":{"script":string}}`
-  );
-}
+  const nGateVoice = ifNode({
+    name: 'Gate: Only Voice',
+    x: 1240,
+    y: 220,
+    conditions: gateExpr('voice'),
+  });
+  nodes.push(nGateVoice);
 
-// ---------- Canonical chronological flow for Appointment Scheduling ----------
-function buildCanonicalSchedulingBranches(channelsIn){
-  const channels = Array.isArray(channelsIn)&&channelsIn.length ? [channelsIn[0]] : ['email'];
-  const steps = [
-    { name:"Lookup: Upcoming Appointments (PMS/CRM)", kind:"lookup" },
-    { name:"Decision: Do we have an upcoming appointment for this contact?", kind:"decision",
-      outcomes:[
-        { value:"yes_upcoming",
-          steps:[
-            { name:"Compose: Confirmation message with business address & reason", kind:"compose" },
-            { name:"Book: Confirm in Calendar", kind:"book" },
-            { name:"Notify: Reminder 2h before appointment", kind:"notify" },
-            { name:"Update: CRM visit status → Confirmed", kind:"update" },
-          ]
-        },
-        { value:"no_or_cannot_attend",
-          steps:[
-            { name:"Lookup: Next available time slots", kind:"lookup" },
-            { name:"Compose: Offer reschedule options (3 choices)", kind:"compose" },
-            { name:"Decision: Client chose a new slot?", kind:"decision",
-              outcomes:[
-                { value:"reschedule_yes",
-                  steps:[
-                    { name:"Book: New slot in Calendar", kind:"book" },
-                    { name:"Compose: New confirmation with date/time/address/reason", kind:"compose" },
-                    { name:"Notify: Reminder 2h before new appointment", kind:"notify" },
-                    { name:"Update: CRM visit status → Rescheduled", kind:"update" },
-                  ]
-                },
-                { value:"reschedule_no",
-                  steps:[
-                    { name:"Store: Add to follow-up list", kind:"store" },
-                    { name:"Update: CRM visit status → Follow-up", kind:"update" },
-                  ]
-                }
-              ]
-            }
-          ]
-        }
-      ]
-    },
-    { name:"Store: Audit trail & timeline event", kind:"store" }
-  ];
-  return { channels, branches: [{ name:"Scheduling", condition:"All scheduling cases", steps }] };
-}
+  const nGateWeb = ifNode({
+    name: 'Gate: Only Web',
+    x: 1240,
+    y: 300,
+    conditions: gateExpr('web'),
+  });
+  nodes.push(nGateWeb);
 
-// ---------- core build ----------
-async function buildWorkflowFromRow(row, opts){
-  const compat=(opts.compat||'safe')==='full'?'full':'safe';
-  const uiSelected = normalizeChannel(opts?.channel || opts?.selectedChannel);
+  const nWA = whatsappSendNode({ name: 'WhatsApp • Send', x: 1460, y: 140 });
+  nodes.push(nWA);
 
-  // channels from best_reply_shapes (default)
-  const channelsFromSheet=[]; const shapes=listify(row.best_reply_shapes);
-  for(const sh of shapes){ for(const norm of CHANNEL_NORMALIZE){ if(norm.rx.test(sh) && !channelsFromSheet.includes(norm.k)) channelsFromSheet.push(norm.k); } }
-  if(!channelsFromSheet.length) channelsFromSheet.push('email');
+  const nVoice = respondNode({
+    name: 'Voice (Vapi) • Tool Response',
+    x: 1460,
+    y: 220,
+    bodyExpr:
+      '={ "results":[{ "toolCallId": "{{ $json.toolCallId || \\"voice-tool\\" }}", "result": "{{ $json.message }}{{ $json.alternatives ? \' \' + $json.alternatives.map(a => a.start).join(\', \') : \'\' }}" }] }',
+  });
+  nodes.push(nVoice);
 
-  // Start with a single channel; let UI override
-  let channels = [channelsFromSheet[0]];
-  if (uiSelected) channels = [uiSelected];
+  const nWeb = respondNode({
+    name: 'Web • HTTP Response',
+    x: 1460,
+    y: 300,
+    bodyExpr:
+      '={{ { status: $json.status, message: $json.message, alternatives: $json.alternatives || [] } }}',
+  });
+  nodes.push(nWeb);
 
-  // choose archetype/trigger
-  let archetype=chooseArchetype(row);
-  let prodTrigger=TRIGGER_PREF[archetype]||'manual';
+  // CONNECTIONS
+  const connections = {};
 
-  // LLM design + messages (hint: forced channel)
-  const design=(await makeDesigner(row, uiSelected || channels[0]))||{};
-  if(typeof design.trigger==='string' && ['cron','webhook','imap','manual'].includes(design.trigger?.toLowerCase?.())){
-    prodTrigger=design.trigger.toLowerCase();
-  }
-  if(typeof design.archetype==='string' && design.archetype.trim()){
-    archetype=design.archetype.trim().toUpperCase();
-  }
-  let systems=Array.isArray(design.systems)?design.systems.map(s=>String(s).toLowerCase()):[];
-  let branches=Array.isArray(design.branches)?design.branches:[];
-
-  // UI wins last for channel
-  channels = [ uiSelected || (Array.isArray(design.channels)&&design.channels[0] ? String(design.channels[0]).toLowerCase() : channels[0]) ]
-            .filter(c=>ALLOWED_CHANNELS.includes(c));
-  if(!channels.length) channels=['email'];
-
-  // Fallback for Appointment Scheduling if LLM sparse
-  if(archetype==='APPOINTMENT_SCHEDULING'){
-    const sparse = !branches.length || !branches.some(b=>Array.isArray(b.steps)&&b.steps.length);
-    if(sparse){
-      const built = buildCanonicalSchedulingBranches(channels);
-      branches = built.branches;
-      channels = built.channels;
-      if(!systems.includes('calendar')) systems.push('calendar');
-      if(!systems.includes('crm')) systems.push('crm');
-      if(!systems.includes('pms')) systems.push('pms');
-      if(!systems.includes('email')) systems.push('email');
-      if(!systems.includes('twilio')) systems.push('twilio');
-    }
+  function link(fromName, toName) {
+    const from = nodes.find((n) => n.name === fromName);
+    const to = nodes.find((n) => n.name === toName);
+    if (!from || !to) return;
+    connections[fromName] = connections[fromName] || { main: [[]] };
+    connections[fromName].main[0].push({ node: toName, type: 'main', index: 0 });
   }
 
-  const errors=Array.isArray(design.errors)?design.errors:[];
-  const msg=(await makeMessages(row, archetype, channels))||{};
+  // Flow wiring
+  link('Universal Trigger (UI/Server)', 'Normalize & Defaults');
+  link('Normalize & Defaults', 'Switch: Intent (book/update/cancel)');
 
-  const title=`${row.scenario_id||'Scenario'} — ${row.name||''}`.trim();
-  const wf=baseWorkflow(title);
+  // Each intent first → Contact collector
+  link('Switch: Intent (book/update/cancel)', 'Collector: Contact Info');
 
-  // build single PROD lane
-  function buildLane({ laneLabel, yOffset, triggerKind }){
-    withYOffset(wf, yOffset, () => {
-      addHeader(wf, `${ZONE.FLOW} · ${laneLabel}`, LAYOUT.prodHeader.x, LAYOUT.prodHeader.y);
+  // Book branch
+  link('Collector: Contact Info', 'Collector: Time Window');
+  link('Collector: Time Window', 'Check Availability (GCal)');
+  link('Check Availability (GCal)', 'Freebusy → Available?');
+  link('Freebusy → Available?', 'If available == true');
+  link('If available == true', 'Create Event (GCal)'); // true
+  link('Create Event (GCal)', 'Airtable: Log Booking');
+  link('Airtable: Log Booking', 'Build Success Payload');
 
-      let trig;
-      if (triggerKind==='cron') trig = addCron(wf, "Cron (from LLM)", LAYOUT.prodStart.x, LAYOUT.prodStart.y - 160, compat);
-      else if (triggerKind==='webhook') trig = addWebhook(wf, "Webhook (from LLM)", LAYOUT.prodStart.x, LAYOUT.prodStart.y, compat);
-      else if (triggerKind==='imap') trig = addFunction(wf, "IMAP Intake (Placeholder)", "return [$json];", LAYOUT.prodStart.x, LAYOUT.prodStart.y);
-      else trig = addManual(wf, LAYOUT.prodStart.x, LAYOUT.prodStart.y, "Manual Trigger");
+  // not-available path:
+  // In n8n, IF node sends "true" to output 0 and "false" to output 1.
+  // We already wired true path above. For the false path we emulate by linking again (editor merges).
+  // When importing, you can re-attach to output 1 visually if desired.
+  link('If available == true', 'Build Alternatives (next 5 slots)');
+  link('Build Alternatives (next 5 slots)', 'Build Alternatives Payload');
 
-      const init = addFunction(wf, "Init Context (PROD)", `
-const scenario=${JSON.stringify({
-  scenario_id: row.scenario_id || '',
-  agent_name: row.agent_name || '',
-  name: row.name || '',
-  triggers: row.triggers || '',
-  how_it_works: row.how_it_works || '',
-  roi_hypothesis: row.roi_hypothesis || '',
-  risk_notes: row.risk_notes || '',
-  tags: listify(row["tags (;)"] || row.tags),
-  archetype,
-})};
-const channels=${JSON.stringify(channels)};
-const systems=${JSON.stringify(systems)};
-const msg=${JSON.stringify(msg)};
-return [{...$json, scenario, channels, systems, msg}];`,
-        LAYOUT.prodStart.x+LAYOUT.stepX, LAYOUT.prodStart.y);
-      connect(wf, trig, init);
+  // Update branch
+  link('Collector: Contact Info', 'Collector: Reschedule Window');
+  link('Collector: Reschedule Window', 'Airtable: Find Event by Phone');
+  link('Airtable: Find Event by Phone', 'Set eventId from Airtable');
+  link('Set eventId from Airtable', 'Update Event (GCal)');
+  link('Update Event (GCal)', 'Airtable: Update Row');
+  link('Airtable: Update Row', 'Build Success Payload (Update)');
 
-      let cursor = init;
-      if(systems.includes('pms')){
-        const fetch = addHTTP(wf, "Fetch Upcoming (PMS)", `={{'${DEFAULT_HTTP.pms_upcoming}'}}`, "={{$json}}", LAYOUT.prodStart.x + 2*LAYOUT.stepX, LAYOUT.prodStart.y);
-        connect(wf, cursor, fetch); cursor = fetch;
+  // Cancel branch
+  link('Collector: Contact Info', 'Collector: Cancel Info');
+  link('Collector: Cancel Info', 'Airtable: Find for Cancel');
+  link('Airtable: Find for Cancel', 'Delete Event (GCal)');
+  link('Delete Event (GCal)', 'Airtable: Mark Canceled');
+  link('Airtable: Mark Canceled', 'Build Success Payload (Cancel)');
 
-        // data gate after fetch
-        const g = addCollector(wf, collectorPosX(LAYOUT.prodStart.x + 2*LAYOUT.stepX), LAYOUT.prodStart.y);
-        connect(wf, fetch, g);
-        cursor = g;
-      }
+  // Responder gates: success/alt payloads feed gates, then responders
+  link('Build Success Payload', 'Gate: Only WhatsApp');
+  link('Build Success Payload', 'Gate: Only Voice');
+  link('Build Success Payload', 'Gate: Only Web');
+  link('Build Alternatives Payload', 'Gate: Only WhatsApp');
+  link('Build Alternatives Payload', 'Gate: Only Voice');
+  link('Build Alternatives Payload', 'Gate: Only Web');
 
-      const branchesArr = (branches.length?branches:[{name:"main", steps:[]}] );
-      const sw = addSwitch(wf, "Branch (LLM/Canonical)", "={{$json.__branch || 'main'}}",
-        branchesArr.map(b=>({operation:'equal', value2:String(b.name||'main').slice(0,48)})),
-        LAYOUT.switchX, LAYOUT.prodStart.y);
-      connect(wf, cursor, sw);
+  link('Gate: Only WhatsApp', 'WhatsApp • Send');
+  link('Gate: Only Voice', 'Voice (Vapi) • Tool Response');
+  link('Gate: Only Web', 'Web • HTTP Response');
 
-      const baseBranchY = LAYOUT.prodStart.y - Math.floor(LAYOUT.branchY * (Math.max(branchesArr.length,1)-1)/2);
-      let lastCollectorOfLastBranch = null;
-
-      branchesArr.forEach((b, bIdx)=>{
-        const branchY = baseBranchY + bIdx*LAYOUT.branchY;
-        const ch = channels[0]; // single channel
-
-        // Communication hub before the channel
-        const commHubX = LAYOUT.prodStart.x + Math.floor(3.6*LAYOUT.stepX);
-        const commHub = addFunction(wf, "Communication (Stage)", "return [$json];", commHubX, branchY);
-        connect(wf, sw, commHub, bIdx);
-
-        // Channel entry
-        let stepNo=0;
-        const enterName = GUIDE.numberSteps
-          ? `[${++stepNo}] Enter: ${b.name||'Case'} · ${ch.toUpperCase()}`
-          : `Enter: ${b.name||'Case'} · ${ch.toUpperCase()}`;
-        const enter = addFunction(wf, enterName,
-          `return [{...$json,__branch:${JSON.stringify(b.name||'case')},__cond:${JSON.stringify(b.condition||'')},__channel:${JSON.stringify(ch)}}];`,
-          LAYOUT.prodStart.x + 4*LAYOUT.stepX, branchY);
-        connect(wf, commHub, enter);
-
-        const steps = Array.isArray(b.steps)?b.steps:[];
-        let prev = enter;
-
-        for (let k=0; k<steps.length; k++){
-          const st = steps[k];
-          const x = LAYOUT.prodStart.x + (5+k)*LAYOUT.stepX;
-          const title = GUIDE.numberSteps ? `[${++stepNo}] ${st.name||'Step'}` : (st.name||'Step');
-          const kind=String(st.kind||'').toLowerCase();
-
-          if(kind==='decision' && Array.isArray(st.outcomes) && st.outcomes.length){
-            const rulz = st.outcomes.map(o=>({operation:'equal', value2:String(o.value||'outcome').slice(0,64)}));
-            const dSwitch = addSwitch(wf, `${title} (Decision)`, "={{$json.__decision || 'default'}}", rulz, x, branchY);
-            connect(wf, prev, dSwitch);
-
-            let chainCollector = null;
-
-            st.outcomes.forEach((o, oIdx)=>{
-              const outcomeValue = String(o.value||'path');
-              const oy = branchY - (Math.floor((st.outcomes.length-1)/2)*LAYOUT.outcomeRowY) + (oIdx*LAYOUT.outcomeRowY);
-
-              const oEnter = addFunction(wf, `[${stepNo}.${oIdx+1}] Outcome: ${outcomeValue}`,
-                `return [{...$json,__decision:${JSON.stringify(outcomeValue)}}];`,
-                x + Math.floor(LAYOUT.stepX*0.6), oy);
-              connect(wf, dSwitch, oEnter, oIdx);
-
-              let oPrev = oEnter;
-              const oSteps = Array.isArray(o.steps)?o.steps:[];
-              oSteps.forEach((os, ok)=>{
-                const ox = x + (ok+1)*Math.floor(LAYOUT.stepX*1.05);
-                const ot = `[${stepNo}.${oIdx+1}.${ok+1}] ${os.name||'Step'}`;
-                const okind = String(os.kind||'').toLowerCase();
-                let node;
-                if(okind==='compose'){
-                  node = addFunction(wf, ot, `
-const ch=${JSON.stringify(ch)};
-const m=$json.msg||{};
-const bodies={ email:(m.email?.body)||'', sms:(m.sms?.body)||'', whatsapp:(m.whatsapp?.body)||'', call:(m.call?.script)||''};
-return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, ox, oy);
-                } else if(['http','update','store','notify','route','lookup'].includes(okind)){
-                  node = addHTTP(wf, ot, "={{'https://example.com/step'}}", "={{$json}}", ox, oy);
-                } else if(okind==='book'){
-                  node = addHTTP(wf, ot, `={{'${DEFAULT_HTTP.calendar_book}'}}`, "={{$json}}", ox, oy);
-                } else if(okind==='ticket'){
-                  node = addHTTP(wf, ot, `={{'${DEFAULT_HTTP.ticket_create}'}}`, "={{$json}}", ox, oy);
-                } else {
-                  node = addFunction(wf, ot, "return [$json];", ox, oy);
-                }
-                connect(wf, oPrev, node);
-
-                // Data gate after steps that produce/need data
-                if (requiresCollector(okind, os.name)) {
-                  const oc = addCollector(wf, collectorPosX(ox), oy);
-                  connect(wf, node, oc);
-                  oPrev = oc;
-                } else {
-                  oPrev = node;
-                }
-              });
-
-              // Sender (terminal per outcome path)
-              const sendX = x + Math.floor(LAYOUT.stepX*1.1) + (Math.max(oSteps.length,0)+1)*Math.floor(LAYOUT.stepX*1.05);
-              const sender = makeSenderNode(wf, ch, sendX, oy, compat);
-              try{ wf.nodes[wf.nodes.findIndex(n=>n.name===sender)].name = `[${stepNo}.${oIdx+1}] Send: ${ch.toUpperCase()}`; }catch{}
-              connect(wf, oPrev, sender);
-
-              // End marker after send (makes terminal explicit)
-              const end = addFunction(wf, "End (Terminal)", "return [$json];", sendX + Math.floor(LAYOUT.stepX*0.35), oy);
-              connect(wf, sender, end);
-
-              if(chainCollector) connect(wf, chainCollector, end);
-              chainCollector = end;
-
-              if (oIdx === st.outcomes.length-1){
-                prev = chainCollector;
-              }
-            });
-            continue;
-          }
-
-          // Non-decision step
-          let node;
-          if(kind==='compose'){
-            node = addFunction(wf, title, `
-const ch=${JSON.stringify(ch)};
-const m=$json||{};
-const msg=$json.msg||{};
-const bodies={ email:(msg.email?.body)||'', sms:(msg.sms?.body)||'', whatsapp:(msg.whatsapp?.body)||'', call:(msg.call?.script)||''};
-return [{...m, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, branchY);
-          } else if(['http','update','store','notify','route','lookup'].includes(kind)){
-            node = addHTTP(wf, title, "={{'https://example.com/step'}}", "={{$json}}", x, branchY);
-          } else if(kind==='book'){
-            node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.calendar_book}'}}`, "={{$json}}", x, branchY);
-          } else if(kind==='ticket'){
-            node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.ticket_create}'}}`, "={{$json}}", x, branchY);
-          } else{
-            node = addFunction(wf, title, "return [$json];", x, branchY);
-          }
-          connect(wf, prev, node);
-
-          // Data gate if needed
-          if (requiresCollector(kind, st.name)) {
-            const coll = addCollector(wf, collectorPosX(x), branchY);
-            connect(wf, node, coll);
-            prev = coll;
-          } else {
-            prev = node;
-          }
-        }
-
-        // If last step wasn't a decision, send + end (terminal)
-        const lastIsDecision = steps.some(s=>String(s.kind||'').toLowerCase()==='decision');
-        let lastTerminal = null;
-        if(!lastIsDecision){
-          const sendX = LAYOUT.prodStart.x + (5 + steps.length)*LAYOUT.stepX + Math.floor(LAYOUT.stepX*0.4);
-          const sendTitle = GUIDE.numberSteps ? `[${++stepNo}] Send: ${ch.toUpperCase()}` : `Send: ${ch.toUpperCase()}`;
-          const sender = makeSenderNode(wf, ch, sendX, branchY, compat);
-          try{ wf.nodes[wf.nodes.findIndex(n=>n.name===sender)].name = sendTitle; }catch{}
-          connect(wf, prev, sender);
-
-          const end = addFunction(wf, "End (Terminal)", "return [$json];", sendX + Math.floor(LAYOUT.stepX*0.35), branchY);
-          connect(wf, sender, end);
-          lastTerminal = end;
-        } else {
-          lastTerminal = prev; // came from chainCollector
-        }
-
-        lastCollectorOfLastBranch = lastTerminal;
-      });
-
-      if(Array.isArray(errors) && errors.length && lastCollectorOfLastBranch){
-        const errY = LAYOUT.prodStart.y + LAYOUT.errorRowYPad;
-
-        addHeader(wf, `${ZONE.ERR} · ${laneLabel}`, LAYOUT.prodStart.x + 3*LAYOUT.stepX, errY - 120);
-
-        let prev = addFunction(wf, "Error Monitor (LLM List)", "return [$json];", LAYOUT.prodStart.x + 4*LAYOUT.stepX, errY);
-        connect(wf, lastCollectorOfLastBranch, prev);
-        errors.forEach((e,i)=>{
-          const fix = addFunction(wf, GUIDE.numberSteps?`[E${i+1}] ${e.name||'Error'}`:(e.name||'Error'),
-            `// ${e.mitigation||''}\nreturn [$json];`, LAYOUT.prodStart.x + (5+i)*LAYOUT.stepX, errY);
-          connect(wf, prev, fix);
-          prev = fix;
-        });
-        const fin = addCollector(wf, LAYOUT.prodStart.x + (6 + errors.length)*LAYOUT.stepX, errY);
-        connect(wf, prev, fin);
-      }
-    });
-  }
-
-  buildLane({ laneLabel:"PRODUCTION LANE", yOffset:0, triggerKind:prodTrigger });
-
-  wf.staticData=wf.staticData||{};
-  wf.staticData.__design={
-    archetype, prodTrigger, channels, systems, branches, errors,
-    selectedChannel: channels[0],
-    guide: GUIDE,
-    layout: { verticalChannels: true, decisions: "switch+lanes", spacing: LAYOUT, antiOverlap: true, commHub: true, collectors: "data-gates" },
-    zones: ZONE
+  // Return assembled workflow
+  return {
+    id: 'UniChannel-Collectors-Template',
+    name: 'Universal Channel Appointments (Collectors First)',
+    meta: { instanceId: 'autogen' },
+    nodes,
+    connections,
+    active: false,
+    pinData: {},
+    settings: {},
+    versionId: 'v1',
   };
-
-  return sanitizeWorkflow(wf);
 }
 
-// ---------- HTTP handler ----------
-module.exports = async (req,res)=>{
-  Object.entries(HEADERS).forEach(([k,v])=>res.setHeader(k,v));
-  if(req.method==="OPTIONS") return res.status(204).end();
+/* --------------------------- PROPOSAL SCENARIO (presentation style) --------------------------- */
 
-  try{
-    if(req.method!=="POST"){
-      return res.status(200).json({ ok:true, usage:'POST {"scenario_id":"<id>", "compat":"safe|full", "channel":"email|sms|whatsapp|call"}' });
-    }
-    const body=await new Promise(resolve=>{
-      const chunks=[]; req.on("data",c=>chunks.push(c)); req.on("end",()=>{ try{ resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); }catch{ resolve({}); } });
-    });
-    const wanted=(body.scenario_id||"").toString().trim(); if(!wanted) throw new Error("Missing scenario_id");
-    const compat=(body.compat||'safe').toLowerCase()==='full'?'full':'safe';
-    const selectedChannel = body.channel || body.selectedChannel || null;
+function buildProposalWorkflow(selectedChannel) {
+  // This mirrors the “Voice2Propal” style: WhatsApp Trigger/Transcribe/Agent/Render/Send
+  // but collapses to one selected channel (e.g., whatsapp). For other channels we return a webhook JSON.
+  const nodes = [];
 
-    const row=await fetchSheetRowByScenarioId(wanted);
-    if(!row) return res.status(404).json({ ok:false, error:`scenario_id not found: ${wanted}` });
+  nodes.push(
+    sticky(
+      `## Voice2Propal – Presentation Build
+**Channel:** ${selectedChannel}
 
-    const wf=await buildWorkflowFromRow(row,{ compat, channel: selectedChannel });
+Part 1: Intake (voice or text)
+Part 2: AI Pack Selection (Airtable)
+Part 3: PDF Generation & Delivery`,
+      { x: -680, y: -120, color: 6, w: 1200, h: 200 }
+    )
+  );
 
-    res.status(200);
-    res.setHeader("Content-Type","application/json; charset=utf-8");
-    res.setHeader("Content-Disposition",`attachment; filename="${(row.scenario_id||'workflow')}.n8n.json"`);
-    res.end(JSON.stringify(wf,null,2));
-  }catch(err){
-    res.status(500).json({ ok:false, error:String(err?.message||err) });
+  const nTrigger = webhookNode({
+    name: 'UI/Server Trigger (Proposal)',
+    pathSuffix: 'proposal',
+    x: -640,
+    y: 120,
+    respond: true,
+  });
+  nodes.push(nTrigger);
+
+  const nNormalize = setNode({
+    name: 'Normalize Payload',
+    x: -420,
+    y: 120,
+    assignments: [
+      { id: 'c1', name: 'selected_channel', type: 'string', value: `=${JSON.stringify(selectedChannel)}` },
+      { id: 't1', name: 'text', type: 'string', value: "={{ $json.text || '' }}" },
+      { id: 'v1', name: 'voice_url', type: 'string', value: "={{ $json.voice_url || '' }}" },
+      { id: 'p1', name: 'phone', type: 'string', value: "={{ $json.phone || '' }}" },
+    ],
+  });
+  nodes.push(nNormalize);
+
+  // Simple "text vs voice" gate (if you want to keep parity with WA flow)
+  const nIfVoice = ifNode({
+    name: 'If voice_url exists',
+    x: -200,
+    y: 120,
+    conditions: {
+      combinator: 'and',
+      options: { version: 2 },
+      conditions: [
+        {
+          id: 'v',
+          operator: { type: 'string', operation: 'notEmpty' },
+          leftValue: '={{ $json.voice_url }}',
+          rightValue: '',
+        },
+      ],
+    },
+  });
+  nodes.push(nIfVoice);
+
+  // (Placeholders) Download + Transcribe
+  const nDownload = codeNode({
+    name: 'HTTP Download (placeholder)',
+    x: 20,
+    y: 60,
+    js: `return { json: { ...$json, audio: $json.voice_url, transcript: $json.text || 'Transcribed text placeholder' } };`,
+  });
+  nodes.push(nDownload);
+
+  const nUseText = setNode({
+    name: 'Use Provided Text',
+    x: 20,
+    y: 180,
+    assignments: [
+      { id: 't2', name: 'transcript', type: 'string', value: '={{ $json.text }}' },
+    ],
+  });
+  nodes.push(nUseText);
+
+  // Agent output (JSON contract)
+  const nAgent = codeNode({
+    name: 'Agent (pack selection mock)',
+    x: 240,
+    y: 120,
+    js: `
+const now = new Date().toISOString().slice(0,10);
+const out = {
+  date_actuel: now,
+  nom_entreprise: "Company Name [sample]",
+  nom: "First Last [sample]",
+  date: now,
+  situation_lead: "Brief need based on transcript",
+  pack_nom: "Pack FULL SYSTEM™",
+  pack_objectif: "Scale operations with automation",
+  pack_services: "- Service A\\n- Service B\\n- Service C",
+  duree_estimee: "2 to 4 weeks",
+  prix: "€4,200 HT",
+  lien_reservation: "https://your-booking-link.com"
+};
+return { json: { ...$json, output: out } };
+`.trim(),
+  });
+  nodes.push(nAgent);
+
+  // Render PDF (placeholder node to keep presentation style)
+  const nRender = codeNode({
+    name: 'Render PDF (placeholder)',
+    x: 460,
+    y: 120,
+    js: `
+return { json: { ...$json, download_url: "https://example.com/proposal.pdf" } };
+`.trim(),
+  });
+  nodes.push(nRender);
+
+  // Channel respond
+  const nGateWA = ifNode({
+    name: 'Gate: Only WhatsApp',
+    x: 680,
+    y: 80,
+    conditions: {
+      combinator: 'and',
+      options: { version: 2 },
+      conditions: [
+        {
+          id: 'gw',
+          operator: { type: 'string', operation: 'equals' },
+          leftValue: '={{ $json.selected_channel }}',
+          rightValue: 'whatsapp',
+        },
+      ],
+    },
+  });
+  nodes.push(nGateWA);
+
+  const nGateVoice = ifNode({
+    name: 'Gate: Only Voice',
+    x: 680,
+    y: 120,
+    conditions: {
+      combinator: 'and',
+      options: { version: 2 },
+      conditions: [
+        {
+          id: 'gv',
+          operator: { type: 'string', operation: 'equals' },
+          leftValue: '={{ $json.selected_channel }}',
+          rightValue: 'voice',
+        },
+      ],
+    },
+  });
+  nodes.push(nGateVoice);
+
+  const nGateWeb = ifNode({
+    name: 'Gate: Only Web',
+    x: 680,
+    y: 160,
+    conditions: {
+      combinator: 'and',
+      options: { version: 2 },
+      conditions: [
+        {
+          id: 'gweb',
+          operator: { type: 'string', operation: 'equals' },
+          leftValue: '={{ $json.selected_channel }}',
+          rightValue: 'web',
+        },
+      ],
+    },
+  });
+  nodes.push(nGateWeb);
+
+  const nWA = whatsappSendNode({ name: 'WhatsApp • Send (proposal)', x: 900, y: 80 });
+  nodes.push(nWA);
+
+  const nVoiceRespond = respondNode({
+    name: 'Voice (Vapi) • Tool Response (proposal)',
+    x: 900,
+    y: 120,
+    bodyExpr:
+      '={ "results":[{ "toolCallId": "{{ $json.toolCallId || \\"voice-tool\\" }}", "result": "Proposal ready. {{ $json.download_url }}" }] }',
+  });
+  nodes.push(nVoiceRespond);
+
+  const nWebRespond = respondNode({
+    name: 'Web • HTTP Response (proposal)',
+    x: 900,
+    y: 160,
+    bodyExpr: '={{ { status: "ok", download_url: $json.download_url } }}',
+  });
+  nodes.push(nWebRespond);
+
+  // Connections
+  const connections = {};
+  function link(fromName, toName) {
+    const from = nodes.find((n) => n.name === fromName);
+    const to = nodes.find((n) => n.name === toName);
+    if (!from || !to) return;
+    connections[fromName] = connections[fromName] || { main: [[]] };
+    connections[fromName].main[0].push({ node: toName, type: 'main', index: 0 });
   }
+
+  link('UI/Server Trigger (Proposal)', 'Normalize Payload');
+  link('Normalize Payload', 'If voice_url exists');
+  link('If voice_url exists', 'HTTP Download (placeholder)'); // true
+  link('If voice_url exists', 'Use Provided Text'); // false
+  link('HTTP Download (placeholder)', 'Agent (pack selection mock)');
+  link('Use Provided Text', 'Agent (pack selection mock)');
+  link('Agent (pack selection mock)', 'Render PDF (placeholder)');
+
+  link('Render PDF (placeholder)', 'Gate: Only WhatsApp');
+  link('Render PDF (placeholder)', 'Gate: Only Voice');
+  link('Render PDF (placeholder)', 'Gate: Only Web');
+
+  link('Gate: Only WhatsApp', 'WhatsApp • Send (proposal)');
+  link('Gate: Only Voice', 'Voice (Vapi) • Tool Response (proposal)');
+  link('Gate: Only Web', 'Web • HTTP Response (proposal)');
+
+  return {
+    id: 'Voice2Propal-Presentation',
+    meta: { instanceId: 'autogen' },
+    name: 'Voice2Propal – Presentation Build (Single Channel)',
+    nodes,
+    connections,
+    active: false,
+    pinData: {},
+    settings: {},
+    versionId: 'v1',
+  };
+}
+
+/* --------------------------- SCENARIO REGISTRY --------------------------- */
+
+const SCENARIO_BUILDERS = {
+  appointments: buildAppointmentsWorkflow,
+  proposal: buildProposalWorkflow,
+  // add more scenarios here: 'support': buildSupportWorkflow, etc.
 };
 
-// Force Node runtime on Vercel
-module.exports.config = { runtime: 'nodejs20.x' };
+/* --------------------------- BUILD ALL REQUESTED --------------------------- */
+
+function ensureDir(p) {
+  if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
+}
+
+function build() {
+  const outDir = path.resolve(process.cwd(), 'dist');
+  ensureDir(outDir);
+
+  for (const s of SCENARIOS) {
+    const fn = SCENARIO_BUILDERS[s];
+    if (!fn) {
+      console.warn(`[build] Unknown scenario "${s}" — skipping.`);
+      continue;
+    }
+    const json = fn(CHANNEL);
+    const file = path.join(outDir, `${s}-${CHANNEL}.json`);
+    fs.writeFileSync(file, JSON.stringify(json, null, 2), 'utf8');
+    console.log(`[build] Wrote ${file}`);
+  }
+}
+
+build();

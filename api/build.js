@@ -1,7 +1,8 @@
 // api/build.js
 // Wide layout, vertical-per-channel branches, strict chronology, fully linked end-to-end.
 // Step-1 is fixed: Webhook → Init Context → Fetch Upcoming (PMS) → Branch.
-// Adds Junctions AFTER steps (spine) so chronology is visually obvious.
+// Adds a Communication (Stage) hub BEFORE channel fan-out.
+// Junctions AFTER steps (spine) so chronology is visually obvious.
 // Universal prompt + universal fallback so any scenario becomes a clean A→Z plan.
 // Uses conservative n8n node versions. Env: SHEET_ID, GOOGLE_API_KEY, SHEET_TAB?=Scenarios, OPENAI_API_KEY
 
@@ -14,7 +15,7 @@ const HEADERS = {
 
 // ====== Layout (extra air + spine control) ======
 const LAYOUT = {
-  laneGap: 3200,        // distance between PROD and DEMO
+  laneGap: 3200,        // distance between PROD and DEMO (demo disabled by default now)
   stepX: 720,           // horizontal distance between numbered columns
   branchY: 820,         // distance between branches
   channelY: 520,        // distance between channels
@@ -35,7 +36,7 @@ const GUIDE = { showWaypoints: false, numberSteps: true };
 // Bands (your UI can color these)
 const ZONE = { FLOW: "FLOW AREA", ERR: "ERROR AREA" };
 
-// Demo seed
+// Demo seed (kept for later; demo lane off by default)
 const DEMO = {
   to: "+34613030526",
   emailTo: "kevanm.spain@gmail.com",
@@ -475,7 +476,8 @@ function buildUniversalFallback(archetype, channelsIn){
 // ---------- core build ----------
 async function buildWorkflowFromRow(row, opts){
   const compat=(opts.compat||'safe')==='full'?'full':'safe';
-  const includeDemo=opts.includeDemo!==false;
+  // Default: demo lane OFF to keep the canvas light (can be re-enabled via request body)
+  const includeDemo=opts.includeDemo===true;
 
   // channels from best_reply_shapes
   const channels=[]; const shapes=listify(row.best_reply_shapes);
@@ -581,6 +583,17 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
         const branchCenterY = branchTopY;
         const junctionKey = `branch_${bIdx}_${laneLabel}`;
 
+        // NEW: Communication (Stage) hub BEFORE channel fan-out
+        const commHubX = LAYOUT.prodStart.x + Math.floor(3.6*LAYOUT.stepX);
+        const commHub = addFunction(
+          wf,
+          "Communication (Stage)",
+          "return [$json];",
+          commHubX,
+          branchCenterY
+        );
+        connect(wf, sw, commHub, bIdx);
+
         const chCount = Math.max(channels.length,1);
         const firstChY = branchTopY - Math.floor(LAYOUT.channelY * (chCount-1)/2);
 
@@ -597,7 +610,8 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
             `return [{...$json,__branch:${JSON.stringify(b.name||'case')},__cond:${JSON.stringify(b.condition||'')},__channel:${JSON.stringify(ch)}}];`,
             LAYOUT.prodStart.x + 4*LAYOUT.stepX, rowY);
 
-          if (chIdx === 0) connect(wf, sw, enter, bIdx);
+          // Connect branch → Communication hub → channel Enter
+          if (chIdx === 0) connect(wf, commHub, enter);
           if (prevChannelCollector) connect(wf, prevChannelCollector, enter);
 
           const steps = Array.isArray(b.steps)?b.steps:[];
@@ -700,6 +714,8 @@ return [{...m, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
               node = addFunction(wf, title, "return [$json];", x, rowY);
             }
             connect(wf, prev, node);
+            const jx = x + Math.floor(LAYOUT.stepX * LAYOUT.junctionXOffset);
+            const mainJunction = addJunction(wf, junctionKey, `${stepNo}`, jx, branchCenterY);
             connect(wf, node, mainJunction); // step → spine
             prev = mainJunction;
           }
@@ -745,7 +761,7 @@ return [{...m, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
     });
   }
 
-  // build lanes (PROD first, DEMO second)
+  // build lanes (PROD first); DEMO OFF by default
   buildLane({ laneLabel:"PRODUCTION LANE", yOffset:0, triggerKind:prodTrigger, isDemo:false });
   if(includeDemo){
     buildLane({ laneLabel:"DEMO LANE (Manual Trigger + Seeded Contacts)", yOffset:LAYOUT.laneGap, triggerKind:'manual', isDemo:true });
@@ -755,7 +771,7 @@ return [{...m, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, rowY);
   wf.staticData.__design={
     archetype, prodTrigger, channels, systems, branches, errors,
     guide: GUIDE,
-    layout: { verticalChannels: true, decisions: "switch+lanes", spacing: LAYOUT, spine: "junctions-after-steps", antiOverlap: true },
+    layout: { verticalChannels: true, decisions: "switch+lanes", spacing: LAYOUT, spine: "junctions-after-steps", antiOverlap: true, commHub: true },
     zones: ZONE
   };
 
@@ -769,14 +785,15 @@ module.exports = async (req,res)=>{
 
   try{
     if(req.method!=="POST"){
-      return res.status(200).json({ ok:true, usage:'POST {"scenario_id":"<id>", "compat":"safe|full", "includeDemo": true }' });
+      return res.status(200).json({ ok:true, usage:'POST {"scenario_id":"<id>", "compat":"safe|full", "includeDemo": false }' });
     }
     const body=await new Promise(resolve=>{
       const chunks=[]; req.on("data",c=>chunks.push(c)); req.on("end",()=>{ try{ resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); }catch{ resolve({}); } });
     });
     const wanted=(body.scenario_id||"").toString().trim(); if(!wanted) throw new Error("Missing scenario_id");
     const compat=(body.compat||'safe').toLowerCase()==='full'?'full':'safe';
-    const includeDemo=body.includeDemo!==false;
+    // Default demo OFF unless explicitly true
+    const includeDemo = body.includeDemo === true;
 
     const row=await fetchSheetRowByScenarioId(wanted);
     if(!row) return res.status(404).json({ ok:false, error:`scenario_id not found: ${wanted}` });

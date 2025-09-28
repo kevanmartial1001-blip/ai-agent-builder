@@ -398,19 +398,20 @@ return [{...$json, flags}];`,
         LAYOUT.prodStart.x + 6*LAYOUT.stepX, rowY);
       connect(wf, allowFn, allowedIf);
 
-      // 4) Sender
-      const sender = makeSenderNode(wf, ch, LAYOUT.prodStart.x + 6.8*LAYOUT.stepX, rowY, compat, false);
-      // Prepare message for this channel from composed bodies
+      // Prepare per-channel body
       const prep = addFunction(wf, `Prepare ${ch.toUpperCase()} Body`, `
 const bodies=$json.chBodies||{};
 const txt = bodies['${ch}'] || bodies.email || 'Hello!';
 return [{...$json, message: txt}];`,
         LAYOUT.prodStart.x + 6.2*LAYOUT.stepX, rowY);
-      connect(wf, allowedIf, prep, 0);          // true → prepare
-      connect(wf, prep, sender);                 // then send
-      connect(wf, sender, waitNode);             // converge into Wait
+      connect(wf, allowedIf, prep, 0);
 
-      // false branches just drop through (no send)
+      // 4) Sender → Wait
+      const sender = makeSenderNode(wf, ch, LAYOUT.prodStart.x + 6.8*LAYOUT.stepX, rowY, compat, false);
+      connect(wf, prep, sender);
+      connect(wf, sender, waitNode);
+
+      // false branches (not allowed) terminate without send (as in screenshot)
     });
 
     // static design (kept to avoid UI fallback)

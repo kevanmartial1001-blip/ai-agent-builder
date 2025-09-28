@@ -1,7 +1,9 @@
 // api/build.js
 // Single-channel, strictly chronological, fully linked A→Z.
-// Adds "Communication (Stage)" BEFORE the channel flow.
-// No junction nodes; explicit chaining only.
+// "Communication (Stage)" sits BEFORE the channel flow.
+// Collectors are used as *data gates* right after steps that produce/need data,
+// so the chain reads: Step → Collector (if needed) → Next Step … → Send → End.
+// No demo lane. No junction nodes.
 // Uses conservative n8n node versions (all nodes have link handles).
 // Env: SHEET_ID, GOOGLE_API_KEY, SHEET_TAB?=Scenarios, OPENAI_API_KEY
 
@@ -14,8 +16,8 @@ const HEADERS = {
 
 // ====== Layout (spacious) ======
 const LAYOUT = {
-  stepX: 720,
-  branchY: 820,
+  stepX: 720,       // horizontal spacing
+  branchY: 820,     // (kept for future multi-branches)
   channelY: 520,
   outcomeRowY: 380,
   prodHeader: { x: -1700, y: 40 },
@@ -93,6 +95,17 @@ function chooseArchetype(row){
   return 'SALES_OUTREACH';
 }
 
+// ---------- Collector policy helpers ----------
+function requiresCollector(kind, name=''){
+  const k = String(kind||'').toLowerCase();
+  const n = String(name||'').toLowerCase();
+  if (['lookup','http','score','wait'].includes(k)) return true;   // fetch/compute -> data gate
+  if (k==='book' || k==='ticket') return true;                     // returns confirmation payload
+  if (['store','update','route','notify','compose'].includes(k)) return false;
+  return false; // unknown kinds keep graph light
+}
+function collectorPosX(x){ return x + Math.floor(LAYOUT.stepX * 0.35); }
+
 // ---------- sheet + llm ----------
 async function fetchSheetRowByScenarioId(scenarioId){
   const SHEET_ID=process.env.SHEET_ID; const GOOGLE_API_KEY=process.env.GOOGLE_API_KEY; const TAB=process.env.SHEET_TAB||"Scenarios";
@@ -140,11 +153,11 @@ function makeDesignerPrompt(row, forcedChannel){
   ].join("\n");
   return `
 Design a bullet-proof, strictly chronological n8n workflow. We will auto-insert a
-"Communication (Stage)" node right before per-channel fan-out. Do NOT output any
+"Communication (Stage)" node right before the per-channel flow. Do NOT output any
 junction/merge/placeholder nodes—only steps & decisions.
 
-IMPORTANT: If FORCED_CHANNEL is provided, design the workflow assuming ONLY that
-channel is used for all communications. Tailor steps and content (e.g., call vs sms).
+If FORCED_CHANNEL is provided, assume ONLY that channel is used for all comms.
+Tailor steps and content (e.g., call vs sms).
 
 Rules:
 - "trigger": one of ["cron","webhook","imap","manual"].
@@ -324,7 +337,6 @@ function makeMessages(row, archetype, channels){
 
 // ---------- Canonical chronological flow for Appointment Scheduling ----------
 function buildCanonicalSchedulingBranches(channelsIn){
-  // Only use provided single channel
   const channels = Array.isArray(channelsIn)&&channelsIn.length ? [channelsIn[0]] : ['email'];
   const steps = [
     { name:"Lookup: Upcoming Appointments (PMS/CRM)", kind:"lookup" },
@@ -374,20 +386,20 @@ async function buildWorkflowFromRow(row, opts){
   const compat=(opts.compat||'safe')==='full'?'full':'safe';
   const uiSelected = normalizeChannel(opts?.channel || opts?.selectedChannel);
 
-  // channels from best_reply_shapes
+  // channels from best_reply_shapes (default)
   const channelsFromSheet=[]; const shapes=listify(row.best_reply_shapes);
   for(const sh of shapes){ for(const norm of CHANNEL_NORMALIZE){ if(norm.rx.test(sh) && !channelsFromSheet.includes(norm.k)) channelsFromSheet.push(norm.k); } }
   if(!channelsFromSheet.length) channelsFromSheet.push('email');
 
-  // Start with sheet channels, then force to one channel if UI specified
-  let channels = channelsFromSheet.slice(0,1); // default single
+  // Start with a single channel; let UI override
+  let channels = [channelsFromSheet[0]];
   if (uiSelected) channels = [uiSelected];
 
   // choose archetype/trigger
   let archetype=chooseArchetype(row);
   let prodTrigger=TRIGGER_PREF[archetype]||'manual';
 
-  // LLM design + messages (tell LLM our forced channel)
+  // LLM design + messages (hint: forced channel)
   const design=(await makeDesigner(row, uiSelected || channels[0]))||{};
   if(typeof design.trigger==='string' && ['cron','webhook','imap','manual'].includes(design.trigger?.toLowerCase?.())){
     prodTrigger=design.trigger.toLowerCase();
@@ -398,12 +410,12 @@ async function buildWorkflowFromRow(row, opts){
   let systems=Array.isArray(design.systems)?design.systems.map(s=>String(s).toLowerCase()):[];
   let branches=Array.isArray(design.branches)?design.branches:[];
 
-  // Force channels to the single UI one (UI wins last)
+  // UI wins last for channel
   channels = [ uiSelected || (Array.isArray(design.channels)&&design.channels[0] ? String(design.channels[0]).toLowerCase() : channels[0]) ]
             .filter(c=>ALLOWED_CHANNELS.includes(c));
   if(!channels.length) channels=['email'];
 
-  // Fallback for APPOINTMENT_SCHEDULING only if LLM empty/sparse
+  // Fallback for Appointment Scheduling if LLM sparse
   if(archetype==='APPOINTMENT_SCHEDULING'){
     const sparse = !branches.length || !branches.some(b=>Array.isArray(b.steps)&&b.steps.length);
     if(sparse){
@@ -458,6 +470,11 @@ return [{...$json, scenario, channels, systems, msg}];`,
       if(systems.includes('pms')){
         const fetch = addHTTP(wf, "Fetch Upcoming (PMS)", `={{'${DEFAULT_HTTP.pms_upcoming}'}}`, "={{$json}}", LAYOUT.prodStart.x + 2*LAYOUT.stepX, LAYOUT.prodStart.y);
         connect(wf, cursor, fetch); cursor = fetch;
+
+        // data gate after fetch
+        const g = addCollector(wf, collectorPosX(LAYOUT.prodStart.x + 2*LAYOUT.stepX), LAYOUT.prodStart.y);
+        connect(wf, fetch, g);
+        cursor = g;
       }
 
       const branchesArr = (branches.length?branches:[{name:"main", steps:[]}] );
@@ -536,19 +553,29 @@ return [{...$json, message:bodies[ch] || bodies.email || 'Hello!'}];`, ox, oy);
                   node = addFunction(wf, ot, "return [$json];", ox, oy);
                 }
                 connect(wf, oPrev, node);
-                oPrev = node;
+
+                // Data gate after steps that produce/need data
+                if (requiresCollector(okind, os.name)) {
+                  const oc = addCollector(wf, collectorPosX(ox), oy);
+                  connect(wf, node, oc);
+                  oPrev = oc;
+                } else {
+                  oPrev = node;
+                }
               });
 
+              // Sender (terminal per outcome path)
               const sendX = x + Math.floor(LAYOUT.stepX*1.1) + (Math.max(oSteps.length,0)+1)*Math.floor(LAYOUT.stepX*1.05);
               const sender = makeSenderNode(wf, ch, sendX, oy, compat);
               try{ wf.nodes[wf.nodes.findIndex(n=>n.name===sender)].name = `[${stepNo}.${oIdx+1}] Send: ${ch.toUpperCase()}`; }catch{}
               connect(wf, oPrev, sender);
 
-              const oCollector = addCollector(wf, sendX + Math.floor(LAYOUT.stepX*0.9), oy);
-              connect(wf, sender, oCollector);
+              // End marker after send (makes terminal explicit)
+              const end = addFunction(wf, "End (Terminal)", "return [$json];", sendX + Math.floor(LAYOUT.stepX*0.35), oy);
+              connect(wf, sender, end);
 
-              if(chainCollector) connect(wf, chainCollector, oCollector);
-              chainCollector = oCollector;
+              if(chainCollector) connect(wf, chainCollector, end);
+              chainCollector = end;
 
               if (oIdx === st.outcomes.length-1){
                 prev = chainCollector;
@@ -576,31 +603,39 @@ return [{...m, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, branchY);
             node = addFunction(wf, title, "return [$json];", x, branchY);
           }
           connect(wf, prev, node);
-          prev = node;
+
+          // Data gate if needed
+          if (requiresCollector(kind, st.name)) {
+            const coll = addCollector(wf, collectorPosX(x), branchY);
+            connect(wf, node, coll);
+            prev = coll;
+          } else {
+            prev = node;
+          }
         }
 
-        // Send + collect when last step was NOT a decision
+        // If last step wasn't a decision, send + end (terminal)
         const lastIsDecision = steps.some(s=>String(s.kind||'').toLowerCase()==='decision');
-        let lastCollector = null;
+        let lastTerminal = null;
         if(!lastIsDecision){
           const sendX = LAYOUT.prodStart.x + (5 + steps.length)*LAYOUT.stepX + Math.floor(LAYOUT.stepX*0.4);
           const sendTitle = GUIDE.numberSteps ? `[${++stepNo}] Send: ${ch.toUpperCase()}` : `Send: ${ch.toUpperCase()}`;
           const sender = makeSenderNode(wf, ch, sendX, branchY, compat);
           try{ wf.nodes[wf.nodes.findIndex(n=>n.name===sender)].name = sendTitle; }catch{}
           connect(wf, prev, sender);
-          lastCollector = addCollector(wf, sendX + LAYOUT.stepX, branchY);
-          connect(wf, sender, lastCollector);
+
+          const end = addFunction(wf, "End (Terminal)", "return [$json];", sendX + Math.floor(LAYOUT.stepX*0.35), branchY);
+          connect(wf, sender, end);
+          lastTerminal = end;
         } else {
-          // prev already ends at chainCollector
-          lastCollector = prev;
+          lastTerminal = prev; // came from chainCollector
         }
 
-        lastCollectorOfLastBranch = lastCollector;
+        lastCollectorOfLastBranch = lastTerminal;
       });
 
       if(Array.isArray(errors) && errors.length && lastCollectorOfLastBranch){
-        const bottomOfBranches = LAYOUT.prodStart.y; // single channel/branch baseline
-        const errY = bottomOfBranches + LAYOUT.errorRowYPad;
+        const errY = LAYOUT.prodStart.y + LAYOUT.errorRowYPad;
 
         addHeader(wf, `${ZONE.ERR} · ${laneLabel}`, LAYOUT.prodStart.x + 3*LAYOUT.stepX, errY - 120);
 
@@ -625,7 +660,7 @@ return [{...m, message:bodies[ch] || bodies.email || 'Hello!'}];`, x, branchY);
     archetype, prodTrigger, channels, systems, branches, errors,
     selectedChannel: channels[0],
     guide: GUIDE,
-    layout: { verticalChannels: true, decisions: "switch+lanes", spacing: LAYOUT, antiOverlap: true, commHub: true },
+    layout: { verticalChannels: true, decisions: "switch+lanes", spacing: LAYOUT, antiOverlap: true, commHub: true, collectors: "data-gates" },
     zones: ZONE
   };
 

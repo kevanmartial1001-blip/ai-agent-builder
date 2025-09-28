@@ -3,7 +3,7 @@
 // Step-1 is fixed: Webhook → Init Context → Fetch Upcoming (PMS) → Branch.
 // Adds a Communication (Stage) hub BEFORE channel fan-out.
 // Junctions AFTER steps (spine) so chronology is visually obvious.
-// Universal prompt + universal fallback so any scenario becomes a clean A→Z plan.
+// Uses LLM design as-is; only canonical fallback for APPOINTMENT_SCHEDULING when LLM returns NO steps.
 // Uses conservative n8n node versions. Env: SHEET_ID, GOOGLE_API_KEY, SHEET_TAB?=Scenarios, OPENAI_API_KEY
 
 const HEADERS = {
@@ -52,7 +52,7 @@ const DEFAULT_HTTP = {
   calendar_book: "https://example.com/calendar/book",
 };
 
-// —— Universal scaffolding for any scenario ——
+// —— Step-kind vocabulary for the LLM prompt ——
 const UNIVERSAL_STEP_KINDS = [
   "compose","http","update","store","notify","route","wait","score","lookup","book","ticket","decision","send"
 ];
@@ -427,52 +427,6 @@ function buildCanonicalSchedulingBranches(channelsIn){
   };
 }
 
-// ---------- Universal fallback (any archetype) ----------
-function buildUniversalFallback(archetype, channelsIn){
-  const desired = ['call','sms','whatsapp','email'];
-  const channels = desired.filter(c=>channelsIn.includes(c)).concat(channelsIn.filter(c=>!desired.includes(c)));
-
-  const steps = [
-    { name:"Lookup: Current context / records", kind:"lookup" },
-    { name:"Compose: First outbound (purpose + next action)", kind:"compose" },
-    { name:"Decision: Customer intent / System status", kind:"decision",
-      outcomes:[
-        { value:"yes",
-          steps:[
-            { name:"Update: Primary system state", kind:"update" },
-            { name:"Notify: Confirmation / next steps", kind:"notify" },
-            { name:"Send: confirmation", kind:"send" }
-          ]
-        },
-        { value:"no",
-          steps:[
-            { name:"Store: Follow-up queue", kind:"store" },
-            { name:"Notify: Acknowledgement", kind:"notify" },
-            { name:"Send: acknowledgement", kind:"send" }
-          ]
-        },
-        { value:"unknown",
-          steps:[
-            { name:"Compose: Clarifying question", kind:"compose" },
-            { name:"Send: clarification request", kind:"send" }
-          ]
-        },
-        { value:"timeout",
-          steps:[
-            { name:"Route: Alternate channel or escalation", kind:"route" },
-            { name:"Send: escalation notice", kind:"send" }
-          ]
-        }
-      ]
-    }
-  ];
-
-  return {
-    channels,
-    branches: [{ name: archetype || "Main", condition: "All cases", steps }]
-  };
-}
-
 // ---------- core build ----------
 async function buildWorkflowFromRow(row, opts){
   const compat=(opts.compat||'safe')==='full'?'full':'safe';
@@ -504,10 +458,9 @@ async function buildWorkflowFromRow(row, opts){
   let systems=Array.isArray(design.systems)?design.systems.map(s=>String(s).toLowerCase()):[];
   let branches=Array.isArray(design.branches)?design.branches:[];
 
-  // Prefer LLM design; if sparse, synthesize a sane chronological plan
-  const noSteps = (arr)=>!arr || !arr.some(b=>Array.isArray(b.steps)&&b.steps.length);
-
-  if(archetype==='APPOINTMENT_SCHEDULING' && noSteps(branches)){
+  // === Only fallback for APPOINTMENT_SCHEDULING when LLM returns NO steps ===
+  const hasAnySteps = branches && branches.some(b=>Array.isArray(b.steps) && b.steps.length);
+  if(archetype==='APPOINTMENT_SCHEDULING' && !hasAnySteps){
     const built = buildCanonicalSchedulingBranches(channels);
     branches = built.branches;
     channels.splice(0, channels.length, ...built.channels);
@@ -516,11 +469,8 @@ async function buildWorkflowFromRow(row, opts){
     if(!systems.includes('pms')) systems.push('pms');
     if(!systems.includes('email')) systems.push('email');
     if(!systems.includes('twilio')) systems.push('twilio');
-  } else if (noSteps(branches)) {
-    const builtU = buildUniversalFallback(archetype, channels);
-    branches = builtU.branches;
-    channels.splice(0, channels.length, ...builtU.channels);
   }
+  // For ALL OTHER archetypes: we do NOT fallback—use LLM output exactly as-is.
 
   const errors=Array.isArray(design.errors)?design.errors:[];
   const msg=(await makeMessages(row, archetype, channels))||{};
@@ -583,15 +533,9 @@ return [${isDemo ? "{...seed, scenario, channels, systems, msg, demo:true}" : "{
         const branchCenterY = branchTopY;
         const junctionKey = `branch_${bIdx}_${laneLabel}`;
 
-        // NEW: Communication (Stage) hub BEFORE channel fan-out
+        // Communication (Stage) hub BEFORE channel fan-out
         const commHubX = LAYOUT.prodStart.x + Math.floor(3.6*LAYOUT.stepX);
-        const commHub = addFunction(
-          wf,
-          "Communication (Stage)",
-          "return [$json];",
-          commHubX,
-          branchCenterY
-        );
+        const commHub = addFunction(wf, "Communication (Stage)", "return [$json];", commHubX, branchCenterY);
         connect(wf, sw, commHub, bIdx);
 
         const chCount = Math.max(channels.length,1);

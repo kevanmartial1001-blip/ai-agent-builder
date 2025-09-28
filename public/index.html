@@ -38,7 +38,6 @@
         <select id="scenario"><option value="">Loading…</option></select>
       </div>
       <div>
-        <!-- CHANGED: label + options aligned with presentation builder -->
         <label for="channel">Channel</label>
         <select id="channel">
           <option value="whatsapp">WhatsApp</option>
@@ -63,8 +62,8 @@
   </div>
 </div>
 
-<!-- Load the fallback builder first (no defer/async). Bump ?v= to bust cache. -->
-<script src="/builder.js?v=26-wide-lanes"></script>
+<!-- Use the browser-side builder (no server build). -->
+<script src="/builder.js?v=27-browser-only"></script>
 
 <script>
 /* ========== Small helpers ========== */
@@ -79,7 +78,7 @@ let LAST_JSON = null; // holds last built JSON for download
 
 function assertBuilder(){
   if (!window.Builder || typeof window.Builder.buildWorkflowJSON !== 'function') {
-    throw new Error('Builder not loaded (check /public/builder.js and the script tag order).');
+    throw new Error('Builder not loaded (check /public/builder.js and the script tag).');
   }
 }
 function listify(v){ return Array.isArray(v) ? v : String(v ?? '')
@@ -95,7 +94,7 @@ async function getJSON(url, opts){
   catch { return { ok:r.ok, status:r.status, json:null, raw }; }
 }
 
-/* CHANGED: map catalog shapes to whatsapp | voice | web */
+/* Map catalog shapes to whatsapp | voice | web */
 function recommendedChannel(row){
   const shapes = listify(row.best_reply_shapes).map(x=>x.toLowerCase());
   const set = new Set(shapes.map(s =>
@@ -129,8 +128,7 @@ function populateUI(list){
 
 function setStatus(html, cls=''){
   dbg.innerHTML = html;
-  if (cls) dbg.className = 'dbg ' + cls;
-  else dbg.className = 'dbg';
+  dbg.className = cls ? ('dbg ' + cls) : 'dbg';
 }
 function setBtn(state){
   if (state==='idle'){ buildBtn.disabled=false; buildBtn.textContent='Create workflow'; }
@@ -138,17 +136,17 @@ function setBtn(state){
   if (state==='ready'){ buildBtn.disabled=false; buildBtn.textContent='Download .n8n.json'; }
 }
 
-/* CHANGED: pass selectedChannel + forcePresentation to local builder fallback */
 function previewLocalJSON(s, industry){
+  assertBuilder();
   const wf = window.Builder.buildWorkflowJSON(
     s,
     industry,
-    { selectedChannel: channelSel.value, forcePresentation: true } // CHANGED
+    { selectedChannel: channelSel.value, forcePresentation: true }
   );
   bpTA.value = JSON.stringify(wf, null, 2);
   LAST_JSON = wf;
   setBtn('ready');
-  setStatus('Built locally (presentation style).', 'ok');
+  setStatus('Built locally with builder.js (presentation style).', 'ok');
 }
 
 function applyScenario(id){
@@ -157,11 +155,10 @@ function applyScenario(id){
   const industry = matchIndustryForScenario(s);
   scenarioSel.value = s.scenario_id;
   channelSel.value  = recommendedChannel(s);
-  // clear preview and state; user must click Create
   bpTA.value = '';
   LAST_JSON = null;
   setBtn('idle');
-  setStatus('Ready. Click “Create workflow” to generate per-scenario JSON.', '');
+  setStatus('Ready. Click “Create workflow” to generate per-scenario JSON.');
 }
 
 /* ========== Remote search across 8k+ ========== */
@@ -226,7 +223,6 @@ searchEl.addEventListener('keydown', e=>{
   }
 });
 scenarioSel.addEventListener('change', ()=> applyScenario(scenarioSel.value));
-/* CHANGED: changing channel clears preview + last json */
 channelSel.addEventListener('change', ()=>{
   LAST_JSON = null;
   bpTA.value = '';
@@ -234,7 +230,7 @@ channelSel.addEventListener('change', ()=>{
   setStatus('Channel changed. Click “Create workflow” to rebuild.');
 });
 
-/* ========== Create / Download flow ========== */
+/* ========== Create / Download flow (local-only) ========== */
 function downloadJSON(obj, filename){
   const txt=JSON.stringify(obj,null,2);
   const blob=new Blob([txt],{type:'application/json'});
@@ -248,48 +244,14 @@ buildBtn.addEventListener('click', async ()=>{
 
     // If already created, this click means "Download"
     if (LAST_JSON){
-      // CHANGED: include channel in filename
       downloadJSON(LAST_JSON, `${sid}-${channelSel.value}.n8n.json`);
       return;
     }
 
-    // Create (via API first, fallback to local)
     setBtn('working');
-    setStatus('Creating per-scenario workflow via /api/build…');
+    setStatus('Creating per-scenario workflow with builder.js…');
 
-    /* CHANGED: include channel + presentation=true */
-    const res = await getJSON('/api/build?debug=1', {
-      method:'POST',
-      headers:{ 'Content-Type':'application/json', 'X-Preview':'1' },
-      body: JSON.stringify({
-        scenario_id: sid,
-        channel: channelSel.value,          // CHANGED
-        presentation: true,                 // CHANGED
-        compat: 'safe',
-        includeDemo: true
-      })
-    });
-
-    if (res.ok && res.json && res.json.name && Array.isArray(res.json.nodes)) {
-      LAST_JSON = res.json;
-      bpTA.value = JSON.stringify(res.json, null, 2);
-      setBtn('ready');
-      setStatus('<span class="ok">Created via /api/build (presentation style).</span>');
-      return;
-    }
-
-    setStatus(`api/build failed (${res.status}). Using local builder fallback…`);
-    assertBuilder();
-    /* CHANGED: local fallback passes selectedChannel + forcePresentation */
-    const wf = window.Builder.buildWorkflowJSON(
-      s,
-      matchIndustryForScenario(s),
-      { selectedChannel: channelSel.value, forcePresentation: true }
-    );
-    LAST_JSON = wf;
-    bpTA.value = JSON.stringify(wf, null, 2);
-    setBtn('ready');
-    setStatus('<span class="ok">Built locally (presentation style).</span>');
+    previewLocalJSON(s, matchIndustryForScenario(s));
   }catch(e){
     setBtn('idle');
     setStatus('<span class="err">Create failed:</span> ' + (e.message||String(e)));
@@ -298,10 +260,9 @@ buildBtn.addEventListener('click', async ()=>{
 
 /* ========== Bootstrap (25 initial, search does the rest) ========== */
 async function bootstrap(){
-  try{
-    assertBuilder();
-  }catch(e){
-    // If builder missing, we still proceed—API path will handle creation
+  try{ assertBuilder(); }
+  catch(e){
+    setStatus('<span class="err">builder.js failed to load.</span>'); return;
   }
   try{
     const [sc, ind] = await Promise.all([

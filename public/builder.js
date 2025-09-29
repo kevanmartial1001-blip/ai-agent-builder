@@ -1,23 +1,25 @@
 // public/builder.js
-// Compact & aligned builder with per-scenario variety
-// - Tight spacing, strict grid alignment (no overlaps), two channels (WhatsApp + Call)
+// Compact, aligned builder with per-scenario variety and zero-overlap placement
+// - Tight grid; automatic nudge avoids any superposed nodes
+// - Two channels (WhatsApp + Call) drawn in rows
 // - Per-scenario differences via feature extraction + deterministic variants
-// - Archetype-specific "plays" produce different shapes per scenario
+// - Deeper, context-aware steps inside each archetype ("plays")
 // Exposes: window.Builder.buildWorkflowJSON(scenario, industry, { selectedChannel })
 
 (function () {
   "use strict";
 
-  // ---------- Compact layout ----------
+  // ---------- Compact layout (slightly wider for long branches) ----------
   const LAYOUT = {
-    stepX: 300,        // horizontal gap between columns (tight ~2–3cm on typical screens)
-    channelY: 240,     // vertical gap between channel rows
-    outcomeRowY: 200,  // vertical gap between decision outcomes
-    header: { x: -900, y: 40 },
-    start:  { x: -820, y: 240 },
-    switchX: -480
+    stepX: 340,        // horizontal gap between columns (~2–3cm on most screens)
+    channelY: 260,     // vertical gap between channel rows
+    outcomeRowY: 220,  // vertical gap between decision outcomes
+    header: { x: -940, y: 40 },
+    start:  { x: -860, y: 240 },
+    switchX: -520
   };
-  const GRID = { cellH: 56 }; // strict baseline grid (prevents icon/text overlap)
+  const GRID = { cellH: 56 }; // strict baseline grid
+
   const GUIDE = { numberSteps: true };
 
   const DEFAULT_HTTP = {
@@ -26,6 +28,9 @@
     calendar_book: "https://example.com/calendar/book",
     step_generic: "https://example.com/step",
     ops_alert: "https://example.com/ops/alert",
+    pay_link: "https://example.com/pay",
+    dispute: "https://example.com/ar/dispute",
+    kyc: "https://example.com/kyc"
   };
 
   // ---------- Archetype rules ----------
@@ -67,7 +72,6 @@
   const pos = (x,y)=>[x,y];
   const listify = (v)=> Array.isArray(v) ? v.map(x=>String(x).trim()).filter(Boolean)
                   : String(v||'').split(/[;,/|\n]+/).map(x=>x.trim()).filter(Boolean);
-
   const gridY = (y)=> Math.round(y / GRID.cellH) * GRID.cellH;
 
   function chooseArchetype(s){
@@ -127,7 +131,7 @@
     if(/calendar|calendly|outlook|google calendar/.test(txt)) f.add('calendar');
     if(/twilio|sms|whatsapp|voice|call/.test(txt)) f.add('twilio');
 
-    // patterns
+    // patterns (logic toggles)
     if(/dedup|dedupe/.test(txt)) f.add('dedupe');
     if(/enrich|clearbit|apollo|zoominfo/.test(txt)) f.add('enrich');
     if(/approval|sign[- ]?off|legal review|finance review/.test(txt)) f.add('approvals');
@@ -142,10 +146,15 @@
     if(/privacy|dsr|gdpr|ccpa/.test(txt)) f.add('privacy');
     if(/payment|payable|invoice|collections?/.test(txt)) f.add('payment');
 
+    // risk-based hardening
+    if(/compliance|gdpr|hipaa|pii|privacy|security|risk|audit/.test(txt)) f.add('compliance_guard');
+
     return f; // Set of strings
   }
-  // ---------- Workflow primitives (strict grid alignment) ----------
-  function baseWorkflow(name){ return { name, nodes:[], connections:{}, active:false, settings:{}, staticData:{} }; }
+  // ---------- Workflow primitives (strict grid + anti-overlap) ----------
+  function baseWorkflow(name){
+    return { name, nodes:[], connections:{}, active:false, settings:{}, staticData:{}, __occupied: new Set() };
+  }
 
   function uniqueName(wf, base){
     const existing=new Set((wf.nodes||[]).map(n=>String(n.name||'').toLowerCase()));
@@ -154,10 +163,26 @@
     return name;
   }
 
+  function keyXY(x,y){ return `${x}|${y}`; }
+  function isOccupied(wf,x,y){ return wf.__occupied.has(keyXY(x,y)); }
+  function occupy(wf,x,y){ wf.__occupied.add(keyXY(x,y)); }
+
+  // nudge down until (x,y) is available; snap to grid
+  function nudgeIfOccupied(wf, x, y){
+    let yy = gridY(y);
+    for(let i=0;i<200;i++){ // 200*56px ~ big vertical safety
+      if(!isOccupied(wf,x,yy)){ occupy(wf,x,yy); return yy; }
+      yy += GRID.cellH;
+    }
+    occupy(wf,x,yy); return yy; // worst-case: push far down
+  }
+
   function addNode(wf,node){
     node.name = uniqueName(wf, node.name);
     if(Array.isArray(node.position)){
-      node.position=[ node.position[0], gridY(node.position[1]) ];
+      const x = node.position[0];
+      const y = nudgeIfOccupied(wf, x, node.position[1]);
+      node.position=[ x, y ];
     }
     wf.nodes.push(node); return node.name;
   }
@@ -240,40 +265,50 @@ return arr.map((it,i)=>({json:{...it.json,__collected_at:now,index:i}}));`, x, y
     };
     const opener = { whatsapp:'Heads up:', call:'Talk track:' }[channel] || 'Note:';
     const cta = { whatsapp:'Reply to confirm or change.', call:'Say “confirm” or “reschedule”.' }[channel] || 'Reply to proceed.';
-    const block = (lines, max=5)=> lines.filter(Boolean).slice(0,max).join('\n');
+    const block = (lines, max=6)=> lines.filter(Boolean).slice(0,max).join('\n');
 
+    // Slightly different flavors by archetype
     switch(archetype){
       case 'APPOINTMENT_SCHEDULING':
-        return block([ `${opener}`, ctx.trig && `Why now: ${ctx.trig}`, ctx.how && `Plan: ${ctx.how}`, ctx.roi && `Impact: ${ctx.roi}`, ctx.tone && ctx.tone, cta ]);
+        return block([ `${opener}`, ctx.trig && `Why now: ${ctx.trig}`, `Plan: ${ctx.how||'Confirm or reschedule.'}`, ctx.roi && `Impact: ${ctx.roi}`, ctx.tone, cta ]);
       case 'CUSTOMER_SUPPORT_INTAKE':
-        return block([ `${opener}`, `We received your request and opened a ticket.`, ctx.how && `Next: ${ctx.how}`, ctx.tone && ctx.tone, cta ]);
+        return block([ `${opener}`, `We received your request and opened a ticket.`, ctx.how && `Next: ${ctx.how}`, ctx.risk && `Note: ${ctx.risk}`, ctx.tone, cta ]);
+      case 'AR_FOLLOWUP':
+        return block([ `${opener}`, `Your invoice appears past due.`, ctx.trig && `Context: ${ctx.trig}`, ctx.how && `Resolution: ${ctx.how}`, `Reply “dispute” if you disagree.`, cta ]);
       default:
-        return block([ `${opener}`, ctx.trig && `Context: ${ctx.trig}`, ctx.how && `Plan: ${ctx.how}`, ctx.roi && `Value: ${ctx.roi}`, ctx.tone && ctx.tone, cta ]);
+        return block([ `${opener}`, ctx.trig && `Context: ${ctx.trig}`, ctx.how && `Plan: ${ctx.how}`, ctx.roi && `Value: ${ctx.roi}`, ctx.tone, cta ]);
     }
   }
-  // ---------- Archetype factories (use features + variant) ----------
+  // ---------- Deeper archetype factories (features + variant) ----------
   function branchesForScheduling(features, variant){
+    const guards = [];
+    if (features.has('compliance_guard')) guards.push({ name:'Guard · Consent/PII mask', kind:'update' });
+    if (features.has('kyc')) guards.push({ name:'KYC · Verify identity', kind:'http' });
+
     const plays = [
       [{
         name:'Scheduling',
         steps:[
+          ...guards,
           { name:'Lookup · Upcoming appointments (PMS/CRM)', kind:'lookup' },
           { name:'Decision · Have upcoming appointment', kind:'decision', outcomes:[
             { value:'yes_upcoming', steps:[
-              { name:'Compose · Confirmation', kind:'compose' },
+              { name:'Compose · Confirmation incl. address/reason', kind:'compose' },
               { name:'Book · Confirm in calendar', kind:'book' },
-              ...(features.has('crm') ? [{ name:'CRM · Visit → Confirmed', kind:'update' }] : [])
+              ...(features.has('crm') ? [{ name:'CRM · Visit → Confirmed', kind:'update' }] : []),
+              { name:'Notify · Reminder T-2h', kind:'notify' }
             ]},
             { value:'no_or_cannot_attend', steps:[
-              { name:'Lookup · Next available slots', kind:'lookup' },
-              { name:'Compose · Offer 3 reschedule options', kind:'compose' },
+              { name:'Lookup · Next available slots (3)', kind:'lookup' },
+              { name:'Compose · Offer reschedule options', kind:'compose' },
               { name:'Decision · Client picked a slot', kind:'decision', outcomes:[
                 { value:'reschedule_yes', steps:[
                   { name:'Book · New slot in calendar', kind:'book' },
-                  ...(features.has('crm') ? [{ name:'CRM · Visit → Rescheduled', kind:'update' }] : [])
+                  ...(features.has('pms') ? [{ name:'PMS · Update appointment', kind:'update' }] : []),
+                  { name:'Notify · Reminder T-2h', kind:'notify' }
                 ]},
                 { value:'reschedule_no', steps:[
-                  { name:'Store · Follow-up list', kind:'store' }
+                  ...(features.has('waitlist') ? [{ name:'Waitlist · Add', kind:'store' }] : [{ name:'Store · Follow-up list', kind:'store' }])
                 ]}
               ]}
             ]}
@@ -283,32 +318,31 @@ return arr.map((it,i)=>({json:{...it.json,__collected_at:now,index:i}}));`, x, y
       [{
         name:'Scheduling',
         steps:[
+          ...guards,
           { name:'Lookup · Next available slots', kind:'lookup' },
-          { name:'Compose · Offer 3 reschedule options', kind:'compose' },
+          { name:'Compose · Offer reschedule options', kind:'compose' },
+          ...(features.has('approvals') ? [{ name:'Approval · Staff confirm slot', kind:'update' }] : []),
           { name:'Decision · Client picked a slot', kind:'decision', outcomes:[
             { value:'yes', steps:[
               { name:'Book · Calendar', kind:'book' },
-              ...(features.has('pms') ? [{ name:'PMS · Confirm', kind:'update' }] : [])
+              ...(features.has('crm') ? [{ name:'CRM · Visit → Rescheduled', kind:'update' }] : [])
             ]},
-            { value:'no', steps:[
-              ...(features.has('waitlist') ? [{ name:'Waitlist · Add', kind:'store' }] : [{ name:'Store · Follow-up', kind:'store' }])
-            ]}
+            { value:'no', steps:[ { name:'Store · Follow-up', kind:'store' } ]}
           ]}
         ]
       }],
       [{
         name:'Scheduling',
         steps:[
+          ...guards,
           { name:'Lookup · Upcoming appointments (PMS/CRM)', kind:'lookup' },
           { name:'Decision · Canceled/No-show', kind:'decision', outcomes:[
             { value:'canceled', steps:[
-              ...(features.has('waitlist') ? [{ name:'Waitlist · Backfill slot', kind:'http' }] : [{ name:'Notify · Team', kind:'notify' }]),
+              ...(features.has('waitlist') ? [{ name:'Waitlist · Backfill slot', kind:'http' }] : [{ name:'Notify · Ops', kind:'notify' }]),
               { name:'Lookup · Next available slots', kind:'lookup' },
               { name:'Compose · Offer reschedule options', kind:'compose' }
             ]},
-            { value:'active', steps:[
-              { name:'Compose · Confirmation', kind:'compose' }
-            ]}
+            { value:'active', steps:[ { name:'Compose · Confirmation', kind:'compose' } ]}
           ]}
         ]
       }]
@@ -317,16 +351,21 @@ return arr.map((it,i)=>({json:{...it.json,__collected_at:now,index:i}}));`, x, y
   }
 
   function branchesForSupport(features, variant){
+    const guards = [];
+    if (features.has('compliance_guard')) guards.push({ name:'Guard · PII mask & consent', kind:'update' });
+
     const plays = [
       [{
         name:'Support',
         steps:[
-          ...(features.has('kb') ? [{ name:'KB · Search', kind:'lookup' }] : []),
+          ...guards,
+          ...(features.has('kb') ? [{ name:'KB · Semantic search', kind:'lookup' }] : []),
           { name:'Decision · KB match', kind:'decision', outcomes:[
-            { value:'hit', steps:[ { name:'Compose · Answer', kind:'compose' } ]},
+            { value:'hit', steps:[ { name:'Compose · Natural answer + link', kind:'compose' } ]},
             { value:'miss', steps:[
               { name:'Ticket · Create', kind:'ticket' },
-              ...(features.has('approvals') ? [{ name:'Approval · Route', kind:'update' }] : [])
+              ...(features.has('approvals') ? [{ name:'Approval · Route to L2', kind:'update' }] : []),
+              ...(features.has('bi') ? [{ name:'BI · Deflection metric', kind:'update' }] : [])
             ]}
           ]}
         ]
@@ -334,10 +373,11 @@ return arr.map((it,i)=>({json:{...it.json,__collected_at:now,index:i}}));`, x, y
       [{
         name:'Support',
         steps:[
+          ...guards,
           { name:'Ticket · Create', kind:'ticket' },
           { name:'Score · SLA/VIP', kind:'score' },
           { name:'Decision · High SLA', kind:'decision', outcomes:[
-            { value:'high', steps:[ { name:'Notify · Escalation', kind:'notify' } ]},
+            { value:'high', steps:[ { name:'Notify · Pager/Slack', kind:'notify' }, { name:'Compose · Rapid ack', kind:'compose' } ]},
             { value:'normal', steps:[ { name:'Compose · Acknowledgement', kind:'compose' } ]}
           ]}
         ]
@@ -345,16 +385,11 @@ return arr.map((it,i)=>({json:{...it.json,__collected_at:now,index:i}}));`, x, y
       [{
         name:'Support',
         steps:[
-          { name:'Score · SLA/VIP', kind:'score' },
+          ...guards,
+          { name:'Score · VIP intent', kind:'score' },
           { name:'Decision · VIP', kind:'decision', outcomes:[
-            { value:'vip', steps:[
-              { name:'Notify · Pager/Slack', kind:'notify' },
-              { name:'Ticket · Create', kind:'ticket' }
-            ]},
-            { value:'regular', steps:[
-              ...(features.has('kb') ? [{ name:'KB · Search', kind:'lookup' }] : []),
-              { name:'Ticket · Create', kind:'ticket' }
-            ]}
+            { value:'vip', steps:[ { name:'Notify · On-call', kind:'notify' }, { name:'Ticket · Create', kind:'ticket' } ]},
+            { value:'regular', steps:[ ...(features.has('kb') ? [{ name:'KB · Search', kind:'lookup' }] : []), { name:'Ticket · Create', kind:'ticket' } ]}
           ]}
         ]
       }]
@@ -363,18 +398,23 @@ return arr.map((it,i)=>({json:{...it.json,__collected_at:now,index:i}}));`, x, y
   }
 
   function branchesForAR(features, variant){
+    const guards = [];
+    if (features.has('compliance_guard')) guards.push({ name:'Guard · Dunning policy check', kind:'update' });
+
     const plays = [
       [{
         name:'AR Follow-up',
         steps:[
+          ...guards,
           { name:'Lookup · Aging', kind:'lookup' },
+          ...(features.has('payment') ? [{ name:'HTTP · Generate payment link', kind:'http' }] : []),
           { name:'Decision · Bucket 30/60/90', kind:'decision', outcomes:[
             { value:'30', steps:[ { name:'Compose · Friendly reminder', kind:'compose' } ]},
             { value:'60', steps:[ { name:'Compose · Firm reminder', kind:'compose' } ]},
             { value:'90', steps:[
               { name:'Notify · Finance', kind:'notify' },
               ...(features.has('dispute_flow') ? [{ name:'Decision · Dispute raised', kind:'decision', outcomes:[
-                { value:'yes', steps:[ { name:'HTTP · Dispute desk', kind:'http' } ]},
+                { value:'yes', steps:[ { name:'HTTP · Dispute desk', kind:'http' }, { name:'Update · Case', kind:'update' } ]},
                 { value:'no',  steps:[ { name:'Compose · Final notice', kind:'compose' } ]}
               ]}] : [{ name:'Compose · Final notice', kind:'compose' }])
             ]}
@@ -384,24 +424,20 @@ return arr.map((it,i)=>({json:{...it.json,__collected_at:now,index:i}}));`, x, y
       [{
         name:'AR Follow-up',
         steps:[
+          ...guards,
           { name:'Decision · Dispute present', kind:'decision', outcomes:[
-            { value:'yes', steps:[
-              { name:'HTTP · Dispute review', kind:'http' },
-              { name:'Update · Case', kind:'update' }
-            ]},
-            { value:'no', steps:[
-              { name:'Lookup · Aging', kind:'lookup' },
-              { name:'Compose · Reminder', kind:'compose' }
-            ]}
+            { value:'yes', steps:[ { name:'HTTP · Dispute review', kind:'http' }, { name:'Update · Pause dunning', kind:'update' } ]},
+            { value:'no', steps:[ { name:'Lookup · Aging', kind:'lookup' }, { name:'Compose · Reminder', kind:'compose' } ]}
           ]}
         ]
       }],
       [{
         name:'AR Follow-up',
         steps:[
+          ...guards,
           { name:'Score · Risk', kind:'score' },
           { name:'Decision · High risk', kind:'decision', outcomes:[
-            { value:'high', steps:[ { name:'Notify · Collections', kind:'notify' } ]},
+            { value:'high', steps:[ { name:'Notify · Collections', kind:'notify' }, ...(features.has('payment')?[{name:'HTTP · Payment link', kind:'http'}]:[]) ]},
             { value:'low',  steps:[ { name:'Compose · Soft nudge', kind:'compose' } ]}
           ]}
         ]
@@ -411,32 +447,39 @@ return arr.map((it,i)=>({json:{...it.json,__collected_at:now,index:i}}));`, x, y
   }
 
   function branchesForRecruiting(features, variant){
+    const guards = [];
+    if (features.has('compliance_guard')) guards.push({ name:'Guard · EEOC/redaction', kind:'update' });
+
     const plays = [
       [{
         name:'Recruiting',
         steps:[
+          ...guards,
           { name:'Parse · Resume', kind:'lookup' },
           { name:'Score · Candidate', kind:'score' },
           { name:'Decision · Route', kind:'decision', outcomes:[
-            { value:'ae',  steps:[ { name:'Calendar · Phone screen', kind:'book' } ]},
-            { value:'sdr', steps:[ { name:'Calendar · Screening', kind:'book' } ]}
+            { value:'ae',  steps:[ { name:'Calendar · Phone screen', kind:'book' }, { name:'ATS · Stage: Phone', kind:'update' } ]},
+            { value:'sdr', steps:[ { name:'Calendar · Screening', kind:'book' }, { name:'ATS · Stage: Screen', kind:'update' } ]}
           ]}
         ]
       }],
       [{
         name:'Recruiting',
         steps:[
+          ...guards,
           { name:'Score · Candidate', kind:'score' },
           { name:'Compose · Next steps', kind:'compose' },
-          { name:'Calendar · Schedule', kind:'book' }
+          { name:'Calendar · Schedule', kind:'book' },
+          { name:'ATS · Update stage', kind:'update' }
         ]
       }],
       [{
         name:'Recruiting',
         steps:[
+          ...guards,
           { name:'Decision · Stage', kind:'decision', outcomes:[
-            { value:'phone',  steps:[ { name:'Calendar · Phone screen', kind:'book' } ]},
-            { value:'onsite', steps:[ { name:'ATS · Move to Onsite', kind:'update' } ]}
+            { value:'phone',  steps:[ { name:'Calendar · Phone screen', kind:'book' }, { name:'ATS · Move → Phone', kind:'update' } ]},
+            { value:'onsite', steps:[ { name:'ATS · Move → Onsite', kind:'update' }, { name:'Compose · Directions/Prep', kind:'compose' } ]}
           ]}
         ]
       }]
@@ -445,11 +488,14 @@ return arr.map((it,i)=>({json:{...it.json,__collected_at:now,index:i}}));`, x, y
   }
 
   function branchesForGeneric(features, variant){
+    const guards = [];
+    if (features.has('compliance_guard')) guards.push({ name:'Guard · Compliance/consent', kind:'update' });
+
     const plays = [
-      [{ name:'Main', steps:[ {name:'Enrich · Lead', kind: features.has('enrich')?'http':'score'}, {name:'Compose · Outreach', kind:'compose'} ]}],
-      [{ name:'Main', steps:[ {name:'Deduplicate', kind: features.has('dedupe')?'store':'score'}, {name:'HTTP · Process', kind:'http'} ]}],
-      [{ name:'Main', steps:[ {name:'Score · Priority', kind:'score'}, {name:'Decision · Priority', kind:'decision', outcomes:[
-        { value:'high', steps:[ {name:'Notify · Team', kind:'notify'} ]},
+      [{ name:'Main', steps:[ ...guards, {name:'Enrich · Lead', kind: features.has('enrich')?'http':'score'}, {name:'Compose · Outreach', kind:'compose'}, ...(features.has('bi')?[{name:'BI · Push KPI',kind:'update'}]:[]) ]}],
+      [{ name:'Main', steps:[ ...guards, {name:'Deduplicate', kind: features.has('dedupe')?'store':'score'}, {name:'HTTP · Process', kind:'http'}, {name:'Notify · Team', kind:'notify'} ]}],
+      [{ name:'Main', steps:[ ...guards, {name:'Score · Priority', kind:'score'}, {name:'Decision · Priority', kind:'decision', outcomes:[
+        { value:'high', steps:[ {name:'Notify · Team', kind:'notify'}, {name:'HTTP · Fast-track', kind:'http'} ]},
         { value:'normal', steps:[ {name:'Compose · Standard', kind:'compose'} ]}
       ]} ]}]
     ];
@@ -460,7 +506,7 @@ return arr.map((it,i)=>({json:{...it.json,__collected_at:now,index:i}}));`, x, y
   function buildWorkflowJSON(scenario, industry, opts = {}){
     const selectedChannel = (opts.selectedChannel||'').toLowerCase().trim();
     const archetype = (scenario?.archetype) ? String(scenario.archetype).toUpperCase() : chooseArchetype(scenario);
-    const channels = normalizeChannels(scenario, selectedChannel); // pair, ordered
+    const channels = normalizeChannels(scenario, selectedChannel); // ordered pair
     const intendedTrigger = preferredTrigger(archetype, scenario);
     const features = deriveFeatures(scenario);
     const variant  = pickVariant(scenario, 3); // 0..2
@@ -574,6 +620,12 @@ return [{...$json, message: body, subject}];`, x, y);
             node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.calendar_book}'}}`, '={{$json}}', x, y);
           } else if (kind==='ticket'){
             node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.ticket_create}'}}`, '={{$json}}', x, y);
+          } else if (kind==='http' && /kyc/i.test(title)){
+            node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.kyc}'}}`, '={{$json}}', x, y);
+          } else if (kind==='http' && /payment/i.test(title)){
+            node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.pay_link}'}}`, '={{$json}}', x, y);
+          } else if (kind==='http' && /dispute/i.test(title)){
+            node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.dispute}'}}`, '={{$json}}', x, y);
           } else if (['http','lookup','update','store','notify','route','score'].includes(kind)){
             node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.step_generic}'}}`, '={{$json}}', x, y);
           } else {
@@ -615,6 +667,10 @@ return [{...$json, message: body, subject}];`, ox, oy);
                     node = addHTTP(wf, ot, `={{'${DEFAULT_HTTP.calendar_book}'}}`, '={{$json}}', ox, oy);
                   } else if (okind==='ticket'){
                     node = addHTTP(wf, ot, `={{'${DEFAULT_HTTP.ticket_create}'}}`, '={{$json}}', ox, oy);
+                  } else if (okind==='http' && /payment/i.test(ot)){
+                    node = addHTTP(wf, ot, `={{'${DEFAULT_HTTP.pay_link}'}}`, '={{$json}}', ox, oy);
+                  } else if (okind==='http' && /dispute/i.test(ot)){
+                    node = addHTTP(wf, ot, `={{'${DEFAULT_HTTP.dispute}'}}`, '={{$json}}', ox, oy);
                   } else if (['http','update','store','notify','route','lookup','score'].includes(okind)){
                     node = addHTTP(wf, ot, `={{'${DEFAULT_HTTP.step_generic}'}}`, '={{$json}}', ox, oy);
                   } else {
@@ -687,7 +743,7 @@ return [{...$json, message: body, subject}];`, ox, oy);
       archetype, trigger:intendedTrigger, channels,
       features: Array.from(features.values()),
       variant,
-      layout:{ stepX:LAYOUT.stepX, channelY:LAYOUT.channelY, outcomeRowY:LAYOUT.outcomeRowY, grid:GRID.cellH, commHub:true, align:'strict-grid' }
+      layout:{ stepX:LAYOUT.stepX, channelY:LAYOUT.channelY, outcomeRowY:LAYOUT.outcomeRowY, grid:GRID.cellH, commHub:true, align:'strict-grid', antiOverlap:true }
     };
 
     return wf;

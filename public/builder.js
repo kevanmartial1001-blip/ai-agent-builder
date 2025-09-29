@@ -1,24 +1,24 @@
 // public/builder.js
-// Compact, aligned builder with per-scenario variety and zero-overlap placement
-// - Tight grid; automatic nudge avoids any superposed nodes
-// - Two channels (WhatsApp + Call) drawn in rows
-// - Per-scenario differences via feature extraction + deterministic variants
-// - Deeper, context-aware steps inside each archetype ("plays")
+// Compact, aligned builder with per-scenario variety and strict, no-overlap placement.
+// - Column-aware placement: preserves vertical order and enforces spacing; no superposition.
+// - Two channels (WhatsApp + Call) rendered in aligned rows.
+// - Deeper, context-aware steps per archetype (guards, KYC, approvals, dispute, etc.).
+// - Deterministic variety per scenario (variant hashing).
 // Exposes: window.Builder.buildWorkflowJSON(scenario, industry, { selectedChannel })
 
 (function () {
   "use strict";
 
-  // ---------- Compact layout (slightly wider for long branches) ----------
+  // ---------- Layout (aligned, compact) ----------
   const LAYOUT = {
-    stepX: 340,        // horizontal gap between columns (~2–3cm on most screens)
-    channelY: 260,     // vertical gap between channel rows
-    outcomeRowY: 220,  // vertical gap between decision outcomes
+    stepX: 340,        // ~2–3 cm between columns on typical screens
+    channelY: 260,     // space between channel rows
+    outcomeRowY: 220,  // space between decision outcomes
     header: { x: -940, y: 40 },
     start:  { x: -860, y: 240 },
     switchX: -520
   };
-  const GRID = { cellH: 56 }; // strict baseline grid
+  const GRID = { cellH: 56 }; // vertical grid step (baseline)
 
   const GUIDE = { numberSteps: true };
 
@@ -30,7 +30,7 @@
     ops_alert: "https://example.com/ops/alert",
     pay_link: "https://example.com/pay",
     dispute: "https://example.com/ar/dispute",
-    kyc: "https://example.com/kyc"
+    kyc: "https://example.com/kyc",
   };
 
   // ---------- Archetype rules ----------
@@ -95,7 +95,7 @@
     return TRIGGER_PREF[archetype] || 'manual';
   }
 
-  // --- Deterministic seed (scenario fingerprint) ---
+  // Deterministic scenario variant
   function hash32(s){
     let h=2166136261>>>0;
     for(let i=0;i<s.length;i++){ h^=s.charCodeAt(i); h=Math.imul(h,16777619); }
@@ -107,11 +107,10 @@
       scenario?.name||'',
       String(scenario?.tags||scenario?.["tags (;)"]||'')
     ].join('|');
-    const n = hash32(s) % Math.max(1,max);
-    return n; // 0..max-1
+    return hash32(s) % Math.max(1,max); // 0..max-1
   }
 
-  // --- Feature extraction from context columns ---
+  // Extract scenario features from context columns
   function deriveFeatures(s){
     const t = (k)=>String(s[k]||'').toLowerCase();
     const txt = [
@@ -131,7 +130,7 @@
     if(/calendar|calendly|outlook|google calendar/.test(txt)) f.add('calendar');
     if(/twilio|sms|whatsapp|voice|call/.test(txt)) f.add('twilio');
 
-    // patterns (logic toggles)
+    // patterns
     if(/dedup|dedupe/.test(txt)) f.add('dedupe');
     if(/enrich|clearbit|apollo|zoominfo/.test(txt)) f.add('enrich');
     if(/approval|sign[- ]?off|legal review|finance review/.test(txt)) f.add('approvals');
@@ -146,14 +145,18 @@
     if(/privacy|dsr|gdpr|ccpa/.test(txt)) f.add('privacy');
     if(/payment|payable|invoice|collections?/.test(txt)) f.add('payment');
 
-    // risk-based hardening
+    // risk-based
     if(/compliance|gdpr|hipaa|pii|privacy|security|risk|audit/.test(txt)) f.add('compliance_guard');
 
     return f; // Set of strings
   }
-  // ---------- Workflow primitives (strict grid + anti-overlap) ----------
+
+  // ---------- Workflow primitives with strict column ordering ----------
   function baseWorkflow(name){
-    return { name, nodes:[], connections:{}, active:false, settings:{}, staticData:{}, __occupied: new Set() };
+    return {
+      name, nodes:[], connections:{}, active:false, settings:{}, staticData:{},
+      __columns: new Map() // x => lastPlacedY
+    };
   }
 
   function uniqueName(wf, base){
@@ -163,25 +166,20 @@
     return name;
   }
 
-  function keyXY(x,y){ return `${x}|${y}`; }
-  function isOccupied(wf,x,y){ return wf.__occupied.has(keyXY(x,y)); }
-  function occupy(wf,x,y){ wf.__occupied.add(keyXY(x,y)); }
-
-  // nudge down until (x,y) is available; snap to grid
-  function nudgeIfOccupied(wf, x, y){
-    let yy = gridY(y);
-    for(let i=0;i<200;i++){ // 200*56px ~ big vertical safety
-      if(!isOccupied(wf,x,yy)){ occupy(wf,x,yy); return yy; }
-      yy += GRID.cellH;
-    }
-    occupy(wf,x,yy); return yy; // worst-case: push far down
+  // Always place at y >= desiredY AND strictly below the last node in this column
+  function placeOnColumn(wf, x, desiredY){
+    const d = gridY(desiredY);
+    const last = wf.__columns.has(x) ? wf.__columns.get(x) : -Infinity;
+    const y = (last > -Infinity) ? Math.max(d, last + GRID.cellH) : d;
+    wf.__columns.set(x, y);
+    return y;
   }
 
   function addNode(wf,node){
     node.name = uniqueName(wf, node.name);
     if(Array.isArray(node.position)){
       const x = node.position[0];
-      const y = nudgeIfOccupied(wf, x, node.position[1]);
+      const y = placeOnColumn(wf, x, node.position[1]);
       node.position=[ x, y ];
     }
     wf.nodes.push(node); return node.name;
@@ -226,7 +224,7 @@ const arr=Array.isArray(items)?items:[{json:$json}];
 return arr.map((it,i)=>({json:{...it.json,__collected_at:now,index:i}}));`, x, y);
   }
 
-  // Channel senders
+  // Channel senders (concrete, linkable)
   function makeSender(wf, channel, x, y){
     if(channel==='whatsapp'){
       return addNode(wf,{ id:uid('wa'), name:'Send WhatsApp (Twilio)', type:'n8n-nodes-base.twilio', typeVersion:3, position:pos(x,y),
@@ -236,10 +234,10 @@ return arr.map((it,i)=>({json:{...it.json,__collected_at:now,index:i}}));`, x, y
       return addHTTP(wf, 'Place Call', "={{$json.callWebhook||'https://example.com/call'}}",
         "={{ { to:$json.to, from:$json.callFrom, text: ($json.message||'Hello!') } }}", x, y, 'POST');
     }
-    return addFunction(wf, `Demo Send ${channel.toUpperCase()}`, "return [$json];", x, y);
+    return addFunction(wf, `Send ${channel.toUpperCase()}`, "return [$json];", x, y);
   }
 
-  // --- System adapters (return node-name and keep cursor) ---
+  // System adapters (all connectable)
   function injectSystem(wf, sys, x, y){
     switch(sys){
       case 'crm':     return addHTTP(wf, 'CRM · Upsert/Log', "={{'https://example.com/crm/upsert'}}", '={{$json}}', x, y);
@@ -254,7 +252,7 @@ return arr.map((it,i)=>({json:{...it.json,__collected_at:now,index:i}}));`, x, y
     }
   }
 
-  // ---------- Short, channel-aware composer ----------
+  // Channel-aware composer (short, natural)
   function composeBody(archetype, channel, s, industry){
     const ctx = {
       trig: String(s.triggers||'').trim(),
@@ -267,7 +265,6 @@ return arr.map((it,i)=>({json:{...it.json,__collected_at:now,index:i}}));`, x, y
     const cta = { whatsapp:'Reply to confirm or change.', call:'Say “confirm” or “reschedule”.' }[channel] || 'Reply to proceed.';
     const block = (lines, max=6)=> lines.filter(Boolean).slice(0,max).join('\n');
 
-    // Slightly different flavors by archetype
     switch(archetype){
       case 'APPOINTMENT_SCHEDULING':
         return block([ `${opener}`, ctx.trig && `Why now: ${ctx.trig}`, `Plan: ${ctx.how||'Confirm or reschedule.'}`, ctx.roi && `Impact: ${ctx.roi}`, ctx.tone, cta ]);
@@ -279,7 +276,8 @@ return arr.map((it,i)=>({json:{...it.json,__collected_at:now,index:i}}));`, x, y
         return block([ `${opener}`, ctx.trig && `Context: ${ctx.trig}`, ctx.how && `Plan: ${ctx.how}`, ctx.roi && `Value: ${ctx.roi}`, ctx.tone, cta ]);
     }
   }
-  // ---------- Deeper archetype factories (features + variant) ----------
+
+  // ---------- Archetype branch factories (deeper plays) ----------
   function branchesForScheduling(features, variant){
     const guards = [];
     if (features.has('compliance_guard')) guards.push({ name:'Guard · Consent/PII mask', kind:'update' });
@@ -506,7 +504,7 @@ return arr.map((it,i)=>({json:{...it.json,__collected_at:now,index:i}}));`, x, y
   function buildWorkflowJSON(scenario, industry, opts = {}){
     const selectedChannel = (opts.selectedChannel||'').toLowerCase().trim();
     const archetype = (scenario?.archetype) ? String(scenario.archetype).toUpperCase() : chooseArchetype(scenario);
-    const channels = normalizeChannels(scenario, selectedChannel); // ordered pair
+    const channels = normalizeChannels(scenario, selectedChannel);
     const intendedTrigger = preferredTrigger(archetype, scenario);
     const features = deriveFeatures(scenario);
     const variant  = pickVariant(scenario, 3); // 0..2
@@ -514,7 +512,7 @@ return arr.map((it,i)=>({json:{...it.json,__collected_at:now,index:i}}));`, x, y
     const title = `${scenario?.scenario_id||'Scenario'} — ${scenario?.name||''}`.trim();
     const wf = baseWorkflow(title);
 
-    // Header + Manual + Simulated Trigger
+    // Header + Trigger
     addHeader(wf, 'FLOW AREA · PRODUCTION', LAYOUT.header.x, LAYOUT.header.y);
     const manual = addManual(wf, LAYOUT.start.x, LAYOUT.start.y, 'Manual Trigger');
     const simTrig = addSimTrigger(wf, intendedTrigger, LAYOUT.start.x + Math.floor(LAYOUT.stepX*0.8), LAYOUT.start.y);
@@ -543,14 +541,14 @@ return [{...$json, scenario}];`,
     );
     connect(wf, simTrig, init);
 
-    // Optional prefetch
+    // Optional prefetch for some archetypes
     let cursor = init;
     if (archetype==='APPOINTMENT_SCHEDULING') {
       const fetch = addHTTP(wf, 'Fetch · Upcoming (PMS)', `={{'${DEFAULT_HTTP.pms_upcoming}'}}`, '={{$json}}', LAYOUT.start.x + 3*LAYOUT.stepX, LAYOUT.start.y);
       connect(wf, cursor, fetch); cursor = fetch;
     }
 
-    // Determine branches via archetype factory
+    // Compute branches
     let branches;
     switch(archetype){
       case 'APPOINTMENT_SCHEDULING': branches = branchesForScheduling(features, variant); break;
@@ -559,23 +557,21 @@ return [{...$json, scenario}];`,
       case 'RECRUITING_INTAKE':      branches = branchesForRecruiting(features, variant); break;
       default:                       branches = branchesForGeneric(features, variant); break;
     }
+    const BR = Array.isArray(branches)?branches:[branches];
 
     // Branch selector
     const sw = addSwitch(
       wf,
       'Branch',
       "={{$json.__branch || 'Main'}}",
-      (Array.isArray(branches)?branches:[branches]).map(b=>({ operation:'equal', value2:String(b.name||'Main').slice(0,64) })),
+      BR.map(b=>({ operation:'equal', value2:String(b.name||'Main').slice(0,64) })),
       LAYOUT.switchX,
       LAYOUT.start.y
     );
     connect(wf, cursor, sw);
 
-    // Communication hub & rows
+    // Communication hub
     const commX = LAYOUT.start.x + Math.floor(2.2*LAYOUT.stepX);
-    const asArray = (x)=> Array.isArray(x)?x:[x];
-    const BR = asArray(branches);
-
     const branchBaseY = (bIdx, total)=> LAYOUT.start.y - Math.floor(LAYOUT.channelY * (Math.max(total,1)-1)/2) + bIdx*LAYOUT.channelY;
 
     let lastCollector = null;
@@ -585,13 +581,15 @@ return [{...$json, scenario}];`,
       const comm = addFunction(wf, 'Communication (Stage)', 'return [$json];', commX, baseY);
       connect(wf, sw, comm, bIdx);
 
-      // Inject 0–2 system nodes between comm and first step
+      // Pre-systems injections (consistent X; column order enforces no overlap)
       let sysCursor = comm;
       const sysList = ['kb','crm','calendar','pms','ats','wms','erp','bi'].filter(s=>features.has(s));
       const howMany = Math.min(sysList.length, (variant===0?1:(variant===1?2:1)));
       for(let si=0; si<howMany; si++){
         const x = commX + Math.floor(0.6*LAYOUT.stepX) + si*Math.floor(0.7*LAYOUT.stepX);
-        sysCursor = injectSystem(wf, sysList[si], x, baseY);
+        const sysNode = injectSystem(wf, sysList[si], x, baseY);
+        connect(wf, sysCursor, sysNode);
+        sysCursor = sysNode;
       }
 
       const chFirstY = (count)=> baseY - Math.floor(LAYOUT.channelY * (count-1)/2);
@@ -642,13 +640,16 @@ return [{...$json, message: body, subject}];`, x, y);
             const x = baseX + i*LAYOUT.stepX;
 
             if (kind==='decision' && Array.isArray(st.outcomes) && st.outcomes.length){
+              // Decision switch at (x, baseY)
               const rulz = st.outcomes.map(o=>({ operation:'equal', value2:String(o.value||'path').slice(0,64) }));
               const dsw = addSwitch(wf, `${title} (Decision)`, "={{$json.__decision || 'default'}}", rulz, x, baseY);
               connect(wf, prev, dsw);
 
+              // Outcomes: preserve vertical order by explicit computed rows
               let chain = null;
               st.outcomes.forEach((o, oIdx)=>{
-                const oy = baseY - Math.floor((st.outcomes.length-1)/2)*LAYOUT.outcomeRowY + oIdx*LAYOUT.outcomeRowY;
+                const oyDesired = baseY - Math.floor((st.outcomes.length-1)/2)*LAYOUT.outcomeRowY + oIdx*LAYOUT.outcomeRowY;
+                const oy = oyDesired; // desired row; column placer ensures it stays >= previous in this column
                 const oEnter = addFunction(wf, `[${stepIndex}.${oIdx+1}] Outcome · ${o.value||'path'}`, `return [{...$json,__decision:${JSON.stringify(String(o.value||'path'))}}];`, x + Math.floor(LAYOUT.stepX*0.6), oy);
                 connect(wf, dsw, oEnter, oIdx);
 
@@ -690,7 +691,7 @@ return [{...$json, message: body, subject}];`, ox, oy);
                 chain = oCol;
 
                 if (oIdx === st.outcomes.length-1){
-                  prev = chain;
+                  prev = chain; // continue chain forward
                 }
               });
             } else {
@@ -702,7 +703,7 @@ return [{...$json, message: body, subject}];`, ox, oy);
         const steps = Array.isArray(b.steps)?b.steps:[];
         walkSteps(steps, commX + 2*LAYOUT.stepX, rowY);
 
-        // Add send+collect if last step wasn't a decision
+        // Send + collect if last step wasn't a decision
         const lastIsDecision = steps.some(st=>String(st.kind||'').toLowerCase()==='decision');
         if (!lastIsDecision){
           const sendX = commX + 2*LAYOUT.stepX + Math.max(1, steps.length)*LAYOUT.stepX;
@@ -720,34 +721,40 @@ return [{...$json, message: body, subject}];`, ox, oy);
       });
     });
 
-    // Error lane styles by variant
+    // Error handling lane (varies by variant)
     if (lastCollector){
       if (variant===0){
         const errY = LAYOUT.start.y + 2*LAYOUT.channelY + 220;
         addHeader(wf, 'ERROR AREA · Sweep', LAYOUT.start.x + 3*LAYOUT.stepX, errY - 80);
         let prevE = addFunction(wf, 'Error Monitor', 'return [$json];', LAYOUT.start.x + 4*LAYOUT.stepX, errY);
         connect(wf, lastCollector, prevE);
-        prevE = addFunction(wf, 'Retry Policy', 'return [$json];', LAYOUT.start.x + 5*LAYOUT.stepX, errY);
-        connect(wf, lastCollector, prevE);
+        const retry = addFunction(wf, 'Retry Policy', 'return [$json];', LAYOUT.start.x + 5*LAYOUT.stepX, errY);
+        connect(wf, prevE, retry);
+        const notify = addHTTP(wf, 'Notify · Ops', `={{'${DEFAULT_HTTP.ops_alert}'}}`, '={{$json}}', LAYOUT.start.x + 6*LAYOUT.stepX, errY);
+        connect(wf, retry, notify);
       } else if (variant===1){
         const e1 = addFunction(wf, 'Mitigate · transient', 'return [$json];', LAYOUT.start.x + 4*LAYOUT.stepX, LAYOUT.start.y + LAYOUT.channelY);
         connect(wf, lastCollector, e1);
+        const e2 = addHTTP(wf, 'Notify · Ops', `={{'${DEFAULT_HTTP.ops_alert}'}}`, '={{$json}}', LAYOUT.start.x + 5*LAYOUT.stepX, LAYOUT.start.y + LAYOUT.channelY);
+        connect(wf, e1, e2);
       } else {
         const e2 = addHTTP(wf, 'Notify · Ops', `={{'${DEFAULT_HTTP.ops_alert}'}}`, '={{$json}}', LAYOUT.start.x + 4*LAYOUT.stepX, LAYOUT.start.y + Math.floor(LAYOUT.channelY*1.5));
         connect(wf, lastCollector, e2);
       }
     }
 
-    // Meta
+    // Meta (useful for debugging / UI badges)
     wf.staticData.__design = {
       archetype, trigger:intendedTrigger, channels,
       features: Array.from(features.values()),
       variant,
-      layout:{ stepX:LAYOUT.stepX, channelY:LAYOUT.channelY, outcomeRowY:LAYOUT.outcomeRowY, grid:GRID.cellH, commHub:true, align:'strict-grid', antiOverlap:true }
+      layout:{ stepX:LAYOUT.stepX, channelY:LAYOUT.channelY, outcomeRowY:LAYOUT.outcomeRowY, grid:GRID.cellH, commHub:true, align:'strict-grid', antiOverlap:true },
+      notes: 'Placement preserves vertical order within each column; no overlaps.'
     };
 
     return wf;
   }
+
   // ---------- Export ----------
   window.Builder = { buildWorkflowJSON };
 })();

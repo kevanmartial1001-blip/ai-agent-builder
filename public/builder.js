@@ -1,23 +1,24 @@
 // public/builder.js
-// Aligned, compact, per-scenario-diverse n8n workflow builder.
-// - No "?" icons: prefers Set/HTTP/Wait/Switch nodes for all steps.
-// - Deterministic variety per scenario (hash-tuned guards, depth, branches, channels, systems).
-// - Strict grid layout with column stacking to avoid any overlap; vertical order preserved.
-// Exposes window.Builder.buildWorkflowJSON(scenario, industry, { selectedChannel })
+// Compact, aligned, per-scenario-diverse n8n workflow builder with NO overlaps.
+// - Global occupancy grid prevents superposition anywhere on the canvas.
+// - Outcome rows keep strict vertical order (3.1.1 above 3.1.2, etc.).
+// - No "?" icons: Set/HTTP/Wait/Switch only.
+// - Deterministic diversity (hash of scenario) for branches, guards, depth, etc.
+// Exposes: window.Builder.buildWorkflowJSON(scenario, industry, { selectedChannel })
 
 (function () {
   "use strict";
 
   // ---------- Layout ----------
   const LAYOUT = {
-    stepX: 280,        // tighter columns (~2–3cm)
-    channelY: 220,     // space between channels
-    outcomeRowY: 200,  // space between decision outcomes
+    stepX: 280,        // ~2–3cm apart depending on zoom
+    channelY: 220,
+    outcomeRowY: 200,
     header: { x: -860, y: 40 },
     start:  { x: -820, y: 220 },
     switchX: -520
   };
-  const GRID = { cellH: 54 }; // baseline
+  const GRID = { cellH: 54, cellW: 40 }; // snap size
 
   const DEFAULT_HTTP = {
     pms_upcoming: "https://example.com/pms/upcoming",
@@ -70,7 +71,8 @@
   const pos = (x,y)=>[x,y];
   const listify = (v)=> Array.isArray(v) ? v.map(x=>String(x).trim()).filter(Boolean)
                   : String(v||'').split(/[;,/|\n]+/).map(x=>x.trim()).filter(Boolean);
-  const gridY = (y)=> Math.round(y / GRID.cellH) * GRID.cellH;
+  const snapX = (x)=> Math.round(x / GRID.cellW) * GRID.cellW;
+  const snapY = (y)=> Math.round(y / GRID.cellH) * GRID.cellH;
 
   function chooseArchetype(s){
     const hay = [s.scenario_id, s.name, s.tags, s.triggers, s.how_it_works, s.tool_stack_dev]
@@ -88,7 +90,6 @@
   }
 
   function normalizeChannels(selected, seedFlip){
-    // Two channels only: WhatsApp + Call; order depends on seed
     const a = seedFlip ? ['call','whatsapp'] : ['whatsapp','call'];
     if(String(selected||'').toLowerCase()==='voice') return ['call','whatsapp'];
     if(String(selected||'').toLowerCase()==='whatsapp') return ['whatsapp','call'];
@@ -111,8 +112,8 @@
       idx: h % 3,                 // 0..2 variant
       flip: !!(h & 0x8),          // channel order
       deep: !!(h & 0x20),         // add extra steps
-      approvals: !!(h & 0x40),    // add approvals when available
-      wait: !!(h & 0x100),        // insert wait nodes occasionally
+      approvals: !!(h & 0x40),    // approvals when available
+      wait: !!(h & 0x100),        // insert small waits
     };
   }
 
@@ -146,9 +147,9 @@
     return f;
   }
 
-  // ---------- Core graph machinery (no overlap) ----------
+  // ---------- Global occupancy grid (no overlaps) ----------
   function baseWorkflow(name){
-    return { name, nodes:[], connections:{}, active:false, settings:{}, staticData:{}, __columns:new Map() };
+    return { name, nodes:[], connections:{}, active:false, settings:{}, staticData:{}, __occ:new Set() };
   }
   function uniqueName(wf, base){
     const existing=new Set((wf.nodes||[]).map(n=>String(n.name||'').toLowerCase()));
@@ -156,18 +157,27 @@
     while(existing.has(name.toLowerCase())){ i++; name = `${base} #${i}`; }
     return name;
   }
-  function placeOnColumn(wf, x, desiredY){
-    const d = gridY(desiredY);
-    const last = wf.__columns.has(x) ? wf.__columns.get(x) : -Infinity;
-    const y = (last > -Infinity) ? Math.max(d, last + GRID.cellH) : d;
-    wf.__columns.set(x, y);
+  function occKey(x,y){ return `${x}:${y}`; }
+  function findFreeY(wf, x, desiredY){
+    const sx = snapX(x);
+    let y = snapY(desiredY);
+    const step = GRID.cellH;
+    // scan down until slot is empty
+    while (wf.__occ.has(occKey(sx,y))) { y += step; }
     return y;
+  }
+  function reserve(wf, x, y){
+    const sx = snapX(x), sy = snapY(y);
+    wf.__occ.add(occKey(sx, sy));
+    return [sx, sy];
   }
   function addNode(wf,node){
     node.name = uniqueName(wf, node.name);
     if(Array.isArray(node.position)){
-      const x=node.position[0], y=placeOnColumn(wf,x,node.position[1]);
+      const x=snapX(node.position[0]);
+      const y=findFreeY(wf, x, node.position[1]);
       node.position=[x,y];
+      reserve(wf, x, y);
     }
     wf.nodes.push(node); return node.name;
   }
@@ -180,7 +190,6 @@
 
   // ---------- Palette (no “?” icons) ----------
   function addHeader(wf,label,x,y){
-    // Use Set node for visible label (no ? icon) and pass-through
     return addNode(wf,{
       id:uid('label'),
       name:`=== ${label} ===`,
@@ -208,7 +217,6 @@
       parameters:{ url:urlExpr, method, jsonParameters:true, sendBody:true, bodyParametersJson:bodyExpr } });
   }
   function addSet(wf,name,fields,x,y){
-    // fields: { key: exprString }
     const stringVals = Object.entries(fields||{}).map(([k,v])=>({ name:k, value:v }));
     return addNode(wf,{
       id:uid('set'),
@@ -226,7 +234,6 @@
       parameters:{ amount: seconds, unit:'seconds', options:{} }});
   }
   function addCollector(wf,x,y){
-    // Use HTTP to /inspect instead of Function so icon ≠ "?"
     return addHTTP(wf,'Collector (Inspect)', `={{'${DEFAULT_HTTP.inspect}'}}`, '={{$json}}', x, y);
   }
   function makeSender(wf, channel, x, y){
@@ -241,7 +248,7 @@
     return addSet(wf, `Send ${channel.toUpperCase()}`, { sent:`={{true}}` }, x, y);
   }
 
-  // ---------- Messaging (precomputed; Set node will inject) ----------
+  // ---------- Messaging ----------
   function composeBody(archetype, channel, s, industry){
     const ctx = {
       trig: String(s.triggers||'').trim(),
@@ -266,7 +273,7 @@
     }
   }
 
-  // ---------- Archetype templates (3 variants each; hash drives choice) ----------
+  // ---------- Archetype variants ----------
   function playsScheduling(features, deep, approvals){
     const base = [{
       name:'Scheduling',
@@ -327,8 +334,7 @@
     }];
 
     const plays = [base, alt, noshow];
-    const picked = plays.map(p=>deep ? amplify(p) : p);
-    return picked;
+    return deep ? plays.map(amplify) : plays;
   }
 
   function playsSupport(features, deep, approvals){
@@ -451,8 +457,6 @@
     const plays = [a,b,c];
     return deep ? plays.map(amplify) : plays;
   }
-
-  // Adds one extra step to each branch for "deep" scenarios
   function amplify(branches){
     return (branches||[]).map(b=>{
       const extra = { name:'Store · Audit trail', kind:'store' };
@@ -470,7 +474,6 @@
     const triggerKind = preferredTrigger(archetype, scenario);
     const features = deriveFeatures(scenario);
 
-    // choose plays
     let plays;
     if (archetype==='APPOINTMENT_SCHEDULING') plays = playsScheduling(features, seed.deep, seed.approvals);
     else if (archetype==='CUSTOMER_SUPPORT_INTAKE') plays = playsSupport(features, seed.deep, seed.approvals);
@@ -478,7 +481,7 @@
     else if (archetype==='RECRUITING_INTAKE') plays = playsRecruiting(features, seed.deep);
     else plays = playsGeneric(features, seed.deep);
 
-    const picked = plays[seed.idx % plays.length]; // one scenario → one variant
+    const picked = plays[seed.idx % plays.length];
 
     const title = `${scenario?.scenario_id||'Scenario'} — ${scenario?.name||''}`.trim();
     const wf = baseWorkflow(title);
@@ -489,7 +492,7 @@
     const simTrig = addSimTrigger(wf, triggerKind, LAYOUT.start.x + Math.floor(LAYOUT.stepX*0.7), LAYOUT.start.y);
     connect(wf, manual, simTrig);
 
-    // Init (Set; no "?")
+    // Init
     const init = addSet(
       wf,
       'Init Context',
@@ -534,11 +537,11 @@
     let lastCollector=null;
 
     (Array.isArray(picked)?picked:[picked]).forEach((branch, bIdx)=>{
-      const bY = baseY(bIdx, 1); // one visible branch per variant
+      const bY = baseY(bIdx, 1);
       const comm = commStage(bY);
       connect(wf, sw, comm, bIdx);
 
-      // pre-systems sprinkle (deterministic)
+      // sprinkle systems (deterministic)
       let pre = comm;
       const sysList = ['kb','crm','calendar','pms','ats','wms','erp','bi'].filter(s=>features.has(s));
       const sysCount = Math.min(sysList.length, seed.idx===0?1:(seed.idx===1?2:1));
@@ -561,10 +564,10 @@
       const chFirstY = (count)=> bY - Math.floor(LAYOUT.channelY * (count-1)/2);
       let prevRowCollector=null;
 
+      const channels = normalizeChannels(null, seed.flip);
       channels.forEach((ch, chIdx)=>{
         const rowY = chFirstY(channels.length) + chIdx*LAYOUT.channelY;
 
-        // Enter row (Set)
         const enter = addSet(
           wf,
           `[1] Enter · ${branch.name||'Main'} · ${ch.toUpperCase()}`,
@@ -597,7 +600,6 @@
             connect(wf, prev, node); prev=node; return;
           }
           if (kind==='http'){
-            // specialize when possible
             let url = DEFAULT_HTTP.step_generic;
             if (/kyc/i.test(st.name||'')) url = DEFAULT_HTTP.kyc;
             if (/payment/i.test(st.name||'')) url = DEFAULT_HTTP.pay_link;
@@ -613,18 +615,25 @@
             const node = addWait(wf, title, x, y, 90);
             connect(wf, prev, node); prev=node; return;
           }
-          // fallback
           const node = addSet(wf, title, { '__note':`={{'pass'}}` }, x, y);
           connect(wf, prev, node); prev=node;
         };
 
         const walk = (steps, baseX, baseY)=>{
+          // Reserve outcome rows first (so order never gets pushed upward)
+          const reserveOutcomeRow = (oy)=> reserve(wf, baseX, oy);
           for (let i=0;i<steps.length;i++){
             const st = steps[i] || {};
             const x = baseX + i*LAYOUT.stepX;
             const kind = String(st.kind||'').toLowerCase();
 
             if (kind==='decision' && Array.isArray(st.outcomes) && st.outcomes.length){
+              // Pre-reserve each outcome row to avoid another column taking its slot
+              const oys = st.outcomes.map((_o, oi)=>
+                baseY - Math.floor((st.outcomes.length-1)/2)*LAYOUT.outcomeRowY + oi*LAYOUT.outcomeRowY
+              );
+              oys.forEach(oy => reserveOutcomeRow(snapY(oy)));
+
               const title = `[${++stepIndex}] ${st.name||'Decision'} (Decision)`;
               const rules = st.outcomes.map(o=>({operation:'equal', value2:String(o.value||'path').slice(0,64)}));
               const dsw = addSwitch(wf, title, "={{$json.__decision || 'default'}}", rules, x, baseY);
@@ -632,27 +641,29 @@
 
               let chain=null;
               st.outcomes.forEach((o, oi)=>{
-                const oyWanted = baseY - Math.floor((st.outcomes.length-1)/2)*LAYOUT.outcomeRowY + oi*LAYOUT.outcomeRowY;
-                const oEnter = addSet(wf, `[${stepIndex}.${oi+1}] Outcome · ${o.value||'path'}`, { '__decision':`={{'${String(o.value||'path')}'}}` }, x + Math.floor(LAYOUT.stepX*0.55), oyWanted);
+                const oy = oys[oi]; // exact reserved Y
+                const oEnter = addSet(wf, `[${stepIndex}.${oi+1}] Outcome · ${o.value||'path'}`, { '__decision':`={{'${String(o.value||'path')}'}}` }, x + Math.floor(LAYOUT.stepX*0.55), oy);
                 connect(wf, dsw, oEnter, oi);
 
-                let prevO = oEnter;
+                let prevLocal = oEnter;
                 (Array.isArray(o.steps)?o.steps:[]).forEach((os, ok)=>{
                   const ox = x + Math.floor(LAYOUT.stepX*0.55) + (ok+1)*Math.floor(LAYOUT.stepX*1.0);
-                  const oy = oyWanted;
-                  runStep({ ...os, name:`${os.name||'Step'}`.replace(/^\[\d+\].\s*/,'') }, ox, oy);
-                  prevO = prev; // runStep updates outer 'prev', keep per-outcome local
+                  const oySame = oy;
+                  const beforePrev = prev;   // stash outer prev
+                  prev = prevLocal;          // run step on local chain
+                  runStep({ ...os, name:`${os.name||'Step'}`.replace(/^\[\d+\].\s*/,'') }, ox, oySame);
+                  prevLocal = prev;          // update local
+                  prev = beforePrev;         // restore outer prev for next outcome wires
                 });
 
-                // Sender after each outcome
                 const sendX = x + Math.floor(LAYOUT.stepX*0.55) + Math.max(2,(o.steps||[]).length+1)*Math.floor(LAYOUT.stepX*1.0);
-                const sender = makeSender(wf, ch, sendX, oyWanted);
+                const sender = makeSender(wf, ch, sendX, oy);
                 try {
                   const idx = wf.nodes.findIndex(n=>n.name===sender);
                   if (idx>=0) wf.nodes[idx].name = `[${stepIndex}.${oi+1}] Send · ${ch.toUpperCase()}`;
                 } catch {}
-                connect(wf, prev, sender);
-                let oCol = addCollector(wf, sendX + Math.floor(LAYOUT.stepX*0.8), oyWanted);
+                connect(wf, (o.steps&&o.steps.length)?prevLocal:oEnter, sender);
+                let oCol = addCollector(wf, sendX + Math.floor(LAYOUT.stepX*0.8), oy);
                 connect(wf, sender, oCol);
 
                 if (chain) connect(wf, chain, oCol);
@@ -661,7 +672,7 @@
               });
             } else {
               runStep(st, x, baseY);
-              if (seed.wait && i===0) { // tiny delay early in row for realism
+              if (seed.wait && i===0) {
                 const wait = addWait(wf,'[pause] jitter', x + Math.floor(LAYOUT.stepX*0.5), baseY, 45);
                 connect(wf, prev, wait); prev = wait;
               }
@@ -692,7 +703,7 @@
       });
     });
 
-    // Simple error lane (varies by seed)
+    // Error lane
     if (lastCollector){
       const errY = LAYOUT.start.y + LAYOUT.channelY + 220;
       addHeader(wf, 'ERROR AREA', LAYOUT.start.x + 3*LAYOUT.stepX, errY - 80);
@@ -710,8 +721,8 @@
       archetype, trigger: triggerKind, channels,
       features: Array.from(features.values()),
       seed,
-      layout:{ stepX:LAYOUT.stepX, channelY:LAYOUT.channelY, outcomeRowY:LAYOUT.outcomeRowY, grid:GRID.cellH, align:'strict-grid', antiOverlap:true },
-      notes:'No Function nodes (except none); Set/HTTP/Wait/Switch only → no "?" icons.'
+      layout:{ stepX:LAYOUT.stepX, channelY:LAYOUT.channelY, outcomeRowY:LAYOUT.outcomeRowY, grid:{w:GRID.cellW,h:GRID.cellH}, align:'strict-grid', antiOverlap:true },
+      notes:'Global occupancy grid ensures no superposition; outcomes reserved to preserve vertical order.'
     };
     return wf;
   }

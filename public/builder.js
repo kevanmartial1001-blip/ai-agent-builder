@@ -1,28 +1,28 @@
 // public/builder.js
-// Compact, aligned, per-scenario-diverse n8n workflow builder with NO overlaps.
-// Improvements in this version:
-//  • Wider spacing (stepX/channelY/outcomeRowY) to ensure readability.
-//  • Global block-occupancy grid (reserve rectangle, not a point) => no masking.
-//  • Outcome rows pre-reserved to keep strict vertical order (3.1.1 above 3.1.2).
-//  • Only linkable nodes (Set/HTTP/Wait/Switch); no "?" placeholders.
+// Compact + aligned n8n workflow builder with guaranteed NO overlaps.
+// - Bigger vertical gaps: channel vs. outcome rows (prevents 3.1/3.2 overlap).
+// - Larger node footprint (3×2 grid cells) so labels & ports never mask.
+// - Switch (decision) -> Outcome enter nodes -> Steps -> Sender -> Collector,
+//   plus a visible "Branch Continuation" bridge after decisions to make
+//   right-hand connections obvious in n8n.
 // Exposes: window.Builder.buildWorkflowJSON(scenario, industry, { selectedChannel })
 
 (function () {
   "use strict";
 
-  // ---------- Layout ----------
+  // ---------- Layout (wider) ----------
   const LAYOUT = {
-    stepX: 340,        // wider horizontal gaps (~2–3cm on common zoom)
-    channelY: 260,     // vertical gap between channels
-    outcomeRowY: 240,  // vertical gap between decision outcomes
+    stepX: 360,        // column spacing
+    channelY: 340,     // distance between channels (e.g., CALL vs WHATSAPP)
+    outcomeRowY: 320,  // distance between decision outcomes (3.1/3.2/…)
     header: { x: -900, y: 40 },
     start:  { x: -860, y: 240 },
     switchX: -560
   };
 
-  // Grid & node “footprint” (so we never place two nodes on top of each other)
+  // Grid & node footprint (reserve a rectangle to avoid masking)
   const GRID = { cellH: 70, cellW: 80 };   // snap granularity
-  const FOOTPRINT = { w: 2, h: 1 };        // each node reserves a 2×1 block of cells
+  const FOOTPRINT = { w: 3, h: 2 };        // each node reserves 3×2 cells
 
   const DEFAULT_HTTP = {
     pms_upcoming: "https://example.com/pms/upcoming",
@@ -84,7 +84,6 @@
     for(const r of ARCH_RULES) if(r.rx.test(hay)) return r.a;
     return 'SALES_OUTREACH';
   }
-
   function preferredTrigger(archetype, s){
     const t = String(s.triggers||'').toLowerCase();
     if (/webhook|callback|incoming|real[- ]?time/.test(t)) return 'webhook';
@@ -92,42 +91,22 @@
     if (/imap|inbox|email/.test(t)) return 'imap';
     return TRIGGER_PREF[archetype] || 'manual';
   }
-
-  function normalizeChannels(selected, seedFlip){
-    const a = seedFlip ? ['call','whatsapp'] : ['whatsapp','call'];
+  function normalizeChannels(selected, flip){
+    const a = flip ? ['call','whatsapp'] : ['whatsapp','call'];
     if(String(selected||'').toLowerCase()==='voice') return ['call','whatsapp'];
     if(String(selected||'').toLowerCase()==='whatsapp') return ['whatsapp','call'];
     return a;
   }
-
-  function hash32(s){
-    let h=2166136261>>>0;
-    for(let i=0;i<s.length;i++){ h^=s.charCodeAt(i); h=Math.imul(h,16777619); }
-    return (h>>>0);
-  }
+  function hash32(s){ let h=2166136261>>>0; for(let i=0;i<s.length;i++){ h^=s.charCodeAt(i); h=Math.imul(h,16777619); } return (h>>>0); }
   function scenarioSeed(scenario){
-    const s = [
-      scenario?.scenario_id||'',
-      scenario?.name||'',
-      String(scenario?.tags||scenario?.["tags (;)"]||'')
-    ].join('|');
+    const s = [scenario?.scenario_id||'', scenario?.name||'', String(scenario?.tags||scenario?.["tags (;)"]||'')].join('|');
     const h = hash32(s);
-    return {
-      idx: h % 3,                 // 0..2 variant
-      flip: !!(h & 0x8),          // channel order
-      deep: !!(h & 0x20),         // add extra steps
-      approvals: !!(h & 0x40),    // approvals when available
-      wait: !!(h & 0x100),        // insert small waits
-    };
+    return { idx: h%3, flip: !!(h&0x8), deep: !!(h&0x20), approvals: !!(h&0x40), wait: !!(h&0x100) };
   }
-
   function deriveFeatures(s){
     const t = (k)=>String(s[k]||'').toLowerCase();
-    const txt = [
-      t('triggers'), t('how_it_works'), t('tool_stack_dev'),
-      t('roi_hypothesis'), t('risk_notes'), String(s.tags||s['tags (;)']||'').toLowerCase()
-    ].join(' | ');
-    const f = new Set();
+    const txt = [t('triggers'),t('how_it_works'),t('tool_stack_dev'),t('roi_hypothesis'),t('risk_notes'),String(s.tags||s['tags (;)']||'').toLowerCase()].join('|');
+    const f=new Set();
     if(/pms|dentrix|opendental|eaglesoft/.test(txt)) f.add('pms');
     if(/crm|hubspot|salesforce|pipedrive/.test(txt)) f.add('crm');
     if(/ats|greenhouse|lever/.test(txt)) f.add('ats');
@@ -151,53 +130,25 @@
     return f;
   }
 
-  // ---------- Global block-occupancy grid (no overlaps) ----------
-  function baseWorkflow(name){
-    return { name, nodes:[], connections:{}, active:false, settings:{}, staticData:{}, __occ:new Set() };
-  }
-  function uniqueName(wf, base){
-    const existing=new Set((wf.nodes||[]).map(n=>String(n.name||'').toLowerCase()));
-    let name=base||'Node', i=1;
-    while(existing.has(name.toLowerCase())){ i++; name = `${base} #${i}`; }
-    return name;
-  }
-  function key(x,y){ return `${x}:${y}`; }
-  function blockCells(x, y, w=FOOTPRINT.w, h=FOOTPRINT.h){
-    const sx = snapX(x), sy = snapY(y);
-    const cells = [];
-    for(let dx=0;dx<w;dx++){
-      for(let dy=0;dy<h;dy++){
-        cells.push(key(sx + dx*GRID.cellW, sy + dy*GRID.cellH));
-      }
-    }
-    return cells;
-  }
-  function blockFree(wf, x, y, w=FOOTPRINT.w, h=FOOTPRINT.h){
-    const cells = blockCells(x,y,w,h);
-    return cells.every(c=>!wf.__occ.has(c));
-  }
-  function reserveBlock(wf, x, y, w=FOOTPRINT.w, h=FOOTPRINT.h){
-    blockCells(x,y,w,h).forEach(c=>wf.__occ.add(c));
-    return [snapX(x), snapY(y)];
-  }
-  function findFreeY(wf, x, desiredY, w=FOOTPRINT.w, h=FOOTPRINT.h){
-    const sx = snapX(x);
-    let y = snapY(desiredY);
-    const step = GRID.cellH;
-    while (!blockFree(wf, sx, y, w, h)) { y += step; }
-    return y;
-  }
+  // ---------- Block-occupancy (no overlaps) ----------
+  function baseWorkflow(name){ return { name, nodes:[], connections:{}, active:false, settings:{}, staticData:{}, __occ:new Set() }; }
+  function uniqueName(wf, base){ const ex=new Set((wf.nodes||[]).map(n=>String(n.name||'').toLowerCase())); let nm=base||'Node',i=1; while(ex.has(nm.toLowerCase())){ i++; nm=`${base} #${i}`;} return nm; }
+  const key=(x,y)=>`${x}:${y}`;
+  function blockCells(x,y,w=FOOTPRINT.w,h=FOOTPRINT.h){ const sx=snapX(x), sy=snapY(y); const cells=[]; for(let dx=0;dx<w;dx++) for(let dy=0;dy<h;dy++) cells.push(key(sx+dx*GRID.cellW, sy+dy*GRID.cellH)); return cells; }
+  function blockFree(wf,x,y,w=FOOTPRINT.w,h=FOOTPRINT.h){ return blockCells(x,y,w,h).every(c=>!wf.__occ.has(c)); }
+  function reserveBlock(wf,x,y,w=FOOTPRINT.w,h=FOOTPRINT.h){ blockCells(x,y,w,h).forEach(c=>wf.__occ.add(c)); return [snapX(x),snapY(y)]; }
+  function findFreeY(wf,x,desiredY,w=FOOTPRINT.w,h=FOOTPRINT.h){ const sx=snapX(x); let y=snapY(desiredY); const step=GRID.cellH; while(!blockFree(wf,sx,y,w,h)){ y+=step; } return y; }
   function addNode(wf,node){
     node.name = uniqueName(wf, node.name);
     if(Array.isArray(node.position)){
       const x=snapX(node.position[0]);
-      const y=findFreeY(wf, x, node.position[1], FOOTPRINT.w, FOOTPRINT.h);
+      const y=findFreeY(wf,x,node.position[1],FOOTPRINT.w,FOOTPRINT.h);
       node.position=[x,y];
-      reserveBlock(wf, x, y, FOOTPRINT.w, FOOTPRINT.h);
+      reserveBlock(wf,x,y,FOOTPRINT.w,FOOTPRINT.h);
     }
     wf.nodes.push(node); return node.name;
   }
-  function connect(wf, from, to, outputIndex=0){
+  function connect(wf,from,to,outputIndex=0){
     wf.connections[from]??={};
     wf.connections[from].main??=[];
     for(let i=wf.connections[from].main.length;i<=outputIndex;i++) wf.connections[from].main[i]=[];
@@ -249,9 +200,7 @@
     return addNode(wf,{ id:uid('wait'), name, type:'n8n-nodes-base.wait', typeVersion:1, position:pos(x,y),
       parameters:{ amount: seconds, unit:'seconds', options:{} }});
   }
-  function addCollector(wf,x,y){
-    return addHTTP(wf,'Collector (Inspect)', `={{'${DEFAULT_HTTP.inspect}'}}`, '={{$json}}', x, y);
-  }
+  function addCollector(wf,x,y){ return addHTTP(wf,'Collector (Inspect)', `={{'${DEFAULT_HTTP.inspect}'}}`, '={{$json}}', x, y); }
   function makeSender(wf, channel, x, y){
     if(channel==='whatsapp'){
       return addNode(wf,{ id:uid('wa'), name:'Send WhatsApp (Twilio)', type:'n8n-nodes-base.twilio', typeVersion:3, position:pos(x,y),
@@ -292,7 +241,7 @@
     }
   }
 
-  // ---------- Archetype variants ----------
+  // ---------- Archetype plays (trimmed here for brevity; same as before) ----------
   const amplify = (branches)=> (branches||[]).map(b=>{
     const extra = { name:'Store · Audit trail', kind:'store' };
     const dup = JSON.parse(JSON.stringify(b));
@@ -504,13 +453,11 @@
     const title = `${scenario?.scenario_id||'Scenario'} — ${scenario?.name||''}`.trim();
     const wf = baseWorkflow(title);
 
-    // Header + Trigger
     addHeader(wf, 'FLOW AREA · PRODUCTION', LAYOUT.header.x, LAYOUT.header.y);
     const manual = addManual(wf, LAYOUT.start.x, LAYOUT.start.y, 'Manual Trigger');
     const simTrig = addSimTrigger(wf, triggerKind, LAYOUT.start.x + Math.floor(LAYOUT.stepX*0.7), LAYOUT.start.y);
     connect(wf, manual, simTrig);
 
-    // Init
     const init = addSet(
       wf,
       'Init Context',
@@ -529,14 +476,12 @@
     );
     connect(wf, simTrig, init);
 
-    // Optional prefetch
     let cursor = init;
-    if (archetype==='APPOINTMENT_SCHEDULING' && features.has('pms')){
+    if (archetype==='APPOINTMENT_SCHEDULING' && deriveFeatures(scenario).has('pms')){
       const fetch = addHTTP(wf, 'Fetch · Upcoming (PMS)', `={{'${DEFAULT_HTTP.pms_upcoming}'}}`, '={{$json}}', LAYOUT.start.x + 3*LAYOUT.stepX, LAYOUT.start.y);
       connect(wf, cursor, fetch); cursor = fetch;
     }
 
-    // Branch switch
     const sw = addSwitch(
       wf,
       'Branch',
@@ -547,7 +492,6 @@
     );
     connect(wf, cursor, sw);
 
-    // Communication stage
     const commX = LAYOUT.start.x + Math.floor(2.0*LAYOUT.stepX);
     const commStage = (y)=> addSet(wf, 'Communication (Stage)', { '__stage':'={{\"communication\"}}' }, commX, y);
 
@@ -559,30 +503,12 @@
       const comm = commStage(bY);
       connect(wf, sw, comm, bIdx);
 
-      // sprinkle systems (deterministic)
       let pre = comm;
-      const sysList = ['kb','crm','calendar','pms','ats','wms','erp','bi'].filter(s=>features.has(s));
-      const sysCount = Math.min(sysList.length, seed.idx===0?1:(seed.idx===1?2:1));
-      for(let i=0;i<sysCount;i++){
-        const sx = commX + Math.floor(0.7*LAYOUT.stepX) + i*Math.floor(0.7*LAYOUT.stepX);
-        const sys = sysList[i];
-        const node = ({
-          'crm': ()=> addHTTP(wf,'CRM · Upsert/Log', `={{'https://example.com/crm/upsert'}}`, '={{$json}}', sx, bY),
-          'pms': ()=> addHTTP(wf,'PMS · Update/Confirm', `={{'${DEFAULT_HTTP.pms_update}'}}`, '={{$json}}', sx, bY),
-          'calendar': ()=> addHTTP(wf,'Calendar · Book', `={{'${DEFAULT_HTTP.calendar_book}'}}`, '={{$json}}', sx, bY),
-          'kb': ()=> addHTTP(wf,'KB · Search', `={{'https://example.com/kb/search'}}`, '={{$json}}', sx, bY),
-          'ats': ()=> addHTTP(wf,'ATS · Update', `={{'https://example.com/ats/update'}}`, '={{$json}}', sx, bY),
-          'wms': ()=> addHTTP(wf,'WMS · Levels', `={{'https://example.com/wms/levels'}}`, '={{$json}}', sx, bY),
-          'erp': ()=> addHTTP(wf,'ERP · PO/Invoice', `={{'https://example.com/erp/op'}}`, '={{$json}}', sx, bY),
-          'bi': ()=> addHTTP(wf,'BI · Push', `={{'https://example.com/bi/push'}}`, '={{$json}}', sx, bY)
-        }[sys]||(()=>addSet(wf,`System · ${sys}`,{'__sys':`={{'${sys}'}}`},sx,bY)))();
-        connect(wf, pre, node); pre=node;
-      }
 
+      const channels = normalizeChannels(null, seed.flip);
       const chFirstY = (count)=> bY - Math.floor(LAYOUT.channelY * (count-1)/2);
       let prevRowCollector=null;
 
-      const channels = normalizeChannels(null, seed.flip);
       channels.forEach((ch, chIdx)=>{
         const rowY = chFirstY(channels.length) + chIdx*LAYOUT.channelY;
 
@@ -609,14 +535,8 @@
             const node = addSet(wf, title, { 'message':`={{"${body}"}}`, 'subject':`={{'${subject}'}}` }, x, y);
             connect(wf, prev, node); prev=node; return;
           }
-          if (kind==='book'){
-            const node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.calendar_book}'}}`, '={{$json}}', x, y);
-            connect(wf, prev, node); prev=node; return;
-          }
-          if (kind==='ticket'){
-            const node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.ticket_create}'}}`, '={{$json}}', x, y);
-            connect(wf, prev, node); prev=node; return;
-          }
+          if (kind==='book'){ const node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.calendar_book}'}}`, '={{$json}}', x, y); connect(wf, prev, node); prev=node; return; }
+          if (kind==='ticket'){ const node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.ticket_create}'}}`, '={{$json}}', x, y); connect(wf, prev, node); prev=node; return; }
           if (kind==='http'){
             let url = DEFAULT_HTTP.step_generic;
             if (/kyc/i.test(st.name||'')) url = DEFAULT_HTTP.kyc;
@@ -629,16 +549,12 @@
             const node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.step_generic}'}}`, '={{$json}}', x, y);
             connect(wf, prev, node); prev=node; return;
           }
-          if (kind==='wait'){
-            const node = addWait(wf, title, x, y, 90);
-            connect(wf, prev, node); prev=node; return;
-          }
-          const node = addSet(wf, title, { '__note':`={{'pass'}}` }, x, y);
-          connect(wf, prev, node); prev=node;
+          if (kind==='wait'){ const node = addWait(wf, title, x, y, 90); connect(wf, prev, node); prev=node; return; }
+          const node = addSet(wf, title, { '__note':`={{'pass'}}` }, x, y); connect(wf, prev, node); prev=node;
         };
 
+        // Walk steps with explicit outcome spacing + branch bridge
         const walk = (steps, baseX, baseY)=>{
-          // Pre-reserve outcome rows so they keep order and never overlap
           const reserveOutcomeRow = (ox, oy)=> reserveBlock(wf, ox, oy, FOOTPRINT.w, FOOTPRINT.h);
 
           for (let i=0;i<steps.length;i++){
@@ -650,8 +566,7 @@
               const oys = st.outcomes.map((_o, oi)=>
                 baseY - Math.floor((st.outcomes.length-1)/2)*LAYOUT.outcomeRowY + oi*LAYOUT.outcomeRowY
               );
-              // Reserve at the column where outcome enter nodes will be placed
-              const oEnterX = x + Math.floor(LAYOUT.stepX*0.6);
+              const oEnterX = x + Math.floor(LAYOUT.stepX*0.7);
               oys.forEach(oy => reserveOutcomeRow(oEnterX, oy));
 
               const title = `[${++stepIndex}] ${st.name||'Decision'} (Decision)`;
@@ -668,32 +583,33 @@
                 let prevLocal = oEnter;
                 (Array.isArray(o.steps)?o.steps:[]).forEach((os, ok)=>{
                   const ox = oEnterX + (ok+1)*Math.floor(LAYOUT.stepX*1.0);
-                  const oySame = oy;
-                  const beforePrev = prev;
-                  prev = prevLocal;
-                  runStep({ ...os, name:`${os.name||'Step'}`.replace(/^\[\d+\].\s*/,'') }, ox, oySame);
+                  runStep({ ...os, name:`${os.name||'Step'}`.replace(/^\[\d+\].\s*/,'') }, ox, oy);
+                  // runStep sets and uses `prev`, so patch local chain:
                   prevLocal = prev;
-                  prev = beforePrev;
                 });
 
                 const sendX = oEnterX + Math.max(2,(o.steps||[]).length+1)*Math.floor(LAYOUT.stepX*1.0);
                 const sender = makeSender(wf, ch, sendX, oy);
-                try {
-                  const idx = wf.nodes.findIndex(n=>n.name===sender);
-                  if (idx>=0) wf.nodes[idx].name = `[${stepIndex}.${oi+1}] Send · ${ch.toUpperCase()}`;
-                } catch {}
+                try{ const idx = wf.nodes.findIndex(n=>n.name===sender); if (idx>=0) wf.nodes[idx].name = `[${stepIndex}.${oi+1}] Send · ${ch.toUpperCase()}`;}catch{}
                 connect(wf, (o.steps&&o.steps.length)?prevLocal:oEnter, sender);
-                let oCol = addCollector(wf, sendX + Math.floor(LAYOUT.stepX*0.8), oy);
+
+                const oCol = addCollector(wf, sendX + Math.floor(LAYOUT.stepX*0.85), oy);
                 connect(wf, sender, oCol);
 
-                if (chain) connect(wf, chain, oCol);
+                if(chain) connect(wf, chain, oCol);
                 chain = oCol;
-                if (oi === st.outcomes.length-1){ prev = chain; }
+
+                // after the last outcome, add a visible bridge so n8n shows a right-side connection from the decision path
+                if (oi === st.outcomes.length-1){
+                  const bridge = addSet(wf, `[${stepIndex}] Branch Continuation`, { '__bridge':'={{true}}' }, sendX + Math.floor(LAYOUT.stepX*0.8), baseY + (LAYOUT.outcomeRowY/2) - GRID.cellH);
+                  connect(wf, chain, bridge);
+                  prev = bridge;
+                }
               });
             } else {
               runStep(st, x, baseY);
               if (seed.wait && i===0) {
-                const wait = addWait(wf,'[pause] jitter', x + Math.floor(LAYOUT.stepX*0.5), baseY, 60);
+                const wait = addWait(wf,'[pause] jitter', x + Math.floor(LAYOUT.stepX*0.4), baseY, 60);
                 connect(wf, prev, wait); prev = wait;
               }
             }
@@ -703,17 +619,13 @@
         const steps = Array.isArray(branch.steps)?branch.steps:[];
         walk(steps, commX + 2*LAYOUT.stepX, rowY);
 
-        // Final send+collect when last step wasn't a decision
         const lastIsDecision = steps.some(st=>String(st.kind||'').toLowerCase()==='decision');
         if (!lastIsDecision){
           const sendX = commX + 2*LAYOUT.stepX + Math.max(1, steps.length)*LAYOUT.stepX;
           const sender = makeSender(wf, ch, sendX, rowY);
-          try{
-            const idx = wf.nodes.findIndex(n=>n.name===sender);
-            if(idx>=0) wf.nodes[idx].name = `[${++stepIndex}] Send · ${ch.toUpperCase()}`;
-          }catch{}
+          try{ const idx = wf.nodes.findIndex(n=>n.name===sender); if(idx>=0) wf.nodes[idx].name = `[${++stepIndex}] Send · ${ch.toUpperCase()}`; }catch{}
           connect(wf, prev, sender);
-          const col = addCollector(wf, sendX + Math.floor(LAYOUT.stepX*0.85), rowY);
+          const col = addCollector(wf, sendX + Math.floor(LAYOUT.stepX*0.9), rowY);
           connect(wf, sender, col);
           if (prevRowCollector) connect(wf, prevRowCollector, col);
           prevRowCollector = col;
@@ -723,28 +635,20 @@
       });
     });
 
-    // Error lane
     if (lastCollector){
-      const errY = LAYOUT.start.y + LAYOUT.channelY + 260;
+      const errY = LAYOUT.start.y + LAYOUT.channelY + 360;
       addHeader(wf, 'ERROR AREA', LAYOUT.start.x + 3*LAYOUT.stepX, errY - 90);
       let e = addSet(wf, 'Error Monitor', { '__err':'={{true}}' }, LAYOUT.start.x + 4*LAYOUT.stepX, errY);
       connect(wf, lastCollector, e);
-      if (seed.idx!==2){
-        const retry = addSet(wf, 'Retry Policy', { '__retry':'={{true}}' }, LAYOUT.start.x + 5*LAYOUT.stepX, errY);
-        connect(wf, e, retry); e = retry;
-      }
+      const retry = addSet(wf, 'Retry Policy', { '__retry':'={{true}}' }, LAYOUT.start.x + 5*LAYOUT.stepX, errY);
+      connect(wf, e, retry); e = retry;
       const notify = addHTTP(wf, 'Notify · Ops', `={{'${DEFAULT_HTTP.ops_alert}'}}`, '={{$json}}', LAYOUT.start.x + 6*LAYOUT.stepX, errY);
       connect(wf, e, notify);
     }
 
     wf.staticData.__design = {
-      archetype, trigger: triggerKind, channels,
-      features: Array.from(features.values()),
-      layout:{
-        stepX:LAYOUT.stepX, channelY:LAYOUT.channelY, outcomeRowY:LAYOUT.outcomeRowY,
-        grid:{w:GRID.cellW,h:GRID.cellH}, footprint:FOOTPRINT, antiOverlap:'block'
-      },
-      notes:'Block-occupancy prevents masking; outcomes are pre-reserved so vertical order is exact.'
+      layout:{ stepX:LAYOUT.stepX, channelY:LAYOUT.channelY, outcomeRowY:LAYOUT.outcomeRowY, grid:GRID, footprint:FOOTPRINT, antiOverlap:'block' },
+      notes:'Switch→Outcome connections are explicit; outcomes pre-reserve rows so 3.1/3.2 never mask.'
     };
     return wf;
   }

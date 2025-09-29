@@ -1,9 +1,10 @@
 // public/builder.js
 // Compact, aligned, per-scenario-diverse n8n workflow builder with NO overlaps.
-// - Global occupancy grid prevents superposition anywhere on the canvas.
-// - Outcome rows keep strict vertical order (3.1.1 above 3.1.2, etc.).
-// - No "?" icons: Set/HTTP/Wait/Switch only.
-// - Deterministic diversity (hash of scenario) for branches, guards, depth, etc.
+// Improvements in this version:
+//  • Wider spacing (stepX/channelY/outcomeRowY) to ensure readability.
+//  • Global block-occupancy grid (reserve rectangle, not a point) => no masking.
+//  • Outcome rows pre-reserved to keep strict vertical order (3.1.1 above 3.1.2).
+//  • Only linkable nodes (Set/HTTP/Wait/Switch); no "?" placeholders.
 // Exposes: window.Builder.buildWorkflowJSON(scenario, industry, { selectedChannel })
 
 (function () {
@@ -11,14 +12,17 @@
 
   // ---------- Layout ----------
   const LAYOUT = {
-    stepX: 280,        // ~2–3cm apart depending on zoom
-    channelY: 220,
-    outcomeRowY: 200,
-    header: { x: -860, y: 40 },
-    start:  { x: -820, y: 220 },
-    switchX: -520
+    stepX: 340,        // wider horizontal gaps (~2–3cm on common zoom)
+    channelY: 260,     // vertical gap between channels
+    outcomeRowY: 240,  // vertical gap between decision outcomes
+    header: { x: -900, y: 40 },
+    start:  { x: -860, y: 240 },
+    switchX: -560
   };
-  const GRID = { cellH: 54, cellW: 40 }; // snap size
+
+  // Grid & node “footprint” (so we never place two nodes on top of each other)
+  const GRID = { cellH: 70, cellW: 80 };   // snap granularity
+  const FOOTPRINT = { w: 2, h: 1 };        // each node reserves a 2×1 block of cells
 
   const DEFAULT_HTTP = {
     pms_upcoming: "https://example.com/pms/upcoming",
@@ -147,7 +151,7 @@
     return f;
   }
 
-  // ---------- Global occupancy grid (no overlaps) ----------
+  // ---------- Global block-occupancy grid (no overlaps) ----------
   function baseWorkflow(name){
     return { name, nodes:[], connections:{}, active:false, settings:{}, staticData:{}, __occ:new Set() };
   }
@@ -157,27 +161,39 @@
     while(existing.has(name.toLowerCase())){ i++; name = `${base} #${i}`; }
     return name;
   }
-  function occKey(x,y){ return `${x}:${y}`; }
-  function findFreeY(wf, x, desiredY){
+  function key(x,y){ return `${x}:${y}`; }
+  function blockCells(x, y, w=FOOTPRINT.w, h=FOOTPRINT.h){
+    const sx = snapX(x), sy = snapY(y);
+    const cells = [];
+    for(let dx=0;dx<w;dx++){
+      for(let dy=0;dy<h;dy++){
+        cells.push(key(sx + dx*GRID.cellW, sy + dy*GRID.cellH));
+      }
+    }
+    return cells;
+  }
+  function blockFree(wf, x, y, w=FOOTPRINT.w, h=FOOTPRINT.h){
+    const cells = blockCells(x,y,w,h);
+    return cells.every(c=>!wf.__occ.has(c));
+  }
+  function reserveBlock(wf, x, y, w=FOOTPRINT.w, h=FOOTPRINT.h){
+    blockCells(x,y,w,h).forEach(c=>wf.__occ.add(c));
+    return [snapX(x), snapY(y)];
+  }
+  function findFreeY(wf, x, desiredY, w=FOOTPRINT.w, h=FOOTPRINT.h){
     const sx = snapX(x);
     let y = snapY(desiredY);
     const step = GRID.cellH;
-    // scan down until slot is empty
-    while (wf.__occ.has(occKey(sx,y))) { y += step; }
+    while (!blockFree(wf, sx, y, w, h)) { y += step; }
     return y;
-  }
-  function reserve(wf, x, y){
-    const sx = snapX(x), sy = snapY(y);
-    wf.__occ.add(occKey(sx, sy));
-    return [sx, sy];
   }
   function addNode(wf,node){
     node.name = uniqueName(wf, node.name);
     if(Array.isArray(node.position)){
       const x=snapX(node.position[0]);
-      const y=findFreeY(wf, x, node.position[1]);
+      const y=findFreeY(wf, x, node.position[1], FOOTPRINT.w, FOOTPRINT.h);
       node.position=[x,y];
-      reserve(wf, x, y);
+      reserveBlock(wf, x, y, FOOTPRINT.w, FOOTPRINT.h);
     }
     wf.nodes.push(node); return node.name;
   }
@@ -188,7 +204,7 @@
     wf.connections[from].main[outputIndex].push({ node: to, type: "main", index: 0 });
   }
 
-  // ---------- Palette (no “?” icons) ----------
+  // ---------- Palette ----------
   function addHeader(wf,label,x,y){
     return addNode(wf,{
       id:uid('label'),
@@ -229,7 +245,7 @@
     return addNode(wf,{ id:uid('switch'), name, type:'n8n-nodes-base.switch', typeVersion:2, position:pos(x,y),
       parameters:{ value1:valueExpr, rules:safe }});
   }
-  function addWait(wf,name,x,y,seconds=60){
+  function addWait(wf,name,x,y,seconds=90){
     return addNode(wf,{ id:uid('wait'), name, type:'n8n-nodes-base.wait', typeVersion:1, position:pos(x,y),
       parameters:{ amount: seconds, unit:'seconds', options:{} }});
   }
@@ -239,7 +255,10 @@
   function makeSender(wf, channel, x, y){
     if(channel==='whatsapp'){
       return addNode(wf,{ id:uid('wa'), name:'Send WhatsApp (Twilio)', type:'n8n-nodes-base.twilio', typeVersion:3, position:pos(x,y),
-        parameters:{ resource:'message', operation:'create', from:"={{'whatsapp:' + ($json.waFrom||'+10000000002')}}", to:"={{'whatsapp:' + ($json.to||'+10000000003')}}", message:"={{$json.message||'Hello!'}}" }, credentials:{} });
+        parameters:{ resource:'message', operation:'create',
+          from:"={{'whatsapp:' + ($json.waFrom||'+10000000002')}}",
+          to:"={{'whatsapp:' + ($json.to||'+10000000003')}}",
+          message:"={{$json.message||'Hello!'}}" }, credentials:{} });
     }
     if(channel==='call'){
       return addHTTP(wf,'Place Call', "={{$json.callWebhook||'https://example.com/call'}}",
@@ -259,7 +278,7 @@
     };
     const opener = { whatsapp:'Heads up:', call:'Talk track:' }[channel] || 'Note:';
     const cta = { whatsapp:'Reply to confirm or change.', call:'Say “confirm” or “reschedule”.' }[channel] || 'Reply to proceed.';
-    const lines = (...xs)=> xs.filter(Boolean).slice(0,6).join('\\n');
+    const lines = (...xs)=> xs.filter(Boolean).slice(0,6).join('\n');
 
     switch(archetype){
       case 'APPOINTMENT_SCHEDULING':
@@ -274,6 +293,13 @@
   }
 
   // ---------- Archetype variants ----------
+  const amplify = (branches)=> (branches||[]).map(b=>{
+    const extra = { name:'Store · Audit trail', kind:'store' };
+    const dup = JSON.parse(JSON.stringify(b));
+    dup.steps = (dup.steps||[]).concat([extra]);
+    return dup;
+  });
+
   function playsScheduling(features, deep, approvals){
     const base = [{
       name:'Scheduling',
@@ -457,14 +483,6 @@
     const plays = [a,b,c];
     return deep ? plays.map(amplify) : plays;
   }
-  function amplify(branches){
-    return (branches||[]).map(b=>{
-      const extra = { name:'Store · Audit trail', kind:'store' };
-      const dup = JSON.parse(JSON.stringify(b));
-      dup.steps = (dup.steps||[]).concat([extra]);
-      return dup;
-    });
-  }
 
   // ---------- Build ----------
   function buildWorkflowJSON(scenario, industry, opts = {}){
@@ -531,7 +549,7 @@
 
     // Communication stage
     const commX = LAYOUT.start.x + Math.floor(2.0*LAYOUT.stepX);
-    const commStage = (y)=> addSet(wf, 'Communication (Stage)', { '__stage':'={{"communication"}}' }, commX, y);
+    const commStage = (y)=> addSet(wf, 'Communication (Stage)', { '__stage':'={{\"communication\"}}' }, commX, y);
 
     const baseY = (i, total)=> LAYOUT.start.y - Math.floor(LAYOUT.channelY * (Math.max(total,1)-1)/2) + i*LAYOUT.channelY;
     let lastCollector=null;
@@ -546,7 +564,7 @@
       const sysList = ['kb','crm','calendar','pms','ats','wms','erp','bi'].filter(s=>features.has(s));
       const sysCount = Math.min(sysList.length, seed.idx===0?1:(seed.idx===1?2:1));
       for(let i=0;i<sysCount;i++){
-        const sx = commX + Math.floor(0.6*LAYOUT.stepX) + i*Math.floor(0.6*LAYOUT.stepX);
+        const sx = commX + Math.floor(0.7*LAYOUT.stepX) + i*Math.floor(0.7*LAYOUT.stepX);
         const sys = sysList[i];
         const node = ({
           'crm': ()=> addHTTP(wf,'CRM · Upsert/Log', `={{'https://example.com/crm/upsert'}}`, '={{$json}}', sx, bY),
@@ -620,19 +638,21 @@
         };
 
         const walk = (steps, baseX, baseY)=>{
-          // Reserve outcome rows first (so order never gets pushed upward)
-          const reserveOutcomeRow = (oy)=> reserve(wf, baseX, oy);
+          // Pre-reserve outcome rows so they keep order and never overlap
+          const reserveOutcomeRow = (ox, oy)=> reserveBlock(wf, ox, oy, FOOTPRINT.w, FOOTPRINT.h);
+
           for (let i=0;i<steps.length;i++){
             const st = steps[i] || {};
             const x = baseX + i*LAYOUT.stepX;
             const kind = String(st.kind||'').toLowerCase();
 
             if (kind==='decision' && Array.isArray(st.outcomes) && st.outcomes.length){
-              // Pre-reserve each outcome row to avoid another column taking its slot
               const oys = st.outcomes.map((_o, oi)=>
                 baseY - Math.floor((st.outcomes.length-1)/2)*LAYOUT.outcomeRowY + oi*LAYOUT.outcomeRowY
               );
-              oys.forEach(oy => reserveOutcomeRow(snapY(oy)));
+              // Reserve at the column where outcome enter nodes will be placed
+              const oEnterX = x + Math.floor(LAYOUT.stepX*0.6);
+              oys.forEach(oy => reserveOutcomeRow(oEnterX, oy));
 
               const title = `[${++stepIndex}] ${st.name||'Decision'} (Decision)`;
               const rules = st.outcomes.map(o=>({operation:'equal', value2:String(o.value||'path').slice(0,64)}));
@@ -641,22 +661,22 @@
 
               let chain=null;
               st.outcomes.forEach((o, oi)=>{
-                const oy = oys[oi]; // exact reserved Y
-                const oEnter = addSet(wf, `[${stepIndex}.${oi+1}] Outcome · ${o.value||'path'}`, { '__decision':`={{'${String(o.value||'path')}'}}` }, x + Math.floor(LAYOUT.stepX*0.55), oy);
+                const oy = oys[oi];
+                const oEnter = addSet(wf, `[${stepIndex}.${oi+1}] Outcome · ${o.value||'path'}`, { '__decision':`={{'${String(o.value||'path')}'}}` }, oEnterX, oy);
                 connect(wf, dsw, oEnter, oi);
 
                 let prevLocal = oEnter;
                 (Array.isArray(o.steps)?o.steps:[]).forEach((os, ok)=>{
-                  const ox = x + Math.floor(LAYOUT.stepX*0.55) + (ok+1)*Math.floor(LAYOUT.stepX*1.0);
+                  const ox = oEnterX + (ok+1)*Math.floor(LAYOUT.stepX*1.0);
                   const oySame = oy;
-                  const beforePrev = prev;   // stash outer prev
-                  prev = prevLocal;          // run step on local chain
+                  const beforePrev = prev;
+                  prev = prevLocal;
                   runStep({ ...os, name:`${os.name||'Step'}`.replace(/^\[\d+\].\s*/,'') }, ox, oySame);
-                  prevLocal = prev;          // update local
-                  prev = beforePrev;         // restore outer prev for next outcome wires
+                  prevLocal = prev;
+                  prev = beforePrev;
                 });
 
-                const sendX = x + Math.floor(LAYOUT.stepX*0.55) + Math.max(2,(o.steps||[]).length+1)*Math.floor(LAYOUT.stepX*1.0);
+                const sendX = oEnterX + Math.max(2,(o.steps||[]).length+1)*Math.floor(LAYOUT.stepX*1.0);
                 const sender = makeSender(wf, ch, sendX, oy);
                 try {
                   const idx = wf.nodes.findIndex(n=>n.name===sender);
@@ -673,7 +693,7 @@
             } else {
               runStep(st, x, baseY);
               if (seed.wait && i===0) {
-                const wait = addWait(wf,'[pause] jitter', x + Math.floor(LAYOUT.stepX*0.5), baseY, 45);
+                const wait = addWait(wf,'[pause] jitter', x + Math.floor(LAYOUT.stepX*0.5), baseY, 60);
                 connect(wf, prev, wait); prev = wait;
               }
             }
@@ -705,8 +725,8 @@
 
     // Error lane
     if (lastCollector){
-      const errY = LAYOUT.start.y + LAYOUT.channelY + 220;
-      addHeader(wf, 'ERROR AREA', LAYOUT.start.x + 3*LAYOUT.stepX, errY - 80);
+      const errY = LAYOUT.start.y + LAYOUT.channelY + 260;
+      addHeader(wf, 'ERROR AREA', LAYOUT.start.x + 3*LAYOUT.stepX, errY - 90);
       let e = addSet(wf, 'Error Monitor', { '__err':'={{true}}' }, LAYOUT.start.x + 4*LAYOUT.stepX, errY);
       connect(wf, lastCollector, e);
       if (seed.idx!==2){
@@ -720,9 +740,11 @@
     wf.staticData.__design = {
       archetype, trigger: triggerKind, channels,
       features: Array.from(features.values()),
-      seed,
-      layout:{ stepX:LAYOUT.stepX, channelY:LAYOUT.channelY, outcomeRowY:LAYOUT.outcomeRowY, grid:{w:GRID.cellW,h:GRID.cellH}, align:'strict-grid', antiOverlap:true },
-      notes:'Global occupancy grid ensures no superposition; outcomes reserved to preserve vertical order.'
+      layout:{
+        stepX:LAYOUT.stepX, channelY:LAYOUT.channelY, outcomeRowY:LAYOUT.outcomeRowY,
+        grid:{w:GRID.cellW,h:GRID.cellH}, footprint:FOOTPRINT, antiOverlap:'block'
+      },
+      notes:'Block-occupancy prevents masking; outcomes are pre-reserved so vertical order is exact.'
     };
     return wf;
   }

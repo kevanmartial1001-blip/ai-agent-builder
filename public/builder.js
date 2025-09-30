@@ -1,15 +1,26 @@
 // public/builder.js
-// Chain-of-Agents in ONE LINE (main row): Trigger → Init → Context → [StepAgent → JSON → Run → Record] × N → Summary
+// Chain-of-Agents — ONE LINE layout with fixed horizontal spacing (no overlaps)
 
 (function () {
   "use strict";
 
-  // ===== Layout =====
-  const L = { stepX: 320, header: { x: -900, y: 40 }, start: { x: -860, y: 240 } };
-  const GRID = { cellH: 70, cellW: 80 };
+  // ===== Layout (fixed spans) =====
+  const L = {
+    ROW_Y: 240,
+    HEADER: { x: -900, y: 40 },
+    START_X: -860
+  };
+  // Horizontal spacing config (tune SPAN to taste)
+  const H = {
+    SPAN: 320,                  // base horizontal gap between nodes
+    OFF_AGENT: 0,               // Agent at baseX + 0
+    OFF_VALIDATOR: 1,           // +1×SPAN
+    OFF_RUN: 2,                 // +2×SPAN
+    OFF_RECORD: 3,              // +3×SPAN
+    GROUP_GAP: 4                // next group starts at +4×SPAN
+  };
 
-  // ===== Internal line-mode switch (set per build) =====
-  let __lineMode = true;
+  const GRID = { cellH: 70, cellW: 80 };
 
   // ===== Utils =====
   const uid  = (p)=>`${p}_${Math.random().toString(36).slice(2,10)}`;
@@ -27,23 +38,13 @@
     const ex=new Set((wf.nodes||[]).map(n=>String(n.name||'').toLowerCase()));
     let nm=base||'Node', i=1; while(ex.has(nm.toLowerCase())){ i++; nm=`${base} #${i}`;} return nm;
   }
-
-  // Occupancy helpers (kept minimal; ignored in line mode)
-  function key(x,y){ return `${x}:${y}`; }
-  function reserve(wf,x,y){ wf.__occ.add(key(x,y)); }
-  function nextFreeY(wf,x,y){
-    if (__lineMode) return y; // <-- stay on the same row
-    let cy = y; while (wf.__occ.has(key(x,cy))) cy += GRID.cellH; return cy;
-  }
-
   function addNode(wf,node){
     node.name = uniqueName(wf,node.name);
     if (Array.isArray(node.position)){
+      // force same row; never bump vertically
       const x = sX(node.position[0]);
-      const desiredY = sY(node.position[1]);
-      const y = nextFreeY(wf, x, desiredY);
+      const y = sY(node.position[1]);
       node.position = [x, y];
-      reserve(wf, x, y);
     }
     wf.nodes.push(node); return node.name;
   }
@@ -70,7 +71,7 @@
     type:"@n8n/n8n-nodes-langchain.agent", typeVersion:2.2, position:pos(x,y),
     parameters:{ promptType:"define", text:user, hasOutputParser:true, options:{ systemMessage:`=${sys}` } }});
   const validator= (wf,name,x,y)=> addNode(wf,{ id:uid('code'), name:`${name} · JSON Validator`,
-    type:"n8n-nodes-base.code", typeVersion:2, position:pos(x+300,y),
+    type:"n8n-nodes-base.code", typeVersion:2, position:pos(x,y),
     parameters:{ jsCode:`const out=$json.output??$json; if(!out||typeof out!=='object'||Array.isArray(out)) throw new Error('Invalid JSON'); return [out];` }});
 
   // ===== Contracts =====
@@ -79,14 +80,13 @@
 
   // ===== Prompts =====
   const sysContext = `You are 🧠 Context. Convert scenario into ${SCHEMA_CONTEXT}. JSON only.`;
-  const sysStep    = `You are a specialist agent for this step. Return ${SCHEMA_STEP}. Keep 'title' short & scenario-specific. Use channel_bundle for messages. JSON only.`;
+  const sysStep    = `You are a specialist step agent. Return ${SCHEMA_STEP}. Keep 'title' short & scenario-specific. Use channel_bundle for messages. JSON only.`;
 
   const userContext = (s,i)=> `=Make ${SCHEMA_CONTEXT} from:\n${JSON.stringify({
     scenario_id: s.scenario_id||'', name: s.name||'', triggers:s.triggers||'',
     aim: s.roi_hypothesis||'', risk_notes:s.risk_notes||'',
     industry: i?.industry_id||'', tags: (s["tags (;)"]||s.tags||'').toString()
   },null,2)}`;
-
   const userStep = (name)=> `=Step "${name}". Input:\n{{$json}}\nReturn ${SCHEMA_STEP}.`;
 
   // ===== Runner / Record =====
@@ -118,78 +118,108 @@ return go().then(r=>[{...$json,__exec:r}]);`
     });
   }
 
-  // ===== One step agent (Agent → JSON) =====
-  function addStepAgent(wf, x, y, stepName){
+  // ===== Build one step agent at baseX =====
+  function addStepGroup(wf, baseX, y, stepName){
+    // Agent (with model/parser below automatically)
     const role = `🧩 ${stepName} Agent`;
-    const lm   = modelLm(wf, role, x, y);
-    const prs  = parser(wf, role, x, y, SCHEMA_STEP);
-    const ag   = agentNode(wf, role, x, y, sysStep, userStep(stepName));
+    const agentX = baseX + H.SPAN * H.OFF_AGENT;
+    const valX   = baseX + H.SPAN * H.OFF_VALIDATOR;
+    const runX   = baseX + H.SPAN * H.OFF_RUN;
+    const recX   = baseX + H.SPAN * H.OFF_RECORD;
+
+    const lm   = modelLm(wf, role, agentX, y);
+    const prs  = parser(wf, role, agentX, y, SCHEMA_STEP);
+    const ag   = agentNode(wf, role, agentX, y, sysStep, userStep(stepName));
     wf.connections[lm]  = { ai_languageModel: [[{ node: ag, type:"ai_languageModel", index:0 }]] };
     wf.connections[prs] = { ai_outputParser:  [[{ node: ag, type:"ai_outputParser",  index:0 }]] };
-    const val  = validator(wf, role, x, y);
+    const val  = validator(wf, role, valX, y);
     connect(wf, ag, val);
-    return { in: ag, out: val };
+
+    const run  = addRunner(wf, runX, y, stepName);
+    connect(wf, val, run);
+
+    const rec  = addRecord(wf, recX, y, stepName, { scenario_id:'' });
+    connect(wf, run, rec);
+
+    return { agentIn: ag, out: rec };
   }
 
-  // ===== Build main (single line) =====
+  // ===== Main build (single row, fixed spacing) =====
   function buildWorkflowJSON(scenario, industry, opts={}){
-    __lineMode = (opts.layout ?? 'line') === 'line'; // force one line by default
-
     const steps = (opts.steps?.length ? opts.steps : ['Research','Compose Message','Dispatch']).slice(0,6);
 
     const title = `${scenario?.scenario_id||'Scenario'} — ${scenario?.name||''}`.trim();
     const wf = baseWorkflow(title);
 
     // Header
-    header(wf, 'FLOW · ONE LINE', L.header.x, L.header.y);
+    header(wf, 'FLOW · ONE LINE · FIXED SPACING', L.HEADER.x, L.HEADER.y);
 
-    // Row Y fixed
-    const ROW_Y = L.start.y;
+    const y = L.ROW_Y;
+    let x = L.START_X;
 
-    // Trigger + Init
-    const trig = manual(wf, L.start.x, ROW_Y);
+    // Trigger
+    const trig = manual(wf, x, y);
+    x += H.SPAN; // spacing to next
     const init = setNode(wf,'Init',{
       'scenario.id': `={{'${scenario.scenario_id||''}'}}`,
       'scenario.name': `={{'${(scenario.name||'').replace(/'/g,"\\'")}'}}`,
       'industry.id': `={{'${industry?.industry_id||''}'}}`
-    }, L.start.x + L.stepX, ROW_Y);
+    }, x, y);
     connect(wf, trig, init);
 
-    // 🧠 Context (main box stays on the line; model/parser render below automatically)
-    const ctxLm  = modelLm(wf,'🧠 Context', L.start.x + 2*L.stepX, ROW_Y);
-    const ctxPr  = parser(wf,'🧠 Context',  L.start.x + 2*L.stepX, ROW_Y, SCHEMA_CONTEXT);
-    const ctxAg  = agentNode(wf,'🧠 Context', L.start.x + 2*L.stepX, ROW_Y, sysContext, userContext(scenario, industry));
+    // Context group (Agent + Validator)
+    x += H.SPAN;
+    const ctxRole = '🧠 Context';
+    const ctxLm  = modelLm(wf, ctxRole, x + H.SPAN*H.OFF_AGENT, y);
+    const ctxPr  = parser(wf, ctxRole, x + H.SPAN*H.OFF_AGENT, y, SCHEMA_CONTEXT);
+    const ctxAg  = agentNode(wf, ctxRole, x + H.SPAN*H.OFF_AGENT, y, sysContext, userContext(scenario, industry));
     wf.connections[ctxLm] = { ai_languageModel: [[{ node: ctxAg, type:"ai_languageModel", index:0 }]] };
     wf.connections[ctxPr] = { ai_outputParser:  [[{ node: ctxAg, type:"ai_outputParser",  index:0 }]] };
-    const ctxVal = validator(wf,'🧠 Context', L.start.x + 2*L.stepX, ROW_Y);
+    const ctxVal = validator(wf, ctxRole, x + H.SPAN*H.OFF_VALIDATOR, y);
     connect(wf, ctxAg, ctxVal);
     connect(wf, init, ctxAg);
 
-    // Steps in a straight line
-    let x = L.start.x + 3*L.stepX;
+    // Chain steps — each block uses fixed offsets so nothing overlaps
+    x += H.SPAN * H.GROUP_GAP;
     let cursor = ctxVal;
 
     steps.forEach((name, i)=>{
-      const step = addStepAgent(wf, x, ROW_Y, name);
-      connect(wf, cursor, step.in);
+      // build the group
+      const baseX = x;
+      // step group returns nodes, but we need scenario name in Record label—simplify by setting later
+      const role = `🧩 ${name} Agent`;
+      const agentX = baseX + H.SPAN * H.OFF_AGENT;
+      const valX   = baseX + H.SPAN * H.OFF_VALIDATOR;
+      const runX   = baseX + H.SPAN * H.OFF_RUN;
+      const recX   = baseX + H.SPAN * H.OFF_RECORD;
 
-      const run = addRunner(wf, x + L.stepX*0.95, ROW_Y, `${i+1}. ${name}`);
-      connect(wf, step.out, run);
+      const lm   = modelLm(wf, role, agentX, y);
+      const prs  = parser(wf, role, agentX, y, SCHEMA_STEP);
+      const ag   = agentNode(wf, role, agentX, y, sysStep, userStep(name));
+      wf.connections[lm]  = { ai_languageModel: [[{ node: ag, type:"ai_languageModel", index:0 }]] };
+      wf.connections[prs] = { ai_outputParser:  [[{ node: ag, type:"ai_outputParser",  index:0 }]] };
+      const val  = validator(wf, role, valX, y);
+      connect(wf, ag, val);
 
-      const rec = addRecord(wf, x + L.stepX*1.85, ROW_Y, `${i+1}. ${name}`, scenario);
+      connect(wf, cursor, ag);
+
+      const run  = addRunner(wf, runX, y, `${i+1}. ${name}`);
+      connect(wf, val, run);
+
+      const rec  = addRecord(wf, recX, y, `${i+1}. ${name}`, scenario);
       connect(wf, run, rec);
 
       cursor = rec;
-      x += L.stepX*2.2; // widen spacing so all boxes line up and breathe
+      x += H.SPAN * H.GROUP_GAP;
     });
 
-    // Summary (still on the same row)
-    const summary = setNode(wf,'🧾 Summary',{ '__stage':'={{"done"}}' }, x, ROW_Y);
+    // Summary
+    const summary = setNode(wf,'🧾 Summary',{ '__stage':'={{"done"}}' }, x, y);
     connect(wf, cursor, summary);
 
     wf.staticData.__design = {
-      layout:{ mode:'one-line', rowY: ROW_Y, stepX: L.stepX },
-      notes:'Main chain kept on a single horizontal row. AI sub-nodes (model/parser) render beneath their agent automatically.'
+      layout:{ mode:'one-line-fixed', span:H.SPAN, groupGap:H.GROUP_GAP },
+      notes:'All main nodes placed at fixed horizontal offsets; no vertical bumps; no overlap.'
     };
     return wf;
   }

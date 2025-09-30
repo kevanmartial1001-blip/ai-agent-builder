@@ -1,5 +1,6 @@
 // public/builder.js
-// Per-scenario generator with PROD + DEMO rows, fixed spacing, and robust coercion of context fields.
+// Per-scenario generator with PROD + DEMO rows, fixed spacing, robust coercion,
+// and SAFE import (no placeholder creds; tags = []).
 
 (function () {
   "use strict";
@@ -15,7 +16,6 @@
   const sX   = (x)=> Math.round(x/GRID.cellW)*GRID.cellW;
   const sY   = (y)=> Math.round(y/GRID.cellH)*GRID.cellH;
 
-  // coerce anything → single-line string
   const oneLine = (v)=>{
     if (v == null) return "";
     if (Array.isArray(v)) return v.map(oneLine).filter(Boolean).join(" | ");
@@ -25,8 +25,17 @@
   const esc = (s)=> oneLine(s).replace(/"/g, '\\"');
 
   function baseWorkflow(name){
-    return { name, nodes:[], connections:{}, active:false,
-      settings:{ executionOrder:"v1", timezone:"Europe/Madrid" }, staticData:{}, __occ:new Set()
+    return {
+      name,
+      nodes: [],
+      connections: {},
+      active: false,
+      settings: { executionOrder: "v1", timezone: "Europe/Madrid" },
+      staticData: {},
+      __occ: new Set(),
+      // prevent import error paths that lowercase tags etc.
+      tags: [],
+      pinData: {}
     };
   }
   function uniqueName(wf, base){
@@ -54,8 +63,9 @@
 
   const modelLm  = (wf, role, x, y)=> addNode(wf,{ id:uid('lm'), name:`${role} · OpenAI Chat Model`,
     type:"@n8n/n8n-nodes-langchain.lmChatOpenAi", typeVersion:1.2, position:pos(x, y+148),
-    parameters:{ model:{ "__rl":true,"value":"gpt-5-mini","mode":"list","cachedResultName":"gpt-5-mini"}, options:{ temperature:0.2 } },
-    credentials:{ openAiApi:{ id:"OpenAI_Creds_Id", name:"OpenAi account" } }});
+    parameters:{ model:{ "__rl":true,"value":"gpt-5-mini","mode":"list","cachedResultName":"gpt-5-mini"}, options:{ temperature:0.2 } }
+    // <-- no credentials block (pick in n8n UI)
+  });
   const parser   = (wf, role, x, y, schema)=> addNode(wf,{ id:uid('op'), name:`${role} · Structured Parser`,
     type:"@n8n/n8n-nodes-langchain.outputParserStructured", typeVersion:1.3, position:pos(x+144, y+260),
     parameters:{ jsonSchemaExample:schema }});
@@ -66,7 +76,7 @@
     type:"n8n-nodes-base.code", typeVersion:2, position:pos(x,y),
     parameters:{ jsCode:`const out=$json.output??$json; if(!out||typeof out!=='object'||Array.isArray(out)) throw new Error('Invalid JSON'); return [out];` }});
   const swNode   = (wf,name,expr,rules,x,y)=> addNode(wf,{ id:uid('sw'), name, type:'n8n-nodes-base.switch', typeVersion:2, position:pos(x,y),
-    parameters:{ value1:expr, rules:rules.map(v=>({operation:'equal', value2:String(v)})) } });
+    parameters:{ value1:expr, rules:(rules||[]).map(v=>({operation:'equal', value2:String(v)})) } });
 
   // ===== Contracts =====
   const SCHEMA_CONTEXT = `{
@@ -99,9 +109,9 @@
   }`;
 
   // ===== Prompts =====
-  const sysContext = `You are 🧠 Context Distiller. Input = a business scenario with 4 context columns (triggers, best_reply_shapes, risk_notes, roi_hypothesis) + industry + tags. Produce ${SCHEMA_CONTEXT}. JSON only.`;
+  const sysContext = `You are 🧠 Context Distiller. Input = the 4 columns (triggers, best_reply_shapes, risk_notes, roi_hypothesis) + industry + tags. Produce ${SCHEMA_CONTEXT}. JSON only.`;
   const sysPlanner = `You are 🗺️ Schema-Map Architect. From Context enumerate branches and steps (with channels/tools/errors). Return ${SCHEMA_PLAN}. JSON only.`;
-  const sysStep    = `You are a specialist Step Agent. Read Context + Branch + Step and return ${SCHEMA_STEP}. Human-sounding messages. JSON only.`;
+  const sysStep    = `You are a specialist Step Agent. Read Context + Branch + Step and return ${SCHEMA_STEP}. Human messages. JSON only.`;
 
   const userContext = (s,i)=> `=Context input:
 {
@@ -149,7 +159,7 @@ function withDemoDefaults(p){
 }
 
 async function exec(){
-  switch(a.type){
+  switch((a.type||'').toLowerCase()){
     case 'send_message': {
       const p = mode==='demo' ? withDemoDefaults(a.params||{}) : (a.params||{});
       return { status:200, body:{ channel:a.channel, tool:a.tool, payload:p, demo: mode==='demo' } };
@@ -185,7 +195,7 @@ return [{ ...ctx, __history: hist }];`
     });
   }
 
-  // ===== Step group (Agent → JSON → Run → Record) =====
+  // ===== Step group =====
   function addStepGroup(wf, baseX, y, branchObj, stepObj, laneKey, idx, scenario, mode, demoSeeds){
     const role = `🧩 ${stepObj.title || stepObj.id} Agent`;
     const agentX = baseX + H.SPAN*0;
@@ -329,10 +339,10 @@ return [{ ...ctx, __history: hist }];`
     wf.staticData.__design = {
       layout:{ span:H.SPAN, group:H.GROUP, block:H.BLOCK, branchGapY:H.BRANCH_GAP_Y, rows:{ prod:L.ROW_PROD_Y, demo:L.ROW_DEMO_Y } },
       notes:[
-        'Robust coercion for context fields (strings/arrays/objects).',
-        'Two rows: PROD + DEMO. Identical logic; DEMO seeds + fake tools.',
-        'Each step: Agent → JSON Validator → Runner → Recorder.',
-        'Backbone: Manual → Init → Context → Schema-Map → Switch → Branch lanes.'
+        'No placeholder credentials in nodes; select creds in n8n UI.',
+        'tags: [] included to avoid import lowercasing on undefined.',
+        'Two rows: PROD + DEMO (identical logic; demo seeds + fake tools).',
+        'Each step: Agent → JSON Validator → Runner → Recorder.'
       ]
     };
     return wf;

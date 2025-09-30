@@ -1,6 +1,6 @@
 // public/builder.js
 // Per-scenario generator with PROD + DEMO rows, fixed spacing, robust coercion,
-// and SAFE import (no placeholder creds; tags = []).
+// SAFE import (no resource-locator params, no placeholder creds, tags=[]).
 
 (function () {
   "use strict";
@@ -32,8 +32,7 @@
       active: false,
       settings: { executionOrder: "v1", timezone: "Europe/Madrid" },
       staticData: {},
-      __occ: new Set(),
-      // prevent import error paths that lowercase tags etc.
+      // keep import happy
       tags: [],
       pinData: {}
     };
@@ -61,16 +60,17 @@
   const label   = (wf,txt,x,y)=> setNode(wf,`=== ${txt} ===`,{ __zone:`={{'${txt}'}}` },x,y);
   const manual  = (wf,x,y)=> addNode(wf,{ id:uid('m'), name:'Manual Trigger', type:'n8n-nodes-base.manualTrigger', typeVersion:1, position:pos(x,y), parameters:{} });
 
+  // IMPORTANT: plain string model param (no resource-locator)
   const modelLm  = (wf, role, x, y)=> addNode(wf,{ id:uid('lm'), name:`${role} · OpenAI Chat Model`,
-    type:"@n8n/n8n-nodes-langchain.lmChatOpenAi", typeVersion:1.2, position:pos(x, y+148),
-    parameters:{ model:{ "__rl":true,"value":"gpt-5-mini","mode":"list","cachedResultName":"gpt-5-mini"}, options:{ temperature:0.2 } }
-    // <-- no credentials block (pick in n8n UI)
+    type:"@n8n/n8n-nodes-langchain.lmChatOpenAi", typeVersion:1, position:pos(x, y+148),
+    parameters:{ model:"gpt-5-mini", options:{ temperature:0.2 } }
+    // no credentials block
   });
   const parser   = (wf, role, x, y, schema)=> addNode(wf,{ id:uid('op'), name:`${role} · Structured Parser`,
-    type:"@n8n/n8n-nodes-langchain.outputParserStructured", typeVersion:1.3, position:pos(x+144, y+260),
+    type:"@n8n/n8n-nodes-langchain.outputParserStructured", typeVersion:1, position:pos(x+144, y+260),
     parameters:{ jsonSchemaExample:schema }});
   const agentNode= (wf, role, x, y, sys, user)=> addNode(wf,{ id:uid('ag'), name:role,
-    type:"@n8n/n8n-nodes-langchain.agent", typeVersion:2.2, position:pos(x,y),
+    type:"@n8n/n8n-nodes-langchain.agent", typeVersion:2, position:pos(x,y),
     parameters:{ promptType:"define", text:user, hasOutputParser:true, options:{ systemMessage:`=${sys}` } }});
   const validator= (wf,name,x,y)=> addNode(wf,{ id:uid('code'), name:`${name} · JSON Validator`,
     type:"n8n-nodes-base.code", typeVersion:2, position:pos(x,y),
@@ -328,7 +328,7 @@ return [{ ...ctx, __history: hist }];`
         { key: 'maybe', title: 'Maybe path', steps: [] },
       ];
       const laneObjs = (opts.stubBranches || sample).slice(0, MAX_BRANCHES);
-      const lanes = laneObjs.map((b, i)=> addBranchLane(wf, startX, baseY, b, i, scenario, mode, demoSeeds));
+      const lanes = laneObjs.map((b, i)=> addBranchLane(wf, startX, baseY, b, i, scenario, mode, demo));
       lanes.forEach((lane, i)=> connect(wf, swName, lane.enter, i));
       return lanes;
     }
@@ -339,8 +339,8 @@ return [{ ...ctx, __history: hist }];`
     wf.staticData.__design = {
       layout:{ span:H.SPAN, group:H.GROUP, block:H.BLOCK, branchGapY:H.BRANCH_GAP_Y, rows:{ prod:L.ROW_PROD_Y, demo:L.ROW_DEMO_Y } },
       notes:[
-        'No placeholder credentials in nodes; select creds in n8n UI.',
-        'tags: [] included to avoid import lowercasing on undefined.',
+        'LLM model param is a plain string (no Resource Locator) to avoid toLowerCase import bug.',
+        'No placeholder credentials; pick creds in UI.',
         'Two rows: PROD + DEMO (identical logic; demo seeds + fake tools).',
         'Each step: Agent → JSON Validator → Runner → Recorder.'
       ]

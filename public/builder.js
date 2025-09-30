@@ -1,28 +1,22 @@
 // public/builder.js
-// Per-scenario generator with PROD + DEMO rows, fixed spacing, robust coercion,
-// SAFE import (no resource-locator params, no placeholder creds, tags=[]).
+// COMPAT build: only core n8n nodes (Manual, Set, Code, HTTP Request, Switch).
+// No LangChain nodes. Safe to import on any n8n.
+// Layout: two rows (PROD, DEMO). Branches: YES and NO.
+// Backbone: Manual → Init → Context (LLM via HTTP) → Schema-Map (LLM via HTTP) → Switch → Lanes
+// Each step: Step Agent (LLM via HTTP) → JSON Validator → Runner → Recorder
 
 (function () {
   "use strict";
 
-  // ===== Layout (fixed spacing) =====
+  // ===== Layout (fixed rails) =====
   const L = { HEADER: { x: -900, y: 40 }, ROW_PROD_Y: 240, ROW_DEMO_Y: 720, START_X: -860 };
-  const H = { SPAN: 320, GROUP: 4, BLOCK: 4, BRANCH_GAP_Y: 240, AFTER_BACKBONE_GAP: 2 };
-  const GRID = { cellH: 70, cellW: 80 };
+  const H = { SPAN: 320, GROUP: 4, BLOCK: 4, LANE_GAP_Y: 240, AFTER_SWITCH_SPANS: 2 };
 
   // ===== Utils =====
   const uid  = (p)=>`${p}_${Math.random().toString(36).slice(2,10)}`;
   const pos  = (x,y)=>[x,y];
-  const sX   = (x)=> Math.round(x/GRID.cellW)*GRID.cellW;
-  const sY   = (y)=> Math.round(y/GRID.cellH)*GRID.cellH;
-
-  const oneLine = (v)=>{
-    if (v == null) return "";
-    if (Array.isArray(v)) return v.map(oneLine).filter(Boolean).join(" | ");
-    if (typeof v === "object") return JSON.stringify(v);
-    return String(v);
-  };
-  const esc = (s)=> oneLine(s).replace(/"/g, '\\"');
+  const oneLine = (v)=> v == null ? "" : Array.isArray(v) ? v.map(oneLine).filter(Boolean).join(" | ") : (typeof v==="object" ? JSON.stringify(v) : String(v));
+  const esc = (s)=> oneLine(s).replace(/"/g,'\\"');
 
   function baseWorkflow(name){
     return {
@@ -32,7 +26,6 @@
       active: false,
       settings: { executionOrder: "v1", timezone: "Europe/Madrid" },
       staticData: {},
-      // keep import happy
       tags: [],
       pinData: {}
     };
@@ -41,258 +34,227 @@
     const ex=new Set((wf.nodes||[]).map(n=>String(n.name||'').toLowerCase()));
     let nm=base||'Node', i=1; while(ex.has(nm.toLowerCase())){ i++; nm=`${base} #${i}`;} return nm;
   }
-  function addNode(wf,node){
-    node.name = uniqueName(wf,node.name);
-    if (Array.isArray(node.position)){
-      node.position = [sX(node.position[0]), sY(node.position[1])];
-    }
-    wf.nodes.push(node); return node.name;
-  }
+  function addNode(wf,node){ node.name=uniqueName(wf,node.name); wf.nodes.push(node); return node.name; }
   function connect(wf,from,to,idx=0){
     wf.connections[from]??={}; wf.connections[from].main??=[];
     for(let i=wf.connections[from].main.length;i<=idx;i++) wf.connections[from].main[i]=[];
     wf.connections[from].main[idx].push({ node: to, type:"main", index:0 });
   }
 
-  // ===== Palette =====
-  const setNode = (wf,name,fields,x,y)=> addNode(wf,{ id:uid('set'), name, type:'n8n-nodes-base.set', typeVersion:2, position:pos(x,y),
-    parameters:{ keepOnlySet:false, values:{ string:Object.entries(fields||{}).map(([k,v])=>({name:k,value:v})) } } });
-  const label   = (wf,txt,x,y)=> setNode(wf,`=== ${txt} ===`,{ __zone:`={{'${txt}'}}` },x,y);
-  const manual  = (wf,x,y)=> addNode(wf,{ id:uid('m'), name:'Manual Trigger', type:'n8n-nodes-base.manualTrigger', typeVersion:1, position:pos(x,y), parameters:{} });
-
-  // IMPORTANT: plain string model param (no resource-locator)
-  const modelLm  = (wf, role, x, y)=> addNode(wf,{ id:uid('lm'), name:`${role} · OpenAI Chat Model`,
-    type:"@n8n/n8n-nodes-langchain.lmChatOpenAi", typeVersion:1, position:pos(x, y+148),
-    parameters:{ model:"gpt-5-mini", options:{ temperature:0.2 } }
-    // no credentials block
+  // ===== Core palette =====
+  const label = (wf, txt, x, y)=> addNode(wf,{
+    id:uid('lbl'), name:`=== ${txt} ===`, type:'n8n-nodes-base.set', typeVersion:2, position:pos(x,y),
+    parameters:{ keepOnlySet:false, values:{ string:[{ name:'__zone', value:`={{'${txt}'}}` }] } }
   });
-  const parser   = (wf, role, x, y, schema)=> addNode(wf,{ id:uid('op'), name:`${role} · Structured Parser`,
-    type:"@n8n/n8n-nodes-langchain.outputParserStructured", typeVersion:1, position:pos(x+144, y+260),
-    parameters:{ jsonSchemaExample:schema }});
-  const agentNode= (wf, role, x, y, sys, user)=> addNode(wf,{ id:uid('ag'), name:role,
-    type:"@n8n/n8n-nodes-langchain.agent", typeVersion:2, position:pos(x,y),
-    parameters:{ promptType:"define", text:user, hasOutputParser:true, options:{ systemMessage:`=${sys}` } }});
-  const validator= (wf,name,x,y)=> addNode(wf,{ id:uid('code'), name:`${name} · JSON Validator`,
-    type:"n8n-nodes-base.code", typeVersion:2, position:pos(x,y),
-    parameters:{ jsCode:`const out=$json.output??$json; if(!out||typeof out!=='object'||Array.isArray(out)) throw new Error('Invalid JSON'); return [out];` }});
-  const swNode   = (wf,name,expr,rules,x,y)=> addNode(wf,{ id:uid('sw'), name, type:'n8n-nodes-base.switch', typeVersion:2, position:pos(x,y),
-    parameters:{ value1:expr, rules:(rules||[]).map(v=>({operation:'equal', value2:String(v)})) } });
+  const manual = (wf,x,y)=> addNode(wf,{ id:uid('m'), name:'Manual Trigger', type:'n8n-nodes-base.manualTrigger', typeVersion:1, position:pos(x,y), parameters:{} });
+  const setNode = (wf,name,fields,x,y)=> addNode(wf,{ id:uid('set'), name, type:'n8n-nodes-base.set', typeVersion:2, position:pos(x,y),
+    parameters:{ keepOnlySet:false, values:{ string:Object.entries(fields||{}).map(([k,v])=>({name:k, value:v})) } } });
+  const codeNode = (wf,name,js,x,y)=> addNode(wf,{ id:uid('code'), name, type:'n8n-nodes-base.code', typeVersion:2, position:pos(x,y),
+    parameters:{ jsCode: js } });
+  const httpNode = (wf,name,bodyJson,x,y)=> addNode(wf,{ id:uid('http'), name, type:'n8n-nodes-base.httpRequest', typeVersion:4, position:pos(x,y),
+    parameters:{
+      url: "={{$json.__llm_base || $env.OPENAI_BASE_URL || 'https://api.openai.com/v1/chat/completions'}}",
+      method: "POST",
+      authentication: "none",
+      jsonParameters: true,
+      options: {},
+      sendHeaders: true,
+      headerParametersJson: "={{ { 'Content-Type':'application/json', 'Authorization': 'Bearer ' + ($json.__llm_key || $env.OPENAI_API_KEY || '') } }}",
+      bodyParametersJson: bodyJson
+    }
+  });
+  const switchNode = (wf,name,expr,values,x,y)=> addNode(wf,{ id:uid('sw'), name, type:'n8n-nodes-base.switch', typeVersion:2, position:pos(x,y),
+    parameters:{ value1: expr, rules: values.map(v=>({ operation:'equal', value2:v })) }
+  });
 
-  // ===== Contracts =====
-  const SCHEMA_CONTEXT = `{
-    "intent":"string",
-    "industry":"string",
-    "constraints":["string"],
-    "success":"string",
-    "channels_ranked":["email","whatsapp","sms","call","chat"],
-    "guardrails":["string"]
-  }`;
-
-  const SCHEMA_PLAN = `{
-    "trigger":{"kind":"manual|webhook|cron|imap","why":"string"},
-    "archetype":{"name":"string","confidence":0.0},
-    "branches":[
-      {
-        "key":"string","title":"string","why":"string",
-        "steps":[
-          {"id":"string","title":"string","type":"send_message|check_data|place_call|wait|http|END","channel":"email|whatsapp|sms|call|none","tool":"string","params":{}}
-        ]
-      }
+  // ===== Contracts (schemas the validators enforce) =====
+  const SCHEMA_CONTEXT = { intent:"", industry:"", constraints:[], success:"", channels_ranked:[], guardrails:[] };
+  const SCHEMA_PLAN = {
+    trigger:{ kind:"", why:"" },
+    archetype:{ name:"", confidence:0 },
+    branches:[
+      { key:"yes", title:"Yes path", why:"", steps:[{ id:"s1", title:"Action 1", type:"send_message", channel:"whatsapp", tool:"Twilio", params:{} }] },
+      { key:"no",  title:"No path",  why:"", steps:[{ id:"s1", title:"Action 1", type:"send_message", channel:"email",    tool:"MAILING", params:{} }] }
     ],
-    "errors":[{"code":"string","fix":"string"}],
-    "tools_suggested":["string"]
-  }`;
+    errors:[],
+    tools_suggested:[]
+  };
+  const SCHEMA_STEP = { action:{ id:"", title:"", type:"send_message", channel:"email", tool:"", params:{} }, notes:[] };
 
-  const SCHEMA_STEP = `{
-    "action":{"id":"string","title":"string","type":"send_message|check_data|place_call|wait|http|END","channel":"email|whatsapp|sms|call|none","tool":"string","params":{}},
-    "notes":["string"]
-  }`;
+  // ===== Prompt text (system/user) =====
+  const SYS_CONTEXT =
+`You are 🧠 Context Distiller. Input = 4 columns (triggers, best_reply_shapes, risk_notes, roi_hypothesis) + industry + tags.
+Return a SMALL JSON:
+${JSON.stringify(SCHEMA_CONTEXT, null, 2)}
+- channels_ranked must be a subset of ["email","whatsapp","sms","call","chat"].`;
 
-  // ===== Prompts =====
-  const sysContext = `You are 🧠 Context Distiller. Input = the 4 columns (triggers, best_reply_shapes, risk_notes, roi_hypothesis) + industry + tags. Produce ${SCHEMA_CONTEXT}. JSON only.`;
-  const sysPlanner = `You are 🗺️ Schema-Map Architect. From Context enumerate branches and steps (with channels/tools/errors). Return ${SCHEMA_PLAN}. JSON only.`;
-  const sysStep    = `You are a specialist Step Agent. Read Context + Branch + Step and return ${SCHEMA_STEP}. Human messages. JSON only.`;
+  const SYS_PLANNER =
+`You are 🗺️ Schema-Map Architect. Build trigger, archetype, and exactly 2 branches: "yes" and "no".
+Each branch.steps is a list of actionable steps with {id,title,type,channel,tool,params}.
+Keep channels/tools modern and realistic. Return strictly:
+${JSON.stringify(SCHEMA_PLAN, null, 2)}`;
 
-  const userContext = (s,i)=> `=Context input:
-{
-  "industry":"${esc(i?.industry_id)}",
-  "triggers":"${esc(s?.triggers)}",
-  "best_reply_shapes":"${esc(s?.best_reply_shapes)}",
-  "risk_notes":"${esc(s?.risk_notes)}",
-  "roi_hypothesis":"${esc(s?.roi_hypothesis)}",
-  "tags":"${esc(s?.["tags (;)"] ?? s?.tags)}"
-}
-Return ${SCHEMA_CONTEXT}.`;
+  const SYS_STEP =
+`You are a specialist Step Agent. Given the Context + a Branch + a Step draft, output exactly:
+${JSON.stringify(SCHEMA_STEP, null, 2)}
+- When type is send_message/place_call, write natural, human copy in params (subject/body or script), no IVR "press 1".`;
 
-  const userPlanner = `=Planner input:
-{
-  "context": {{$json}},
-  "hints": "Use the 4 columns to build a bullet-proof map. Enumerate multiple-choice outcomes. Suggest best channels and tools. Add trigger and errors."
-}
-Return ${SCHEMA_PLAN}.`;
+  // Helper to build Chat Completions request body (OpenAI-compatible)
+  const bodyLLM = (systemText, userText)=>
+`={{ {
+  model: $json.__llm_model || 'gpt-5-mini',
+  temperature: 0.2,
+  response_format: { type: 'json_object' },
+  messages: [
+    { role: 'system', content: ${JSON.stringify(systemText)} },
+    { role: 'user',   content: ${JSON.stringify(userText)} }
+  ]
+} }}`;
 
-  const userStep = (branchObj, stepObj)=> `=Step Agent input:
-{
-  "context": {{$json.__context}},
-  "branch": ${JSON.stringify(branchObj)},
-  "step": ${JSON.stringify(stepObj)}
-}
-Return ${SCHEMA_STEP}.`;
+  // ===== JSON validator code (strict but small) =====
+  const VALIDATE_JSON =
+`function isObj(o){return o && typeof o==='object' && !Array.isArray(o);}
+const raw = $json.choices?.[0]?.message?.content || $json.output || $json;
+let parsed;
+try{ parsed = typeof raw==='string' ? JSON.parse(raw) : raw; }catch(e){ throw new Error('LLM did not return valid JSON'); }
+return [parsed];`;
 
-  // ===== Runners =====
-  function addRunner(wf, x, y, label, mode, demoSeeds){
-    const seeds = demoSeeds || {};
-    return addNode(wf,{
-      id:uid('run'), name:`Run · ${label} · ${mode.toUpperCase()}`, type:'n8n-nodes-base.code', typeVersion:2, position:pos(x,y),
-      parameters:{ jsCode:
-`const mode = ${JSON.stringify(mode)};
-const demo = ${JSON.stringify(seeds)};
-const a = $json.action || { type:'END', title:'END', channel:'none', tool:'', params:{} };
-
-function withDemoDefaults(p){
+  // ===== Runner (simulate tools; do real HTTP only if url provided and PROD) =====
+  const RUNNER =
+`const mode = $json.__mode || 'prod';
+const a = $json.action || {};
+const demo = $json.__demo || {};
+function fillDemo(p){
   const ch = (a.channel||'').toLowerCase();
-  const out = {...p};
+  const out = {...(p||{})};
   if(ch==='whatsapp' || ch==='sms'){ out.to = out.to || demo.to || '+34613030526'; out.from = out.from || (ch==='whatsapp'? demo.waFrom : demo.smsFrom); }
   if(ch==='email'){ out.to = out.to || demo.emailTo || 'kevanm.spain@gmail.com'; out.subject = out.subject || 'Demo'; }
   if(ch==='call'){ out.to = out.to || demo.to || '+34613030526'; out.from = out.from || demo.callFrom; }
   return out;
 }
-
 async function exec(){
-  switch((a.type||'').toLowerCase()){
-    case 'send_message': {
-      const p = mode==='demo' ? withDemoDefaults(a.params||{}) : (a.params||{});
-      return { status:200, body:{ channel:a.channel, tool:a.tool, payload:p, demo: mode==='demo' } };
-    }
-    case 'place_call': {
-      const p = mode==='demo' ? withDemoDefaults(a.params||{}) : (a.params||{});
-      return { status:200, body:{ channel:'call', tool:a.tool, payload:p, demo: mode==='demo' } };
-    }
-    case 'check_data':  return { status:200, body:{ check:a.params||{} } };
-    case 'wait':        await new Promise(r=>setTimeout(r,(a.params?.seconds||5)*1000)); return { status:200, body:{ waited:a.params?.seconds||5 } };
+  switch(String(a.type||'').toLowerCase()){
+    case 'send_message': return { ok:true, channel:a.channel, tool:a.tool, sent: mode==='demo'? fillDemo(a.params): (a.params||{}) };
+    case 'place_call':   return { ok:true, channel:'call', tool:a.tool,  placed: mode==='demo'? fillDemo(a.params): (a.params||{}) };
+    case 'check_data':   return { ok:true, check:a.params||{} };
+    case 'wait':         await new Promise(r=>setTimeout(r,(a.params?.seconds||5)*1000)); return { ok:true, waited:a.params?.seconds||5 };
     case 'http': {
-      if(mode==='demo') return { status:200, body:{ simulated:true, url:a.params?.url||'FAKE', payload:a.params?.body||{} } };
-      if(!a.params?.url) return { status:200, body:{ skipped:true } };
+      if(mode==='demo') return { ok:true, simulated:true, url:a.params?.url||'FAKE', payload:a.params?.body||{} };
+      if(!a.params?.url) return { ok:true, skipped:true };
       const res = await this.helpers.httpRequest({ url:a.params.url, method:a.params.method||'POST', json:true, body:a.params.body||{}, resolveWithFullResponse:true });
-      return { status: res.statusCode, body: res.body };
+      return { ok: res.statusCode>=200 && res.statusCode<300, status: res.statusCode, body: res.body };
     }
-    default:            return { status:200, body:{ noop:true } };
+    default: return { ok:true, noop:true };
   }
 }
-return exec().then(r => [{ ...$json, __exec:r }]);`
-      }
-    });
-  }
-  function addRecord(wf, x, y, label, scenario, laneKey, mode){
-    return addNode(wf,{
-      id:uid('rec'), name:`Record · ${oneLine(scenario?.scenario_id)||'Scenario'} · ${laneKey} · ${label} · ${mode.toUpperCase()}`,
-      type:'n8n-nodes-base.code', typeVersion:2, position:pos(x,y),
-      parameters:{ jsCode:
-`const ctx=$items(0,0)?.json||{}; const hist=Array.isArray(ctx.__history)?ctx.__history:[]; 
-hist.push({ label:'${label}', lane:'${laneKey}', mode:'${mode}', action:ctx.action, status:$json.__exec?.status });
-return [{ ...ctx, __history: hist }];`
-      }
-    });
-  }
+return exec().then(r => [{ ...$json, __exec:r }]);`;
 
-  // ===== Step group =====
-  function addStepGroup(wf, baseX, y, branchObj, stepObj, laneKey, idx, scenario, mode, demoSeeds){
-    const role = `🧩 ${stepObj.title || stepObj.id} Agent`;
-    const agentX = baseX + H.SPAN*0;
-    const valX   = baseX + H.SPAN*1;
-    const runX   = baseX + H.SPAN*2;
-    const recX   = baseX + H.SPAN*3;
+  const RECORDER = (label, lane, mode)=>
+`const hist=Array.isArray($json.__history)?$json.__history:[]; 
+hist.push({ step:'${label}', lane:'${lane}', mode:'${mode}', action: $json.action, result:$json.__exec });
+return [{ ...$json, __history: hist }];`;
 
-    const lm   = modelLm(wf, role, agentX, y);
-    const prs  = parser(wf, role, agentX, y, SCHEMA_STEP);
-    const ag   = agentNode(wf, role, agentX, y, sysStep, userStep(branchObj, stepObj));
-    wf.connections[lm]  = { ai_languageModel: [[{ node: ag, type:"ai_languageModel", index:0 }]] };
-    wf.connections[prs] = { ai_outputParser:  [[{ node: ag, type:"ai_outputParser",  index:0 }]] };
-
-    const val  = validator(wf, role, valX, y);
-    connect(wf, ag, val);
-
-    const run  = addRunner(wf, runX, y, `${idx}. ${stepObj.title||stepObj.id}`, mode, demoSeeds);
-    connect(wf, val, run);
-
-    const rec  = addRecord(wf, recX, y, `${idx}. ${stepObj.title||stepObj.id}`, scenario, laneKey, mode);
-    connect(wf, run, rec);
-
-    return { in: ag, out: rec };
-  }
-
-  // ===== Backbone (per row) =====
-  function addBackbone(wf, scenario, industry, y, rowLabel){
+  // ===== Backbone per row =====
+  function addBackbone(wf, scenario, industry, y, mode, demoSeeds){
     const trig = manual(wf, L.START_X, y);
-    const init = setNode(wf, `Init (${rowLabel})`, {
-      'scenario.id': `={{'${esc(scenario.scenario_id)}'}}`,
-      'scenario.name': `={{'${esc(scenario.name)}'}}`,
-      'industry.id': `={{'${esc(industry?.industry_id)}'}}`,
+    const init = setNode(wf, `Init (${mode.toUpperCase()})`, {
+      'scenario.id':     `={{'${esc(scenario?.scenario_id)}'}}`,
+      'scenario.name':   `={{'${esc(scenario?.name)}'}}`,
+      'industry.id':     `={{'${esc(industry?.industry_id)}'}}`,
+      '__mode':          `={{'${mode}'}}`,
+      // you can set these in n8n Settings → Environment Variables
+      '__llm_key':       "={{$env.OPENAI_API_KEY || ''}}",
+      '__llm_model':     "={{$env.OPENAI_MODEL || 'gpt-5-mini'}}",
+      '__llm_base':      "={{$env.OPENAI_BASE_URL || ''}}",
+      '__demo':          JSON.stringify(demoSeeds||{})
     }, L.START_X + H.SPAN, y);
     connect(wf, trig, init);
 
-    const ctxRole = `🧠 Context (${rowLabel})`;
-    const ctxLm = modelLm(wf, ctxRole, L.START_X + H.SPAN*2, y);
-    const ctxPr = parser (wf, ctxRole, L.START_X + H.SPAN*2, y, SCHEMA_CONTEXT);
-    const ctxAg = agentNode(wf, ctxRole, L.START_X + H.SPAN*2, y, sysContext, userContext(scenario, industry));
-    wf.connections[ctxLm] = { ai_languageModel: [[{ node: ctxAg, type:"ai_languageModel", index:0 }]] };
-    wf.connections[ctxPr] = { ai_outputParser:  [[{ node: ctxAg, type:"ai_outputParser",  index:0 }]] };
-    const ctxVal = validator(wf, ctxRole, L.START_X + H.SPAN*3, y);
-    connect(wf, ctxAg, ctxVal);
-    connect(wf, init, ctxAg);
+    // Context (HTTP LLM) → Validator
+    const ctxUser =
+`=Context input:
+{
+  "industry":"${esc(industry?.industry_id)}",
+  "triggers":"${esc(scenario?.triggers)}",
+  "best_reply_shapes":"${esc(scenario?.best_reply_shapes)}",
+  "risk_notes":"${esc(scenario?.risk_notes)}",
+  "roi_hypothesis":"${esc(scenario?.roi_hypothesis)}",
+  "tags":"${esc(scenario?.['tags (;)'] ?? scenario?.tags)}"
+}
+Return strictly a JSON matching this shape, nothing else.`;
+    const ctxReq = httpNode(wf, `🧠 Context (HTTP) · ${mode}`, bodyLLM(SYS_CONTEXT, ctxUser), L.START_X + H.SPAN*2, y);
+    const ctxVal = codeNode(wf, `🧠 Context · JSON Validator · ${mode}`, VALIDATE_JSON, L.START_X + H.SPAN*3, y);
+    connect(wf, init, ctxReq); connect(wf, ctxReq, ctxVal);
 
-    const plRole = `🗺️ Schema-Map (${rowLabel})`;
-    const plLm = modelLm(wf, plRole, L.START_X + H.SPAN*4, y);
-    const plPr = parser (wf, plRole, L.START_X + H.SPAN*4, y, SCHEMA_PLAN);
-    const plAg = agentNode(wf, plRole, L.START_X + H.SPAN*4, y, sysPlanner, userPlanner);
-    wf.connections[plLm] = { ai_languageModel: [[{ node: plAg, type:"ai_languageModel", index:0 }]] };
-    wf.connections[plPr] = { ai_outputParser:  [[{ node: plAg, type:"ai_outputParser",  index:0 }]] };
-    const plVal = validator(wf, plRole, L.START_X + H.SPAN*5, y);
-    connect(wf, plAg, plVal);
-    connect(wf, ctxVal, plAg);
+    // Schema-Map (HTTP LLM) → Validator
+    const plUser =
+`=Planner input:
+{
+  "context": {{$json}},
+  "hints": "Build a bullet-proof map for this scenario; choose best channels/tools; include a short error catalog."
+}
+Return strictly the required JSON with exactly two branches: yes and no.`;
+    const plReq = httpNode(wf, `🗺️ Schema-Map (HTTP) · ${mode}`, bodyLLM(SYS_PLANNER, plUser), L.START_X + H.SPAN*4, y);
+    const plVal = codeNode(wf, `🗺️ Schema-Map · JSON Validator · ${mode}`, VALIDATE_JSON, L.START_X + H.SPAN*5, y);
+    connect(wf, ctxVal, plReq); connect(wf, plReq, plVal);
 
-    const pack = addNode(wf,{ id:uid('pack'), name:`Pack Context (${rowLabel})`,
-      type:'n8n-nodes-base.code', typeVersion:2, position:pos(L.START_X + H.SPAN*6, y),
-      parameters:{ jsCode:`return [{ __context: $items(0,0).json }];` }
-    });
+    // Pack context for step agents
+    const pack = codeNode(wf, `Pack Context · ${mode}`,
+      `return [{ __context: $items(0,0).json }];`,
+      L.START_X + H.SPAN*6, y);
     connect(wf, plVal, pack);
 
-    const sw = swNode(wf, `Route Branch (${rowLabel})`, "={{$json.branches && $json.branches[0] && $json.branches[0].key || 'main'}}",
-      [], L.START_X + H.SPAN*7, y);
+    // Switch (routes by a provided key; we keep outputs in order: yes = 0, no = 1)
+    const sw = switchNode(wf, `Route Branch (${mode.toUpperCase()})`, "={{$json.branches && $json.branches[0] && $json.branches[0].key || 'yes'}}", ["yes","no"], L.START_X + H.SPAN*7, y);
     connect(wf, pack, sw);
 
-    return { ctxVal, planVal: plVal, packOut: pack, switchName: sw };
+    return { switchName: sw };
   }
 
-  // ===== Branch lane =====
-  function addBranchLane(wf, startX, baseY, branchObj, laneIndex, scenario, mode, demoSeeds){
-    const y = baseY + laneIndex * H.BRANCH_GAP_Y;
-    label(wf, `${mode.toUpperCase()} · Branch: ${branchObj.title||branchObj.key}`, startX - H.SPAN, y - 100);
+  // ===== Build a lane with N steps =====
+  function addLane(wf, startX, baseY, branchKey, scenario, mode){
+    const title = branchKey === 'yes' ? 'YES path' : 'NO path';
+    label(wf, `${mode.toUpperCase()} · Branch: ${title}`, startX - H.SPAN, baseY - 100);
 
-    const enter = addNode(wf,{
-      id:uid('enter'), name:`Enter · ${branchObj.key} (${mode})`,
-      type:'n8n-nodes-base.code', typeVersion:2, position:pos(startX, y),
-      parameters:{ jsCode: `return [{ ...$json, __branch: ${JSON.stringify(branchObj)} }];` }
-    });
+    // Start node injects the chosen branch skeleton
+    const enter = codeNode(wf, `Enter · ${branchKey} · ${mode}`,
+      // from planner result at runtime; here we keep the shape and let agents fill fields
+      `const ctx = $json.__context || {};
+const plan = $items(1,0)?.json || {}; // upstream planner validator output in parallel path
+const branch = (Array.isArray(plan.branches)?plan.branches:[]).find(b=>String(b.key||'')==='${branchKey}') || { key:'${branchKey}', title:'${title}', steps:[] };
+return [{ __context: ctx, __branch: branch, __mode: '${mode}', __demo: ${ JSON.stringify(mode==='demo' ? {
+        to:"+34613030526", emailTo:"kevanm.spain@gmail.com", waFrom:"+14155238886", smsFrom:"+13412184164", callFrom:"+13412184164"
+      } : {}) }];`,
+      startX, baseY
+    );
 
-    const steps = Array.isArray(branchObj.steps) ? branchObj.steps : [];
-    let baseX = startX + H.SPAN;
-    let cursor = enter;
-
-    steps.forEach((st, i)=>{
-      const grp = addStepGroup(wf, baseX, y, branchObj, st, branchObj.key, i+1, scenario, mode, demoSeeds);
-      connect(wf, cursor, grp.in);
-      cursor = grp.out;
-      baseX += H.SPAN * H.BLOCK;
-    });
-
-    const tail = setNode(wf, `Lane Done (${branchObj.key}, ${mode})`, { [`__lane_${branchObj.key}_${mode}`] : '={{true}}' }, baseX, y);
-    connect(wf, cursor, tail);
-
-    return { enter, done: tail };
+    return { enter };
   }
 
-  // ===== Main build =====
+  // ===== One Step Agent group (LLM HTTP → Validator → Runner → Recorder) =====
+  function addStepGroup(wf, baseX, y, labelPrefix, scenario, branchKey, mode){
+    const stepTitle = `${labelPrefix}`;
+    const stepDraft = { id: labelPrefix.toLowerCase().replace(/\s+/g,'_'), title: stepTitle, type: "send_message", channel: (branchKey==='yes'?'whatsapp':'email'), tool: (branchKey==='yes'?'Twilio':'MAILING'), params: {} };
+
+    const user =
+`=Step Agent input:
+{
+  "context": {{$json.__context}},
+  "branch": {{$json.__branch}},
+  "step": ${JSON.stringify(stepDraft)}
+}
+Return strictly the required JSON.`;
+
+    const req = httpNode(wf, `🧩 ${stepTitle} · Agent (HTTP) · ${mode}`, bodyLLM(SYS_STEP, user), baseX + H.SPAN*0, y);
+    const val = codeNode(wf, `🧩 ${stepTitle} · JSON Validator · ${mode}`, VALIDATE_JSON, baseX + H.SPAN*1, y);
+    const run = codeNode(wf, `Run · ${stepTitle} · ${mode}`, RUNNER, baseX + H.SPAN*2, y);
+    const rec = codeNode(wf, `Record · ${stepTitle} · ${mode}`, RECORDER(stepTitle, branchKey, mode), baseX + H.SPAN*3, y);
+
+    connect(wf, req, val); connect(wf, val, run); connect(wf, run, rec);
+    return { in: req, out: rec };
+  }
+
+  // ===== Build the whole workflow =====
   function buildWorkflowJSON(scenario, industry, opts = {}){
     const title = `${oneLine(scenario?.scenario_id)||'Scenario'} — ${oneLine(scenario?.name)||''}`.trim();
     const wf = baseWorkflow(title);
@@ -300,6 +262,7 @@ return [{ ...ctx, __history: hist }];`
     label(wf, 'FLOW · PRODUCTION', L.HEADER.x, L.HEADER.y);
     label(wf, 'FLOW · DEMO',       L.HEADER.x, L.HEADER.y + (L.ROW_DEMO_Y - L.ROW_PROD_Y));
 
+    // DEMO seeds (used in Init)
     const demoSeeds = {
       to: "+34613030526",
       emailTo: "kevanm.spain@gmail.com",
@@ -309,42 +272,52 @@ return [{ ...ctx, __history: hist }];`
       ...(opts.demoSeeds||{})
     };
 
-    const prod = addBackbone(wf, scenario, industry, L.ROW_PROD_Y, 'PROD');
-    const demo = addBackbone(wf, scenario, industry, L.ROW_DEMO_Y, 'DEMO');
+    // Backbones
+    const prod = addBackbone(wf, scenario, industry, L.ROW_PROD_Y, 'prod', {});
+    const demo = addBackbone(wf, scenario, industry, L.ROW_DEMO_Y, 'demo', demoSeeds);
 
-    function buildLanes(row, baseY, mode){
-      const swName = row.switchName;
-      const expose = addNode(wf,{
-        id:uid('x'), name:`Expose Branches (${mode})`, type:'n8n-nodes-base.code', typeVersion:2, position:pos(L.START_X + H.SPAN*8, baseY),
-        parameters:{ jsCode:`return [$items(0,0).json];` }
+    // Lanes: YES and NO for each row
+    function buildRow(rowY, switchName, mode){
+      const lanes = {
+        yes: addLane(wf, L.START_X + H.SPAN*(7 + H.AFTER_SWITCH_SPANS), rowY + 0*H.LANE_GAP_Y, 'yes', scenario, mode),
+        no:  addLane(wf, L.START_X + H.SPAN*(7 + H.AFTER_SWITCH_SPANS), rowY + 1*H.LANE_GAP_Y, 'no',  scenario, mode)
+      };
+      // Wire switch outputs: 0 → yes, 1 → no
+      connect(wf, switchName, lanes.yes.enter, 0);
+      connect(wf, switchName, lanes.no.enter,  1);
+
+      // Step groups per lane (keep it simple and visible: 3 steps per lane)
+      ['yes','no'].forEach((k)=>{
+        const baseX0 = L.START_X + H.SPAN*(8 + H.AFTER_SWITCH_SPANS);
+        const y = k==='yes' ? rowY + 0*H.LANE_GAP_Y : rowY + 1*H.LANE_GAP_Y;
+
+        const g1 = addStepGroup(wf, baseX0 + H.SPAN*0, y, 'Step 1 — Gather/Compose', scenario, k, mode);
+        const g2 = addStepGroup(wf, baseX0 + H.SPAN*H.BLOCK, y, 'Step 2 — Check/Decide', scenario, k, mode);
+        const g3 = addStepGroup(wf, baseX0 + H.SPAN*H.BLOCK*2, y, 'Step 3 — Execute', scenario, k, mode);
+
+        connect(wf, lanes[k].enter, g1.in);
+        connect(wf, g1.out, g2.in);
+        connect(wf, g2.out, g3.in);
+
+        const done = setNode(wf, `Lane Done (${k.toUpperCase()}, ${mode.toUpperCase()})`, { [`__lane_${k}_${mode}`]:'={{true}}' }, baseX0 + H.SPAN*H.BLOCK*3 + H.SPAN, y);
+        connect(wf, g3.out, done);
       });
-      connect(wf, swName, expose, 0);
-
-      const MAX_BRANCHES = Math.min(opts.maxBranches || 4, 8);
-      const startX = L.START_X + H.SPAN*(8 + H.AFTER_BACKBONE_GAP);
-      const sample = [
-        { key: 'yes', title: 'Yes path', steps: [] },
-        { key: 'no',  title: 'No path',  steps: [] },
-        { key: 'maybe', title: 'Maybe path', steps: [] },
-      ];
-      const laneObjs = (opts.stubBranches || sample).slice(0, MAX_BRANCHES);
-      const lanes = laneObjs.map((b, i)=> addBranchLane(wf, startX, baseY, b, i, scenario, mode, demo));
-      lanes.forEach((lane, i)=> connect(wf, swName, lane.enter, i));
-      return lanes;
     }
 
-    buildLanes(prod, L.ROW_PROD_Y, 'prod');
-    buildLanes(demo, L.ROW_DEMO_Y, 'demo');
+    buildRow(L.ROW_PROD_Y, prod.switchName, 'prod');
+    buildRow(L.ROW_DEMO_Y, demo.switchName, 'demo');
 
+    // Design note
     wf.staticData.__design = {
-      layout:{ span:H.SPAN, group:H.GROUP, block:H.BLOCK, branchGapY:H.BRANCH_GAP_Y, rows:{ prod:L.ROW_PROD_Y, demo:L.ROW_DEMO_Y } },
+      layout:{ span:H.SPAN, block:H.BLOCK, lanes:['yes','no'], rows:{prod:L.ROW_PROD_Y, demo:L.ROW_DEMO_Y} },
       notes:[
-        'LLM model param is a plain string (no Resource Locator) to avoid toLowerCase import bug.',
-        'No placeholder credentials; pick creds in UI.',
-        'Two rows: PROD + DEMO (identical logic; demo seeds + fake tools).',
-        'Each step: Agent → JSON Validator → Runner → Recorder.'
+        'Uses only core nodes; no LangChain. Safe import.',
+        'LLM via HTTP to OpenAI; set OPENAI_API_KEY/OPENAI_MODEL/OPENAI_BASE_URL in env.',
+        'Two rows (PROD/DEMO). Branches: YES and NO.',
+        'Each step = Agent(HTTP) → Validator(Code) → Runner(Code) → Recorder(Code).'
       ]
     };
+
     return wf;
   }
 

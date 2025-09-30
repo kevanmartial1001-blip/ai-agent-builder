@@ -1,24 +1,27 @@
 // public/builder.js
-// Switch → Outcomes only (3.1, 3.2, …), bigger spacing, zero overlaps via block occupancy.
-// Channels: WhatsApp + Call. Per-scenario shape changes are still driven by tags/context.
+// n8n JSON code generator (per-scenario) with first-class LLM agents.
+// Keeps your anti-overlap grid + Switch→Outcome-only wiring.
+// Inserts: Pre-flight → (optional lookups) → Planner → Communication (Stage) → Composer → QA → Senders → Summarizer.
+// Archetype-specific plays preserved (Scheduling, Support, AR, Recruiting, Generic).
 
 (function () {
   "use strict";
 
   // ---------- Layout (more air) ----------
   const LAYOUT = {
-    stepX: 380,         // column distance
-    channelY: 420,      // distance between channels (CALL vs WHATSAPP)
-    outcomeRowY: 380,   // distance between 3.1 / 3.2 / …
+    stepX: 380,
+    channelY: 420,
+    outcomeRowY: 380,
     header: { x: -900, y: 40 },
     start:  { x: -860, y: 240 },
     switchX: -560
   };
 
-  // Grid + footprint: each node reserves a 3×3 block so labels/ports never mask
+  // Grid + footprint (no overlaps)
   const GRID = { cellH: 70, cellW: 80 };
   const FOOTPRINT = { w: 3, h: 3 };
 
+  // ---------- External endpoints (demo-safe placeholders) ----------
   const DEFAULT_HTTP = {
     pms_upcoming: "https://example.com/pms/upcoming",
     pms_update:   "https://example.com/pms/update",
@@ -32,7 +35,7 @@
     inspect:      "https://example.com/inspect"
   };
 
-  // ---------- Rules ----------
+  // ---------- Archetype detection ----------
   const ARCH_RULES = [
     { a:'APPOINTMENT_SCHEDULING', rx:/(appointment|appointments|scheduling|no[-_ ]?show|calendar)/i },
     { a:'CUSTOMER_SUPPORT_INTAKE', rx:/\b(cs|support|helpdesk|ticket|sla|triage|escalation|deflection|kb)\b/i },
@@ -44,7 +47,7 @@
     { a:'RENEWALS_CSM', rx:/\b(renewal|qbr|success|csm|upsell|cross-?sell)\b/i },
     { a:'AR_FOLLOWUP', rx:/\b(a\/?r|accounts?\s*receivable|invoice|collections?|dso|reconciliation)\b/i },
     { a:'AP_AUTOMATION', rx:/\b(a\/?p|accounts?\s*payable|invoices?|3[-\s]?way|three[-\s]?way|matching|approvals?)\b/i },
-    { a:'INVENTORY_MONITOR', rx:/\b(inventory|stock|sku|threshold|warehouse|3pl|wms|backorder)\b/i },
+    { a:'INVENTORY_MONITOR', rx:/\b(inventory|stock|sku|threshold|warehouse|wms|3pl|backorder)\b/i },
     { a:'REPLENISHMENT_PO', rx:/\b(replenishment|purchase[-_ ]?order|po|procure|procurement|vendors?|suppliers?)\b/i },
     { a:'FIELD_SERVICE_DISPATCH', rx:/\b(dispatch|work[-_ ]?orders?|technicians?|field|geo|eta|route|yard)\b/i },
     { a:'COMPLIANCE_AUDIT', rx:/\b(compliance|audit|audits|policy|governance|sox|iso|gdpr|hipaa|attestation)\b/i },
@@ -125,8 +128,8 @@
     return f;
   }
 
-  // ---------- Block-occupancy (no overlaps) ----------
-  function baseWorkflow(name){ return { name, nodes:[], connections:{}, active:false, settings:{}, staticData:{}, __occ:new Set() }; }
+  // ---------- Base workflow + occupancy ----------
+  function baseWorkflow(name){ return { name, nodes:[], connections:{}, active:false, settings:{ executionOrder:"v1", timezone:"Europe/Madrid" }, staticData:{}, __occ:new Set() }; }
   function uniqueName(wf, base){ const ex=new Set((wf.nodes||[]).map(n=>String(n.name||'').toLowerCase())); let nm=base||'Node',i=1; while(ex.has(nm.toLowerCase())){ i++; nm=`${base} #${i}`;} return nm; }
   const key=(x,y)=>`${x}:${y}`;
   function blockCells(x,y,w=FOOTPRINT.w,h=FOOTPRINT.h){ const sx=snapX(x), sy=snapY(y); const cells=[]; for(let dx=0;dx<w;dx++) for(let dy=0;dy<h;dy++) cells.push(key(sx+dx*GRID.cellW, sy+dy*GRID.cellH)); return cells; }
@@ -211,6 +214,110 @@
     return addSet(wf, `Send ${channel.toUpperCase()}`, { sent:`={{true}}` }, x, y);
   }
 
+  // ---------- Agent contracts (schemas) ----------
+  const SCHEMA_PREFLIGHT = `{
+    "intent":"string",
+    "user_state_hypotheses":["string"],
+    "risks":["string"],
+    "kpis":["string"],
+    "channels_ranked":["email","whatsapp","sms","call"],
+    "guardrails":["string"]
+  }`;
+  const SCHEMA_PLANNER = `{
+    "branches":[{"name":"string"}],
+    "decisions":[{"step":"number","name":"string"}],
+    "steps":["string"],
+    "error_catalog":[{"code":"string","hint":"string"}]
+  }`;
+  const SCHEMA_COMPOSER = `{
+    "email":{"subject":"string","body":"string"},
+    "whatsapp":{"body":"string"},
+    "sms":{"body":"string"},
+    "call":{"script":"string"}
+  }`;
+  const SCHEMA_QA = `{"ok":true, "reasons":["string"], "fixups":[{"field":"string","value":"string"}]}`;
+  const SCHEMA_SUMMARY = `{"highlights":["string"],"decisions_taken":["string"],"next_actions":["string"]}`;
+
+  const SYS_PREFLIGHT = `You are PreFlight, distilling messy scenario fields into a clean JSON context. Output strict JSON.`;
+  const SYS_PLANNER   = `You are Planner. Build a numbered decision plan for this archetype. Output strict JSON.`;
+  const SYS_COMPOSER  = `You are Channel Composer. Return channel-specific copy/scripts grounded in context. JSON only.`;
+  const SYS_QA        = `You are QA. Validate tone, safety, presence of required fields. Propose minimal fixups. JSON only.`;
+  const SYS_SUMMARY   = `You are Summarizer. Produce concise highlights for BI/Slack. JSON only.`;
+
+  // ---------- Agent helper (Agent → Parser → Validator) ----------
+  function addAgent(wf, cfg){
+    const {
+      role='Agent',
+      x=0,y=0,
+      systemPrompt='You are an agent.',
+      userPromptExpr='={{$json}}',
+      schema=SCHEMA_PREFLIGHT,
+      modelName='gpt-5-mini',
+      temperature=0.2,
+      credsName='OpenAi account' // update to your credential name in n8n if different
+    } = cfg;
+
+    // Language Model (LM)
+    const lmName = addNode(wf, {
+      id: uid('lm'),
+      name: `${role} · OpenAI Chat Model`,
+      type: "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      typeVersion: 1.2,
+      position: pos(x, y + 152),
+      parameters: { model: { "__rl": true, "value": modelName, "mode": "list", "cachedResultName": modelName }, options: { temperature } },
+      credentials: { openAiApi: { id: "OpenAI_Creds_Id", name: credsName } }
+    });
+
+    // Structured Parser
+    const parserName = addNode(wf, {
+      id: uid('parser'),
+      name: `${role} · Structured Parser`,
+      type: "@n8n/n8n-nodes-langchain.outputParserStructured",
+      typeVersion: 1.3,
+      position: pos(x + 144, y + 268),
+      parameters: { jsonSchemaExample: schema }
+    });
+
+    // Agent
+    const agentName = addNode(wf, {
+      id: uid('agent'),
+      name: `${role}`,
+      type: "@n8n/n8n-nodes-langchain.agent",
+      typeVersion: 2.2,
+      position: pos(x, y),
+      parameters: {
+        promptType: "define",
+        text: userPromptExpr,
+        hasOutputParser: true,
+        options: { systemMessage: `=${systemPrompt}` }
+      }
+    });
+
+    // Wire LM/Parser → Agent
+    wf.connections[lmName] = { ai_languageModel: [[{ node: agentName, type: "ai_languageModel", index: 0 }]] };
+    wf.connections[parserName] = { ai_outputParser: [[{ node: agentName, type: "ai_outputParser", index: 0 }]] };
+
+    // JSON Validator (code) ensures valid object and optionally merges fixups in QA step
+    const validatorName = addNode(wf, {
+      id: uid('code'),
+      name: `${role} · JSON Validator`,
+      type: "n8n-nodes-base.code",
+      typeVersion: 2,
+      position: pos(x + 300, y),
+      parameters: {
+        jsCode:
+`const out = $json.output ?? $json;
+if (typeof out !== 'object' || Array.isArray(out) || out === null) throw new Error('Agent did not return an object');
+return [out];`
+      }
+    });
+
+    // Connect Agent → Validator
+    connect(wf, agentName, validatorName);
+
+    return { in: agentName, out: validatorName, lm: lmName, parser: parserName };
+  }
+
   // ---------- Messaging ----------
   function composeBody(archetype, channel, s, industry){
     const ctx = {
@@ -236,13 +343,8 @@
     }
   }
 
-  // ---------- Archetype “plays” (same as previous answer; trimmed) ----------
-  const amplify = (branches)=> (branches||[]).map(b=>{
-    const extra = { name:'Store · Audit trail', kind:'store' };
-    const dup = JSON.parse(JSON.stringify(b));
-    dup.steps = (dup.steps||[]).concat([extra]);
-    return dup;
-  });
+  // ---------- Plays (same structure you had; trimmed for space) ----------
+  const amplify = (branches)=> (branches||[]).map(b=>{ const extra = { name:'Store · Audit trail', kind:'store' }; const dup = JSON.parse(JSON.stringify(b)); dup.steps = (dup.steps||[]).concat([extra]); return dup; });
 
   function playsScheduling(features, deep, approvals){
     const base = [{
@@ -275,7 +377,6 @@
         ]}
       ].filter(Boolean)
     }];
-
     const alt = [{
       name:'Scheduling',
       steps:[
@@ -289,7 +390,6 @@
         ]}
       ].filter(Boolean)
     }];
-
     const noshow = [{
       name:'Scheduling',
       steps:[
@@ -304,7 +404,6 @@
         ]}
       ]
     }];
-
     const plays = [base, alt, noshow];
     return deep ? plays.map(amplify) : plays;
   }
@@ -446,15 +545,16 @@
     else plays = playsGeneric(features, seed.deep);
 
     const picked = plays[seed.idx % plays.length];
-
     const title = `${scenario?.scenario_id||'Scenario'} — ${scenario?.name||''}`.trim();
     const wf = baseWorkflow(title);
 
+    // Zone headers & triggers
     addHeader(wf, 'FLOW AREA · PRODUCTION', LAYOUT.header.x, LAYOUT.header.y);
     const manual = addManual(wf, LAYOUT.start.x, LAYOUT.start.y, 'Manual Trigger');
     const simTrig = addSimTrigger(wf, triggerKind, LAYOUT.start.x + Math.floor(LAYOUT.stepX*0.7), LAYOUT.start.y);
     connect(wf, manual, simTrig);
 
+    // Init context
     const init = addSet(
       wf,
       'Init Context',
@@ -473,12 +573,45 @@
     );
     connect(wf, simTrig, init);
 
-    let cursor = init;
-    if (archetype==='APPOINTMENT_SCHEDULING' && deriveFeatures(scenario).has('pms')){
-      const fetch = addHTTP(wf, 'Fetch · Upcoming (PMS)', `={{'${DEFAULT_HTTP.pms_upcoming}'}}`, '={{$json}}', LAYOUT.start.x + 3*LAYOUT.stepX, LAYOUT.start.y);
-      connect(wf, cursor, fetch); cursor = fetch;
+    // ----------- Agents: Pre-flight + optional domain lookups + Planner -----------
+    const preflight = addAgent(wf, {
+      role: 'Pre-flight Context Agent',
+      x: LAYOUT.start.x + 3*LAYOUT.stepX,
+      y: LAYOUT.start.y - 120,
+      systemPrompt: `=${SYS_PREFLIGHT}`,
+      userPromptExpr:
+        `=Distill this context into ${SCHEMA_PREFLIGHT} JSON:\n` +
+        `{\n  "industry": "${industry?.industry_id||''}",\n  "tags": ${JSON.stringify(listify(scenario["tags (;)"]||scenario.tags))},\n  "triggers": "{{ $json['scenario.triggers'] }}",\n  "best_reply_shapes": ["email","whatsapp","sms","call"],\n  "risk_notes": "{{ $json['scenario.risk_notes'] }}",\n  "roi_hypothesis": "{{ $json['scenario.roi_hypothesis'] }}"\n}`,
+      schema: SCHEMA_PREFLIGHT
+    });
+    connect(wf, init, preflight.in);
+
+    let cursorAfterPlan = preflight.out;
+
+    // Optional PMS lookup (example)
+    if (archetype==='APPOINTMENT_SCHEDULING' && features.has('pms')){
+      const fetch = addHTTP(wf, 'Fetch · Upcoming (PMS)', `={{'${DEFAULT_HTTP.pms_upcoming}'}}`, '={{$json}}', LAYOUT.start.x + 4*LAYOUT.stepX, LAYOUT.start.y);
+      connect(wf, preflight.out, fetch);
+      cursorAfterPlan = fetch;
     }
 
+    const planner = addAgent(wf, {
+      role: 'Planner / Schema-Map Agent',
+      x: LAYOUT.start.x + 4*LAYOUT.stepX + 200,
+      y: LAYOUT.start.y - 120,
+      systemPrompt: `=${SYS_PLANNER}`,
+      userPromptExpr:
+        `=Given PREFLIGHT_JSON + quick facts, emit ${SCHEMA_PLANNER}:\n` +
+        `{\n  "archetype": "${archetype}",\n  "preflight": {{$json}},\n  "facts": {"has_pms": ${features.has('pms')}, "has_crm": ${features.has('crm')}}\n}`,
+      schema: SCHEMA_PLANNER
+    });
+    connect(wf, cursorAfterPlan, planner.in);
+
+    // Communication stage
+    const commX = LAYOUT.start.x + Math.floor(2.0*LAYOUT.stepX);
+    const commStage = (y)=> addSet(wf, 'Communication (Stage)', { '__stage':'={{\"communication\"}}' }, commX, y);
+
+    // Branching by picked play
     const sw = addSwitch(
       wf,
       'Branch',
@@ -487,10 +620,7 @@
       LAYOUT.switchX,
       LAYOUT.start.y
     );
-    connect(wf, cursor, sw);
-
-    const commX = LAYOUT.start.x + Math.floor(2.0*LAYOUT.stepX);
-    const commStage = (y)=> addSet(wf, 'Communication (Stage)', { '__stage':'={{\"communication\"}}' }, commX, y);
+    connect(wf, planner.out, sw);
 
     const baseY = (i, total)=> LAYOUT.start.y - Math.floor(LAYOUT.channelY * (Math.max(total,1)-1)/2) + i*LAYOUT.channelY;
     let lastCollector=null;
@@ -509,27 +639,57 @@
       chs.forEach((ch, chIdx)=>{
         const rowY = chFirstY(chs.length) + chIdx*LAYOUT.channelY;
 
+        // Composer Agent (per channel)
+        const composer = addAgent(wf, {
+          role: `Channel Composer (${ch.toUpperCase()})`,
+          x: commX + LAYOUT.stepX,
+          y: rowY - 120,
+          systemPrompt: `=${SYS_COMPOSER}`,
+          userPromptExpr:
+            `=Compose channel bundle ${SCHEMA_COMPOSER} for channel "${ch}" using:\n` +
+            `{\n "preflight": {{$json}},\n "scenario": {\n  "id": "${scenario.scenario_id||''}",\n  "name": "${(scenario.name||'').replace(/"/g,'\\"')}",\n  "how": "${(scenario.how_it_works||'').replace(/"/g,'\\"')}"\n },\n "industry_prompt":"${(industry?.agent_language_prompt||'').replace(/"/g,'\\"')}"\n}`,
+          schema: SCHEMA_COMPOSER
+        });
+
+        // QA Agent
+        const qa = addAgent(wf, {
+          role: `QA / Validator (${ch.toUpperCase()})`,
+          x: commX + LAYOUT.stepX + 300,
+          y: rowY - 120,
+          systemPrompt: `=${SYS_QA}`,
+          userPromptExpr:
+            `=Check the composed bundle and return ${SCHEMA_QA}. Strict JSON. Input: {{$json}}`,
+          schema: SCHEMA_QA
+        });
+
+        // Wire pre → composer → qa
+        connect(wf, pre, composer.in);
+        connect(wf, composer.out, qa.in);
+
+        // Enter row marker
         const enter = addSet(
           wf,
           `[1] Enter · ${branch.name||'Main'} · ${ch.toUpperCase()}`,
           { '__branch':`={{'${String(branch.name||'Main')}'}}`, '__channel':`={{'${ch}'}}` },
-          commX + LAYOUT.stepX,
-          rowY
+          commX + 2*LAYOUT.stepX, rowY
         );
-        if (chIdx===0) connect(wf, pre, enter);
-        if (prevRowCollector) connect(wf, prevRowCollector, enter);
+        connect(wf, qa.out, enter);
 
         let stepIndex=1;
         let prev=enter;
 
+        // Step runner (non-decision)
         const runStep = (st, x, y)=>{
           const kind = String(st.kind||'').toLowerCase();
           const title = `[${++stepIndex}] ${st.name||'Step'}`;
 
           if (kind==='compose'){
-            const body = composeBody(archetype, ch, scenario, industry).replace(/"/g,'\\"');
+            // Use composer output for message
             const subject = scenario.agent_name ? `${scenario.agent_name} — ${scenario.scenario_id||''}` : (scenario.scenario_id||'Update');
-            const node = addSet(wf, title, { 'message':`={{"${body}"}}`, 'subject':`={{'${subject}'}}` }, x, y);
+            const msgExpr = ch==='call' ? "={{$json.call?.script || $json.whatsapp?.body || $json.email?.body || 'Hello!'}}"
+                                        : ch==='whatsapp' ? "={{$json.whatsapp?.body || $json.email?.body || 'Hello!'}}"
+                                        : "={{$json.email?.body || $json.whatsapp?.body || 'Hello!'}}";
+            const node = addSet(wf, title, { 'message': msgExpr , 'subject':`={{'${subject}'}}` }, x, y);
             connect(wf, prev, node); prev=node; return;
           }
           if (kind==='book'){ const node = addHTTP(wf, title, `={{'${DEFAULT_HTTP.calendar_book}'}}`, '={{$json}}', x, y); connect(wf, prev, node); prev=node; return; }
@@ -550,10 +710,8 @@
           const node = addSet(wf, title, { '__note':`={{'pass'}}` }, x, y); connect(wf, prev, node); prev=node;
         };
 
-        // Walk steps with STRONG rule:
-        // if a decision occurs at #N, the switch ONLY connects to N.1 / N.2 outcomes.
+        // Decision walker (strict Switch → N.1/N.2)
         const walk = (steps, baseX, baseY)=>{
-          // pre-reserve outcome rows so nothing else can occupy them later
           const reserveOutcomeRow = (ox, oy)=> reserveBlock(wf, ox, oy, FOOTPRINT.w, FOOTPRINT.h);
 
           for (let i=0;i<steps.length;i++){
@@ -562,7 +720,6 @@
             const kind = String(st.kind||'').toLowerCase();
 
             if (kind==='decision' && Array.isArray(st.outcomes) && st.outcomes.length){
-              // compute outcome Y’s and pre-reserve their first-node cells
               const oys = st.outcomes.map((_o, oi)=>
                 baseY - Math.floor((st.outcomes.length-1)/2)*LAYOUT.outcomeRowY + oi*LAYOUT.outcomeRowY
               );
@@ -572,11 +729,9 @@
               const title = `[${++stepIndex}] ${st.name||'Decision'} (Decision)`;
               const rules = st.outcomes.map(o=>({operation:'equal', value2:String(o.value||'path').slice(0,64)}));
               const dsw = addSwitch(wf, title, "={{$json.__decision || 'default'}}", rules, x, baseY);
-              // IMPORTANT: switch connects ONLY to outcomes below
-              // (no connection from dsw to any later step)
               connect(wf, prev, dsw);
 
-              let chain=null; // outcome chain for rejoin
+              let chain=null;
               st.outcomes.forEach((o, oi)=>{
                 const oy = oys[oi];
                 const oEnter = addSet(wf, `[${stepIndex}.${oi+1}] Outcome · ${o.value||'path'}`, { '__decision':`={{'${String(o.value||'path')}'}}` }, oEnterX, oy);
@@ -585,14 +740,14 @@
                 let prevLocal = oEnter;
                 (Array.isArray(o.steps)?o.steps:[]).forEach((os, ok)=>{
                   const ox = oEnterX + (ok+1)*Math.floor(LAYOUT.stepX*1.0);
-                  // run each outcome step from local prevLocal (not global prev)
                   const kind2 = String(os.kind||'').toLowerCase();
                   const title2 = `[${stepIndex}.${oi+1}.${ok+1}] ${os.name||'Step'}`;
                   let node;
                   if (kind2==='compose'){
-                    const body = composeBody(archetype, ch, scenario, industry).replace(/"/g,'\\"');
-                    const subject = scenario.agent_name ? `${scenario.agent_name} — ${scenario.scenario_id||''}` : (scenario.scenario_id||'Update');
-                    node = addSet(wf, title2, { 'message':`={{"${body}"}}`, 'subject':`={{'${subject}'}}` }, ox, oy);
+                    const msgExpr = ch==='call' ? "={{$json.call?.script || $json.whatsapp?.body || $json.email?.body || 'Hello!'}}"
+                                                : ch==='whatsapp' ? "={{$json.whatsapp?.body || $json.email?.body || 'Hello!'}}"
+                                                : "={{$json.email?.body || $json.whatsapp?.body || 'Hello!'}}";
+                    node = addSet(wf, title2, { 'message': msgExpr, 'subject':`={{'${scenario.scenario_id||'Update'}'}}` }, ox, oy);
                   } else if (kind2==='book'){
                     node = addHTTP(wf, title2, `={{'${DEFAULT_HTTP.calendar_book}'}}`, '={{$json}}', ox, oy);
                   } else if (kind2==='ticket'){
@@ -620,15 +775,14 @@
                 if(chain) connect(wf, chain, oCol);
                 chain = oCol;
 
-                // after last outcome, add a visible bridge; next top-level step will connect from here
                 if (oi === st.outcomes.length-1){
                   const bridge = addSet(wf, `[${stepIndex}] Branch Continuation`, { '__bridge':'={{true}}' }, sendX + Math.floor(LAYOUT.stepX*0.9), baseY + Math.floor(LAYOUT.outcomeRowY/2) - GRID.cellH);
                   connect(wf, chain, bridge);
-                  prev = bridge; // continue sequence from branch bridge
+                  prev = bridge;
                 }
               });
 
-              continue; // VERY IMPORTANT: do not auto-connect switch to step N+1
+              continue;
             }
 
             // Non-decision step
@@ -641,16 +795,30 @@
         };
 
         const steps = Array.isArray(branch.steps)?branch.steps:[];
-        walk(steps, commX + 2*LAYOUT.stepX, rowY);
+        walk(steps, commX + 3*LAYOUT.stepX, rowY);
 
+        // Sender + Summarizer tail (if not already sent by decision paths)
         const lastIsDecision = steps.some(st=>String(st.kind||'').toLowerCase()==='decision');
         if (!lastIsDecision){
-          const sendX = commX + 2*LAYOUT.stepX + Math.max(1, steps.length)*LAYOUT.stepX;
+          const sendX = commX + 3*LAYOUT.stepX + Math.max(1, steps.length)*LAYOUT.stepX;
           const sender = makeSender(wf, ch, sendX, rowY);
           try{ const idx = wf.nodes.findIndex(n=>n.name===sender); if(idx>=0) wf.nodes[idx].name = `[${++stepIndex}] Send · ${ch.toUpperCase()}`; }catch{}
           connect(wf, prev, sender);
-          const col = addCollector(wf, sendX + Math.floor(LAYOUT.stepX*0.95), rowY);
-          connect(wf, sender, col);
+
+          // Summarizer Agent
+          const summarizer = addAgent(wf, {
+            role: `Summarizer / Logger (${ch.toUpperCase()})`,
+            x: sendX + 240,
+            y: rowY - 120,
+            systemPrompt: `=${SYS_SUMMARY}`,
+            userPromptExpr: `=Summarize the action in ${SCHEMA_SUMMARY} from: {{$json}}`,
+            schema: SCHEMA_SUMMARY
+          });
+          connect(wf, sender, summarizer.in);
+
+          const col = addCollector(wf, sendX + Math.floor(LAYOUT.stepX*1.5), rowY);
+          connect(wf, summarizer.out, col);
+
           if (prevRowCollector) connect(wf, prevRowCollector, col);
           prevRowCollector = col;
         }
@@ -659,6 +827,7 @@
       });
     });
 
+    // Error lane
     if (lastCollector){
       const errY = LAYOUT.start.y + LAYOUT.channelY + 420;
       addHeader(wf, 'ERROR AREA', LAYOUT.start.x + 3*LAYOUT.stepX, errY - 90);
@@ -672,10 +841,11 @@
 
     wf.staticData.__design = {
       layout:{ stepX:LAYOUT.stepX, channelY:LAYOUT.channelY, outcomeRowY:LAYOUT.outcomeRowY, grid:GRID, footprint:FOOTPRINT, antiOverlap:'block' },
-      notes:'Switch connects only to 3.x outcomes; outcome rows are pre-reserved; branch bridge continues to next top-level step.'
+      notes:'Switch connects only to 3.x outcomes; outcome rows are pre-reserved; Composer/QA/Summarizer agents boxed with parser/validator.'
     };
     return wf;
   }
 
+  // Public API
   window.Builder = { buildWorkflowJSON };
 })();

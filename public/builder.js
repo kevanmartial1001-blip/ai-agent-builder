@@ -1,28 +1,27 @@
 // public/builder.js
-// n8n JSON generator — Digital Team + YES/NO Execution (compact, scenario-named actions)
+// Ultra-simple n8n JSON generator — Clean backbone + YES/NO lanes (2–3 steps)
+// Layout inspired by your minimal screenshot.
+//
+// Backbone (6 nodes total):
+// Manual Trigger → Init → 🧠 Context Agent → { } JSON Validator → 🗺️ Plan/Execute Agent → { } JSON Validator
+// Then: YES/NO switch → two short lanes with compact action slots (Pick → END? → Run → Record)
 
 (function () {
   "use strict";
 
-  // ========= Layout =========
+  // ===== Layout (tight & tidy) =====
   const L = {
     stepX: 320,
     header: { x: -900, y: 40 },
     start:  { x: -860, y: 240 },
-    lanesY: { yes: -110, no: 110 }
+    lanesY: { yes: -100, no: 100 }
   };
   const GRID = { cellH: 70, cellW: 80 };
   const FOOT = { w: 3, h: 3 };
 
-  // ========= Demo endpoints (replace in prod) =========
-  const DEMO = {
-    callWebhook: 'https://example.com/call',
-    opsAlert:    'https://example.com/ops/alert'
-  };
-
-  // ========= Utils =========
-  const uid = (p)=>`${p}_${Math.random().toString(36).slice(2,10)}`;
-  const pos = (x,y)=>[x,y];
+  // ===== Utils =====
+  const uid=(p)=>`${p}_${Math.random().toString(36).slice(2,10)}`;
+  const pos=(x,y)=>[x,y];
   const snapX=(x)=> Math.round(x/GRID.cellW)*GRID.cellW;
   const snapY=(y)=> Math.round(y/GRID.cellH)*GRID.cellH;
 
@@ -61,24 +60,18 @@
     wf.connections[from].main[outputIndex].push({ node: to, type:"main", index:0 });
   }
 
-  // ========= Palette =========
+  // ===== Palette (tiny) =====
   function addHeader(wf,label,x,y){
     return addNode(wf,{ id:uid('label'), name:`=== ${label} ===`,
       type:'n8n-nodes-base.set', typeVersion:2, position:pos(x,y),
       parameters:{ keepOnlySet:false, values:{ string:[{ name:'__zone', value:`={{'${label}'}}` }] } }
     });
   }
-  function addTitle(wf,text,x,y){
-    return addNode(wf,{ id:uid('note'), name:`🧭 ${text}`,
-      type:'n8n-nodes-base.set', typeVersion:2, position:pos(x,y),
-      parameters:{ keepOnlySet:false, values:{ string:[{ name:'__title', value:`={{'${text.replace(/'/g,"\\'")}'}}` }] } }
-    });
-  }
   function addManual(wf,x,y,label='Manual Trigger'){
     return addNode(wf,{ id:uid('manual'), name:label, type:'n8n-nodes-base.manualTrigger', typeVersion:1, position:pos(x,y), parameters:{} });
   }
   function addSimTrigger(wf, kind, x, y){
-    return addNode(wf,{ id:uid('sim'), name:`Simulated Trigger · ${String(kind||'CRON').toUpperCase()}`,
+    return addNode(wf,{ id:uid('sim'), name:`Init Source · ${String(kind||'CRON').toUpperCase()}`,
       type:'n8n-nodes-base.set', typeVersion:2, position:pos(x,y),
       parameters:{ keepOnlySet:false, values:{ string:[{ name:'__trigger', value:`={{'${String(kind||'cron').toUpperCase()}'}}` }] } }
     });
@@ -88,68 +81,51 @@
     return addNode(wf,{ id:uid('set'), name, type:'n8n-nodes-base.set', typeVersion:2, position:pos(x,y),
       parameters:{ keepOnlySet:false, values:{ string: stringVals } } });
   }
-  function addHTTP(wf,name,urlExpr,bodyExpr,x,y,method='POST'){
-    return addNode(wf,{ id:uid('http'), name, type:'n8n-nodes-base.httpRequest', typeVersion:4, position:pos(x,y),
-      parameters:{ url:urlExpr, method, jsonParameters:true, sendBody:true, bodyParametersJson:bodyExpr, options:{ fullResponse:true } }
-    });
-  }
   function addSwitch(wf,name,valueExpr,rules,x,y){
     const safe=(rules||[]).map(r=>({ operation:r.operation||'equal', value2:String(r.value2??'') }));
     return addNode(wf,{ id:uid('switch'), name, type:'n8n-nodes-base.switch', typeVersion:2, position:pos(x,y),
       parameters:{ value1:valueExpr, rules:safe }});
   }
 
-  // ========= Agent contracts =========
-  const SCHEMA_PREFLIGHT = `{"intent":"string","user_state_hypotheses":["string"],"risks":["string"],"kpis":["string"],"channels_ranked":["email","whatsapp","sms","call"],"guardrails":["string"]}`;
-  const SCHEMA_RESEARCH  = `{"company":{"name":"string","domain":"string","geo":"string","stack":["string"]},"personas":["string"],"intel":["string"]}`;
-  const SCHEMA_PLANNER   = `{"steps":["string"],"decisions":[{"step":"number","name":"string","outcomes":["string"]}],"error_catalog":[{"code":"string","hint":"string"}]}`;
-  const SCHEMA_ORCH      = `{"tool_calls":[{"name":"string","url":"string","payload":{"_":"any"},"on_success_next":"string","on_error_next":"string"}]}`;
-  const SCHEMA_COMPOSER  = `{"email":{"subject":"string","body":"string"},"whatsapp":{"body":"string"},"sms":{"body":"string"},"call":{"script":"string"}}`;
-  const SCHEMA_QA        = `{"ok":true,"reasons":["string"],"fixups":[{"field":"string","value":"string"}]}`;
-  const SCHEMA_SUMMARY   = `{"highlights":["string"],"decisions_taken":["string"],"next_actions":["string"]}`;
-
-  // ==== Execution (YES/NO only) ====
-  const SCHEMA_EXECUTION = `{
-    "hypothesis":"yes|no",
-    "actions": {
-      "yes":[{"id":"string","type":"http|send_whatsapp|place_call|wait|set|log|END","title":"string","params":{}}],
-      "no":[{"id":"string","type":"http|send_whatsapp|place_call|wait|set|log|END","title":"string","params":{}}]
-    },
-    "env": { "channel_bundle": {"email":{"subject":"string","body":"string"},"whatsapp":{"body":"string"},"call":{"script":"string"}} }
+  // ===== Agents (only 2) =====
+  const SCHEMA_CONTEXT = `{
+    "intent":"string",
+    "inputs":{"company":"string","industry":"string","channels":["email","whatsapp","sms","call"]},
+    "constraints":["string"],
+    "success":"string"
   }`;
 
-  const SYS_PREFLIGHT = `You are PreFlight. Distill messy scenario fields into a clean JSON context. Output strict JSON only.`;
-  const SYS_RESEARCH  = `You are Researcher. Enrich with light company/stack/persona intel using only provided inputs. No web calls. JSON only.`;
-  const SYS_PLANNER   = `You are Planner. Produce a numbered decision plan for this scenario. JSON only.`;
-  const SYS_ORCH      = `You are Orchestrator. Turn the plan into concrete tool calls/steps. JSON only.`;
-  const SYS_COMPOSER  = `You are Composer. Produce channel-specific copy/scripts grounded in context. JSON only.`;
-  const SYS_QA        = `You are QA. Validate the bundle & propose minimal fixups. JSON only.`;
-  const SYS_SUMMARY   = `You are Summarizer. Output concise highlights for BI/Slack. JSON only.`;
+  const SCHEMA_EXEC = `{
+    "hypothesis":"yes|no",
+    "actions":{
+      "yes":[{"id":"string","title":"string","type":"send_message|check_data|place_call|wait|http|END","params":{}}],
+      "no":[{"id":"string","title":"string","type":"send_message|check_data|place_call|wait|http|END","params":{}}]
+    },
+    "env":{"channel_bundle":{"email":{"subject":"string","body":"string"},"whatsapp":{"body":"string"},"call":{"script":"string"}}}
+  }`;
 
-  const SYS_EXECUTION = `You are Execution.
-Using validated JSON from Preflight, Research, Planner, Orchestrator, Composer, QA:
-- Choose the best "hypothesis": yes OR no (to reach the scenario goal).
-- For BOTH lanes provide up to 3 ordered actions, each with a short human-readable "title" specific to THIS scenario.
-- Allowed action types: http | send_whatsapp | place_call | wait | set | log | END.
-- Reuse Orchestrator URLs; reuse Composer content via env.channel_bundle.
-- Be concise, deterministic and safe. JSON only.`;
+  const SYS_CONTEXT = `You are 🧠 Context. Convert the scenario fields into a minimal contract ${SCHEMA_CONTEXT}. JSON only.`;
+  const SYS_EXEC    = `You are 🗺️ Planner/Executor. From Context produce ${SCHEMA_EXEC}.
+- Choose hypothesis yes|no to best reach 'success'.
+- Provide up to 3 actions per lane with short, scenario-specific 'title'.
+- Allowed types: send_message | check_data | place_call | wait | http | END.
+- Use env.channel_bundle content for messages. JSON only.`;
 
-  // ========= Agent helper (Agent → Parser → Validator) =========
   function addAgent(wf, cfg){
     const {
-      role='Agent', x=0, y=0, systemPrompt='You are an agent.', userPromptExpr='={{$json}}',
-      schema=SCHEMA_PREFLIGHT, modelName='gpt-5-mini', temperature=0.2, credsName='OpenAi account'
+      role='Agent', x=0, y=0, systemPrompt='You are agent.', userPromptExpr='={{$json}}',
+      schema=SCHEMA_CONTEXT, modelName='gpt-5-mini', temperature=0.2
     } = cfg;
 
     const lm = addNode(wf, {
       id: uid('lm'), name: `${role} · OpenAI Chat Model`,
-      type: "@n8n/n8n-nodes-langchain.lmChatOpenAi", typeVersion: 1.2, position: pos(x, y+152),
+      type: "@n8n/n8n-nodes-langchain.lmChatOpenAi", typeVersion: 1.2, position: pos(x, y+148),
       parameters: { model: { "__rl": true, "value": modelName, "mode": "list", "cachedResultName": modelName }, options: { temperature } },
-      credentials: { openAiApi: { id: "OpenAI_Creds_Id", name: credsName } }
+      credentials: { openAiApi: { id: "OpenAI_Creds_Id", name: "OpenAi account" } }
     });
     const parser = addNode(wf, {
       id: uid('parser'), name: `${role} · Structured Parser`,
-      type: "@n8n/n8n-nodes-langchain.outputParserStructured", typeVersion: 1.3, position: pos(x+144, y+268),
+      type: "@n8n/n8n-nodes-langchain.outputParserStructured", typeVersion: 1.3, position: pos(x+144, y+260),
       parameters: { jsonSchemaExample: schema }
     });
     const agent = addNode(wf, {
@@ -157,7 +133,7 @@ Using validated JSON from Preflight, Research, Planner, Orchestrator, Composer, 
       type: "@n8n/n8n-nodes-langchain.agent", typeVersion: 2.2, position: pos(x, y),
       parameters: { promptType:"define", text: userPromptExpr, hasOutputParser:true, options:{ systemMessage:`=${systemPrompt}` } }
     });
-    // wire
+    // Wire
     wf.connections[lm]     = { ai_languageModel: [[{ node: agent, type: "ai_languageModel", index: 0 }]] };
     wf.connections[parser] = { ai_outputParser:  [[{ node: agent, type: "ai_outputParser",  index: 0 }]] };
 
@@ -166,159 +142,65 @@ Using validated JSON from Preflight, Research, Planner, Orchestrator, Composer, 
       type: "n8n-nodes-base.code", typeVersion: 2, position: pos(x+300, y),
       parameters: { jsCode:
 `const out = $json.output ?? $json;
-if (typeof out !== 'object' || out === null || Array.isArray(out)) throw new Error('Agent did not return an object');
+if (!out || typeof out !== 'object' || Array.isArray(out)) throw new Error('Invalid JSON');
 return [out];` }
     });
     connect(wf, agent, validator);
 
-    return { in: agent, out: validator, lm, parser };
+    return { in: agent, out: validator };
   }
 
-  // ========= Digital team =========
-  function makeTeam(){
-    return [
-      { key:'preflight',  role:'Pre-flight Context Agent', schema:SCHEMA_PREFLIGHT, sys:SYS_PREFLIGHT,
-        user:(s,i)=>`=Distill scenario into ${SCHEMA_PREFLIGHT}:\n${scenarioJSON(s,i)}` },
-      { key:'research',   role:'Research Agent',           schema:SCHEMA_RESEARCH,  sys:SYS_RESEARCH,
-        user:(s,i)=>`=Light research from inputs only into ${SCHEMA_RESEARCH}:\n${scenarioJSON(s,i)}` },
-      { key:'planner',    role:'Planner / Schema-Map Agent',schema:SCHEMA_PLANNER,  sys:SYS_PLANNER,
-        user:(s,i)=>`=Plan into ${SCHEMA_PLANNER}. Context:\n{{$json}}` },
-      { key:'orch',       role:'Ops / Tool Orchestrator',  schema:SCHEMA_ORCH,      sys:SYS_ORCH,
-        user:(s,i)=>`=Turn the plan into concrete tool calls ${SCHEMA_ORCH}. Input:\n{{$json}}` },
-      { key:'composer',   role:'Channel Composer',         schema:SCHEMA_COMPOSER,  sys:SYS_COMPOSER,
-        user:(s,i)=>`=Compose channel bundle ${SCHEMA_COMPOSER} using context & plan:\n{{$json}}` },
-      { key:'qa',         role:'QA / Validator',           schema:SCHEMA_QA,        sys:SYS_QA,
-        user:(s,i)=>`=Validate and return ${SCHEMA_QA}. Fixups only if trivial. Input:\n{{$json}}` },
-      { key:'summary',    role:'Summarizer / Logger',      schema:SCHEMA_SUMMARY,   sys:SYS_SUMMARY,
-        user:(s,i)=>`=Summarize into ${SCHEMA_SUMMARY} from:\n{{$json}}` },
-    ];
+  // ===== Compact runner with pretty icons in names =====
+  function actionIcon(type){
+    return ({
+      send_message:'📨', check_data:'🔎', place_call:'☎️', wait:'⏳', http:'🔗', END:'⛳'
+    })[type] || '⚙️';
   }
-  function scenarioJSON(s, industry){
-    return `{
-  "industry":"${industry?.industry_id||''}",
-  "scenario_id":"${s.scenario_id||''}",
-  "name":"${(s.name||'').replace(/"/g,'\\"')}",
-  "triggers":"${(s.triggers||'').replace(/"/g,'\\"')}",
-  "how_it_works":"${(s.how_it_works||'').replace(/"/g,'\\"')}",
-  "roi_hypothesis":"${(s.roi_hypothesis||'').replace(/"/g,'\\"')}",
-  "risk_notes":"${(s.risk_notes||'').replace(/"/g,'\\"')}",
-  "tags": ${JSON.stringify((s["tags (;)"]||s.tags||'').toString().split(/[;,/|\n]+/).map(x=>x.trim()).filter(Boolean))}
-}`;
-  }
-  function addTeamChain(wf, team, originNodeName, baseX, baseY, s, i){
-    let cursor = originNodeName;
-    let x = baseX, y = baseY - 120;
-    const outNodes = {};
-    team.forEach(t=>{
-      const a = addAgent(wf, {
-        role:t.role, x, y, systemPrompt:`=${t.sys}`, userPromptExpr: t.user(s,i),
-        schema:t.schema, modelName:'gpt-5-mini', temperature:(t.key==='composer'?0.5:0.2)
-      });
-      connect(wf, cursor, a.in);
-      cursor = a.out; outNodes[t.key]=a; x += 300;
-    });
-    return { tail: cursor, outNodes };
-  }
-
-  // ========= Fan-in =========
-  function addFanInAgents(wf, labels, x, y){
+  function addUnifiedRunner(wf, x, y, label){
     return addNode(wf, {
-      id: uid('code'), name: 'Fan-in · Consolidate Agent Outputs',
+      id: uid('code'), name: `Run ${label}`,
       type: 'n8n-nodes-base.code', typeVersion: 2, position: pos(x, y),
       parameters: { jsCode:
-`const out = {};
-(${JSON.stringify(labels)}).forEach((label, i) => {
-  const it = $items(i) || [];
-  const last = it.length ? it[it.length-1].json : {};
-  out[label] = last;
-});
-return [out];`
-      }
-    });
-  }
-
-  // ========= Execution Agent =========
-  function addExecutionAgent(wf, x, y){
-    return addAgent(wf, {
-      role: 'Execution Agent',
-      x, y,
-      systemPrompt: `=${SYS_EXECUTION}`,
-      userPromptExpr: `=Build the playbook ${SCHEMA_EXECUTION} from all prior agent JSON:\n{{$json}}`,
-      schema: SCHEMA_EXECUTION,
-      modelName: 'gpt-5-mini',
-      temperature: 0.2
-    });
-  }
-
-  // ========= Unified runner =========
-  function addUnifiedRunner(wf, x, y){
-    return addNode(wf, {
-      id: uid('code'), name: 'Run Action',
-      type: 'n8n-nodes-base.code', typeVersion: 2, position: pos(x, y),
-      parameters: { jsCode:
-`const a = $json.__action || {};
-const env = $json.env || {};
+`const a = $json.__action || { type:'END', title:'END', params:{} };
 async function run(){
   switch (a.type) {
+    case 'send_message': return { statusCode:200, body:{ delivered:true, to:a.params?.to, text:a.params?.body } };
+    case 'check_data':  return { statusCode:200, body:{ check:a.params||{} } };
+    case 'place_call':  return { statusCode:200, body:{ called:a.params?.to, script:a.params?.script } };
+    case 'wait':        await new Promise(r=>setTimeout(r,(a.params?.seconds||10)*1000)); return { statusCode:200, body:{ waited:a.params?.seconds||10 } };
     case 'http': {
-      const url = a.params?.url;
-      const method = a.params?.method || 'POST';
-      const body = a.params?.body || {};
-      if (!url) return { statusCode: 400, body:{ error:'missing url' } };
-      const res = await this.helpers.httpRequest({
-        url, method, json: true, body, resolveWithFullResponse: true,
-      });
+      const res = await this.helpers.httpRequest({ url:a.params?.url, method:a.params?.method||'POST', json:true, body:a.params?.body||{} , resolveWithFullResponse:true });
       return { statusCode: res.statusCode, body: res.body };
     }
-    case 'send_whatsapp': {
-      return { statusCode: 200, body: { to:a.params?.to, text:a.params?.body || env.channel_bundle?.whatsapp?.body || 'Hi' } };
-    }
-    case 'place_call': {
-      return { statusCode: 200, body: { to:a.params?.to, script: a.params?.script || env.channel_bundle?.call?.script || 'Hello' } };
-    }
-    case 'wait': {
-      const ms = Math.max(0, (a.params?.seconds||30) * 1000);
-      await new Promise(r => setTimeout(r, ms));
-      return { statusCode: 200, body: { waitedMs: ms } };
-    }
-    case 'set':  return { statusCode: 200, body: { set: a.params || {} } };
-    case 'log':  return { statusCode: 200, body: { log: a.params || {} } };
     case 'END':
-    default:     return { statusCode: 200, body: { noop:true } };
+    default:            return { statusCode:200, body:{ noop:true } };
   }
 }
-return run().then(r => [ { ...$json, ...r } ]);`
+return run().then(r => [{ ...$json, ...r }]);`
       }
     });
   }
-
-  // ========= Record node (includes scenario-aware title) =========
-  function addRecordResult(wf, idx, lane, x, y, scenario){
-    const label = `[${lane.toUpperCase()} ${idx}] Record — ${scenario.scenario_id||'Scenario'}`;
-    return addNode(wf, { id: uid('code'), name: label,
-      type:'n8n-nodes-base.code', typeVersion:2, position:pos(x,y),
-      parameters:{ jsCode:
-`const prev = $items(0,0)?.json || {};
-const recs = Array.isArray(prev.__results) ? prev.__results : [];
-const status = $json.statusCode ?? 200;
-recs.push({ lane:'${lane}', i:${idx}, action: prev.__action?.id, title: prev.__action?.title, type: prev.__action?.type, status });
-return [{ ...prev, __results: recs }];` }});
-  }
-
-  // ========= Pick & END? =========
-  function addPickAction(wf, idx, lane, x, y, scenario){
-    const pretty = (s)=> String(s||'').slice(0,60);
+  function addRecord(wf, x, y, lane, idx, scenario){
     return addNode(wf, {
-      id: uid('code'),
-      name: `[${lane.toUpperCase()} ${idx}] Pick — ${pretty(scenario.name)}`,
+      id: uid('code'), name: `Record · ${scenario.scenario_id||'Scenario'} · ${lane.toUpperCase()} #${idx}`,
       type: 'n8n-nodes-base.code', typeVersion: 2, position: pos(x, y),
       parameters: { jsCode:
-`const lane = '${lane}';
-const i = ${idx} - 1;
-const play = $json || {};
-const list = (play.actions && Array.isArray(play.actions[lane])) ? play.actions[lane] : [];
-const a = list[i] || { id:'END', type:'END', title:'END', params:{} };
-return [{ ...play, __lane: lane, __i:${idx}, __action: a }];`
+`const p = $items(0,0)?.json || {};
+const arr = Array.isArray(p.__results)?p.__results:[];
+arr.push({ lane:'${lane}', idx:${idx}, title:p.__action?.title, type:p.__action?.type, status:$json.statusCode });
+return [{ ...p, __results: arr }];`
+      }
+    });
+  }
+  function addPick(wf, x, y, lane, idx, scenario){
+    return addNode(wf, {
+      id: uid('code'), name: `${lane==='yes'?'✅ YES':'❌ NO'} · Pick #${idx} — ${String(scenario.name||'').slice(0,48)}`,
+      type: 'n8n-nodes-base.code', typeVersion: 2, position: pos(x, y),
+      parameters: { jsCode:
+`const lane='${lane}', i=${idx}-1, play=$json||{};
+const list=(play.actions && Array.isArray(play.actions[lane]))?play.actions[lane]:[];
+const a=list[i] || { id:'END', title:'END', type:'END', params:{} };
+return [{ ...play, __action:a }];`
       }
     });
   }
@@ -330,34 +212,27 @@ return [{ ...play, __lane: lane, __i:${idx}, __action: a }];`
     });
   }
 
-  // ========= One compact action slot =========
-  function addActionSlot(wf, idx, lane, x, baseY, scenario){
+  function addActionSlot(wf, lane, idx, x, baseY, scenario){
     const y = baseY + (L.lanesY[lane]||0);
-    const pick  = addPickAction(wf, idx, lane, x, y, scenario);
-    const ifEnd = addIfEnd(wf, x+200, y);             connect(wf, pick, ifEnd);
+    const pick = addPick(wf, x, y, lane, idx, scenario);
+    const endQ = addIfEnd(wf, x+180, y); connect(wf, pick, endQ);
 
-    // Name the runner node with scenario + action title at runtime (title visible in Record)
-    const run   = addUnifiedRunner(wf, x+420, y);     connect(wf, ifEnd, run, 1);
-    const rec   = addRecordResult(wf, idx, lane, x+660, y, scenario); connect(wf, run, rec);
+    const labelExpr = `${lane.toUpperCase()} #${idx}`;
+    const run  = addUnifiedRunner(wf, x+380, y, labelExpr); connect(wf, endQ, run, 1);
+    const rec  = addRecord(wf, x+620, y, lane, idx, scenario); connect(wf, run, rec);
 
-    const done  = addSet(wf, `[${lane.toUpperCase()} ${idx}] END`, { [`__end_${lane}_${idx}`]:"={{true}}" }, x+420, y-110);
-    connect(wf, ifEnd, done, 0);
-
+    const done = addSet(wf, `${lane==='yes'?'✅':'❌'} Lane ${lane.toUpperCase()} · Step ${idx} · END`, { [`__end_${lane}_${idx}`]:'={{true}}' }, x+360, y-100);
+    connect(wf, endQ, done, 0);
     return { enter: pick, tail: rec, done };
   }
 
-  // ========= Build a YES/NO lane =========
   function addLane(wf, execOut, lane, x, baseY, steps, scenario){
-    const norm = addNode(wf, { id: uid('set'), name:`Normalize (${lane})`,
-      type:'n8n-nodes-base.set', typeVersion:2, position:pos(x-200, baseY+(L.lanesY[lane]||0)),
-      parameters:{ keepOnlySet:false, values:{ string:[ { name:'env', value:"={{$json.env || {}}}" } ] }}});
+    const norm = addSet(wf, `Normalize (${lane})`, { env:'={{$json.env || {}}}' }, x-200, baseY+(L.lanesY[lane]||0));
     connect(wf, execOut, norm);
 
-    let prev = norm;
-    let firstDone=null;
-
+    let prev = norm, firstDone=null;
     for(let i=1;i<=steps;i++){
-      const slot = addActionSlot(wf, i, lane, x + (i-1)*L.stepX, baseY, scenario);
+      const slot = addActionSlot(wf, lane, i, x + (i-1)*L.stepX, baseY, scenario);
       connect(wf, prev, slot.enter);
       prev = slot.tail;
       if(!firstDone) firstDone = slot.done;
@@ -368,84 +243,91 @@ return [{ ...play, __lane: lane, __i:${idx}, __action: a }];`
     return done;
   }
 
-  // ========= Build main workflow =========
-  function buildWorkflowJSON(scenario, industry, opts = {}){
-    const title = `${scenario?.scenario_id||'Scenario'} — ${scenario?.name||''}`.trim();
+  // ===== Main build =====
+  function buildWorkflowJSON(s, industry, opts={}){
+    const title = `${s?.scenario_id||'Scenario'} — ${s?.name||''}`.trim();
     const wf = baseWorkflow(title);
 
-    // Title & header
-    addHeader(wf, 'FLOW AREA · PRODUCTION', L.header.x, L.header.y);
-    addTitle(wf, `${scenario?.scenario_id||''} · ${scenario?.name||''}`, L.header.x + 260, L.header.y + 10);
+    // Header + tiny intro row
+    addHeader(wf, 'FLOW · SIMPLE', L.header.x, L.header.y);
+    const trig = addManual(wf, L.start.x, L.start.y, 'Manual Trigger');
+    const initSrc = addSimTrigger(wf, 'CRON', L.start.x + Math.floor(L.stepX*0.7), L.start.y);
+    connect(wf, trig, initSrc);
 
-    // Trigger row
-    const manual = addManual(wf, L.start.x, L.start.y, 'Manual Trigger');
-    const simTrig = addSimTrigger(wf, 'CRON', L.start.x + Math.floor(L.stepX*0.7), L.start.y);
-    connect(wf, manual, simTrig);
-
-    // Init
-    const init = addSet(wf,'Init Context',{
-      'scenario.scenario_id': `={{'${scenario.scenario_id||''}'}}`,
-      'scenario.agent_name':  `={{'${scenario.agent_name||''}'}}`,
-      'scenario.name':        `={{'${(scenario.name||'').replace(/'/g,"\\'")}'}}`,
-      'scenario.triggers':    `={{'${(scenario.triggers||'').replace(/'/g,"\\'")}'}}`,
-      'scenario.how_it_works':`={{'${(scenario.how_it_works||'').replace(/'/g,"\\'")}'}}`,
-      'scenario.roi_hypothesis':`={{'${(scenario.roi_hypothesis||'').replace(/'/g,"\\'")}'}}`,
-      'scenario.risk_notes':  `={{'${(scenario.risk_notes||'').replace(/'/g,"\\'")}'}}`,
-      'scenario.tags':        `={{${JSON.stringify((scenario["tags (;)"]||scenario.tags||'').toString().split(/[;,/|\n]+/).map(x=>x.trim()).filter(Boolean))}}}`
-    }, L.start.x + 2*L.stepX, L.start.y);
-    connect(wf, simTrig, init);
-
-    // Digital Team
-    const team = makeTeam();
-    const { outNodes } = addTeamChain(wf, team, init, L.start.x + 3*L.stepX, L.start.y, scenario, industry);
-
-    // Fan-in validators
-    const fanIn = addFanInAgents(wf, ['preflight','research','planner','orchestrator','composer','qa'], L.start.x + 5*L.stepX + 40, L.start.y - 160);
-    if (outNodes.preflight) connect(wf, outNodes.preflight.out, fanIn);
-    if (outNodes.research)  connect(wf, outNodes.research.out,  fanIn);
-    if (outNodes.planner)   connect(wf, outNodes.planner.out,   fanIn);
-    if (outNodes.orch)      connect(wf, outNodes.orch.out,      fanIn);
-    if (outNodes.composer)  connect(wf, outNodes.composer.out,  fanIn);
-    if (outNodes.qa)        connect(wf, outNodes.qa.out,        fanIn);
-
-    // Execution Agent
-    const exec = addExecutionAgent(wf, L.start.x + 6*L.stepX + 40, L.start.y - 160);
-    connect(wf, fanIn, exec.in);
-
-    // Route by hypothesis YES / NO
-    const hypSwitch = addSwitch(wf, 'Route by Hypothesis', "={{$json.hypothesis}}",
-      [{operation:'equal', value2:'yes'}, {operation:'equal', value2:'no'}],
-      L.start.x + 6*L.stepX + 320, L.start.y - 160
+    // Init (only the essentials shown in UI)
+    const init = addSet(
+      wf,
+      'Init Context',
+      {
+        'scenario.id': `={{'${s.scenario_id||''}'}}`,
+        'scenario.name': `={{'${(s.name||'').replace(/'/g,"\\'")}'}}`,
+        'industry.id': `={{'${industry?.industry_id||''}'}}`,
+        'channels': `={{${JSON.stringify(['email','whatsapp','sms','call'])}}}`
+      },
+      L.start.x + 2*L.stepX, L.start.y
     );
-    connect(wf, exec.out, hypSwitch);
+    connect(wf, initSrc, init);
 
-    // Lanes with scenario-aware labels (3 actions max)
-    const baseX = L.start.x + 7*L.stepX;
-    const baseY = L.start.y - 30;
-    const stepsPerLane = Math.max(1, Math.min(3, opts.maxActionsPerLane || 3));
+    // 🧠 Context Agent
+    const ctx = addAgent(wf, {
+      role:'🧠 Pre-flight Context',
+      x: L.start.x + 3*L.stepX, y: L.start.y,
+      systemPrompt:`=${SYS_CONTEXT}`,
+      userPromptExpr: `=Create ${SCHEMA_CONTEXT} from:\n${scenarioJSON(s,industry)}`,
+      schema: SCHEMA_CONTEXT, temperature:0.2
+    });
+    connect(wf, init, ctx.in);
 
-    const laneYesDone = addLane(wf, exec.out, 'yes', baseX, baseY, stepsPerLane, scenario);
-    const laneNoDone  = addLane(wf, exec.out, 'no',  baseX, baseY, stepsPerLane, scenario);
+    // 🗺️ Planner/Executor
+    const exec = addAgent(wf, {
+      role:'🗺️ Plan / Execute',
+      x: L.start.x + 4*L.stepX, y: L.start.y,
+      systemPrompt:`=${SYS_EXEC}`,
+      userPromptExpr:`=Build ${SCHEMA_EXEC} using Context + scenario inputs:\n{{$json}}`,
+      schema: SCHEMA_EXEC, temperature:0.2
+    });
+    connect(wf, ctx.out, exec.in);
 
-    connect(wf, hypSwitch, laneYesDone, 0);
-    connect(wf, hypSwitch, laneNoDone,  1);
+    // YES/NO switch
+    const hyp = addSwitch(wf, 'Route · YES / NO', "={{$json.hypothesis}}",
+      [{operation:'equal', value2:'yes'},{operation:'equal', value2:'no'}],
+      L.start.x + 5*L.stepX, L.start.y
+    );
+    connect(wf, exec.out, hyp);
 
-    // Post-exec & simple error area
-    const stage = addSet(wf, 'Post-Execution Stage', { '__stage':'={{"post-exec"}}' }, L.start.x + 2*L.stepX, L.start.y + 220);
-    connect(wf, laneYesDone, stage); connect(wf, laneNoDone, stage);
+    // Two tiny lanes (2–3 steps)
+    const baseX = L.start.x + 6*L.stepX;
+    const baseY = L.start.y - 10;
+    const steps = Math.max(2, Math.min(3, opts.maxActionsPerLane || 3));
 
-    addHeader(wf, 'ERROR AREA', L.start.x + 3*L.stepX, L.start.y + 400);
-    const ops = addHTTP(wf, 'Notify · Ops', `={{'${DEMO.opsAlert}'}}`, '={{$json}}', L.start.x + 4*L.stepX, L.start.y + 460);
-    connect(wf, stage, ops);
+    const yesDone = addLane(wf, exec.out, 'yes', baseX, baseY, steps, s);
+    const noDone  = addLane(wf, exec.out, 'no',  baseX, baseY, steps, s);
 
-    // Design notes
+    connect(wf, hyp, yesDone, 0);
+    connect(wf, hyp, noDone,  1);
+
+    // Tiny tail (optional)
+    const tail = addSet(wf, 'Summarize (brief)', { '__stage':'={{"done"}}' }, L.start.x + 2*L.stepX, L.start.y + 200);
+    connect(wf, yesDone, tail); connect(wf, noDone, tail);
+
+    // Notes
     wf.staticData.__design = {
       layout:{ stepX:L.stepX, grid:GRID, footprint:FOOT, antiOverlap:'block' },
-      notes:'Digital team → Execution (yes/no) → compact visual lanes (scenario-named actions).'
+      notes:'Backbone: Trigger→Init→Context→Plan/Execute. Then a single YES/NO fork with up to 3 compact actions per lane.'
     };
     return wf;
   }
 
-  // Public API
+  function scenarioJSON(s, i){
+    return `{
+  "scenario_id":"${s?.scenario_id||''}",
+  "name":"${(s?.name||'').replace(/"/g,'\\"')}",
+  "triggers":"${(s?.triggers||'').replace(/"/g,'\\"')}",
+  "aim":"${(s?.roi_hypothesis||'').replace(/"/g,'\\"')}",
+  "risk_notes":"${(s?.risk_notes||'').replace(/"/g,'\\"')}",
+  "industry":"${i?.industry_id||''}"
+}`;
+  }
+
   window.Builder = { buildWorkflowJSON };
 })();

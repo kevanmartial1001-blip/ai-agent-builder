@@ -1,32 +1,38 @@
 // public/builder.js
-// n8n JSON generator — Digital Team + 3-Hypotheses Execution (YES / NO / MAYBE)
-// - Team d'agents (Preflight → Research → Planner → Orchestrator → Composer → QA → Summarizer)
-// - Fan-in des JSON validés → Execution Agent (choisit hypothesis yes|no|maybe + liste d'actions par voie)
-// - Visual Runner en 3 voies (YES/NO/MAYBE), jusqu’à N actions, node-par-action
-// - Canvas épuré + anti-overlap grid
+// n8n JSON generator — Digital Team + 3-Hypotheses Execution (compact)
+// - Team of agents: Preflight → Research → Planner → Orchestrator → Composer → QA → Summarizer
+// - Fan-in validators → Execution Agent (hypothesis yes|maybe|no + actions per lane)
+// - Visual lanes (YES / MAYBE / NO): Pick → END? → Run (unified) → Record
+// - Compact layout with anti-overlap grid
 
 (function () {
   "use strict";
 
-  // ===== Layout minimal & Grid =====
-  const L = { stepX: 360, header:{x:-900,y:40}, start:{x:-860,y:240}, lanesY:{ yes:-160, maybe:0, no:160 } };
+  // ===== Layout & Grid =====
+  const L = {
+    stepX: 300,
+    header: { x: -900, y: 40 },
+    start:  { x: -860, y: 240 },
+    lanesY: { yes: -140, maybe: 0, no: 140 }
+  };
   const GRID = { cellH: 70, cellW: 80 };
   const FOOT = { w: 3, h: 3 };
 
-  // ===== Endpoints démo sûrs =====
+  // ===== Safe demo endpoints (replace in prod) =====
   const DEMO = {
     callWebhook: 'https://example.com/call',
     opsAlert:    'https://example.com/ops/alert'
   };
 
   // ===== Utils =====
-  const uid=(p)=>`${p}_${Math.random().toString(36).slice(2,10)}`;
-  const pos=(x,y)=>[x,y];
+  const uid = (p)=>`${p}_${Math.random().toString(36).slice(2,10)}`;
+  const pos = (x,y)=>[x,y];
   const snapX=(x)=> Math.round(x/GRID.cellW)*GRID.cellW;
   const snapY=(y)=> Math.round(y/GRID.cellH)*GRID.cellH;
 
   function baseWorkflow(name){
-    return { name, nodes:[], connections:{}, active:false,
+    return {
+      name, nodes:[], connections:{}, active:false,
       settings:{ executionOrder:"v1", timezone:"Europe/Madrid" },
       staticData:{}, __occ:new Set()
     };
@@ -100,7 +106,7 @@
   const SCHEMA_QA        = `{"ok":true,"reasons":["string"],"fixups":[{"field":"string","value":"string"}]}`;
   const SCHEMA_SUMMARY   = `{"highlights":["string"],"decisions_taken":["string"],"next_actions":["string"]}`;
 
-  // *** Nouvelle exécution à 3 hypothèses ***
+  // Execution: YES / MAYBE / NO (compact)
   const SCHEMA_EXECUTION = `{
     "hypothesis":"yes|no|maybe",
     "actions": {
@@ -118,17 +124,16 @@
   const SYS_COMPOSER  = `You are Composer. Produce channel-specific copy/scripts grounded in context. JSON only.`;
   const SYS_QA        = `You are QA. Validate the bundle & propose minimal fixups. JSON only.`;
   const SYS_SUMMARY   = `You are Summarizer. Output concise highlights for BI/Slack. JSON only.`;
-
   const SYS_EXECUTION = `You are Execution.
 Given validated JSON from Preflight, Research, Planner, Orchestrator, Composer, QA,
-emit a STRICT JSON playbook per schema:
-- Pick one "hypothesis": yes | no | maybe (best path to reach the scenario target).
-- For EACH hypothesis, provide up to 6 ordered actions (keep others short/empty).
-- Actions types allowed: http | send_whatsapp | place_call | wait | set | log | END.
-- Use Composer content (env.channel_bundle) for messages; use Orchestrator URLs when present.
-- Keep it minimal and safe (no PII, no external browsing).`;
+emit a STRICT JSON per schema:
+- Pick the best hypothesis: yes | maybe | no (to achieve the scenario goal).
+- Provide up to 4 ordered actions for each lane (short lists are fine).
+- Allowed action types: http | send_whatsapp | place_call | wait | set | log | END.
+- Use Composer content in env.channel_bundle; use Orchestrator URLs when present.
+- Keep it minimal, deterministic and safe.`;
 
-  // ===== Agent Helper (Agent → Parser → Validator) =====
+  // ===== Agent helper (Agent → Parser → Validator) =====
   function addAgent(wf, cfg){
     const {
       role='Agent', x=0, y=0, systemPrompt='You are an agent.', userPromptExpr='={{$json}}',
@@ -151,11 +156,10 @@ emit a STRICT JSON playbook per schema:
       type: "@n8n/n8n-nodes-langchain.agent", typeVersion: 2.2, position: pos(x, y),
       parameters: { promptType:"define", text: userPromptExpr, hasOutputParser:true, options:{ systemMessage:`=${systemPrompt}` } }
     });
-    // Wire LM + Parser into Agent
+    // wire
     wf.connections[lm]     = { ai_languageModel: [[{ node: agent, type: "ai_languageModel", index: 0 }]] };
     wf.connections[parser] = { ai_outputParser:  [[{ node: agent, type: "ai_outputParser",  index: 0 }]] };
 
-    // JSON Validator
     const validator = addNode(wf, {
       id: uid('code'), name: `${role} · JSON Validator`,
       type: "n8n-nodes-base.code", typeVersion: 2, position: pos(x+300, y),
@@ -169,7 +173,7 @@ return [out];` }
     return { in: agent, out: validator, lm, parser };
   }
 
-  // ===== Digital Team (fixe) =====
+  // ===== Digital team =====
   function makeTeam(){
     return [
       { key:'preflight',  role:'Pre-flight Context Agent', schema:SCHEMA_PREFLIGHT, sys:SYS_PREFLIGHT,
@@ -210,12 +214,12 @@ return [out];` }
         schema:t.schema, modelName:'gpt-5-mini', temperature:(t.key==='composer'?0.5:0.2)
       });
       connect(wf, cursor, a.in);
-      cursor = a.out; outNodes[t.key]=a; x += 320;
+      cursor = a.out; outNodes[t.key]=a; x += 300;
     });
     return { tail: cursor, outNodes };
   }
 
-  // ===== Fan-in de tous les agents =====
+  // ===== Fan-in =====
   function addFanInAgents(wf, labels, x, y){
     return addNode(wf, {
       id: uid('code'), name: 'Fan-in · Consolidate Agent Outputs',
@@ -232,7 +236,7 @@ return [out];`
     });
   }
 
-  // ===== Execution Agent (YES/NO/MAYBE) =====
+  // ===== Execution Agent =====
   function addExecutionAgent(wf, x, y){
     return addAgent(wf, {
       role: 'Execution Agent',
@@ -245,47 +249,62 @@ return [out];`
     });
   }
 
-  // ===== Runners pour actions =====
-  function addHttpRunner(wf, x, y){
-    return addNode(wf, { id: uid('http'), name: 'HTTP',
-      type:'n8n-nodes-base.httpRequest', typeVersion:4, position:pos(x,y),
-      parameters:{ url:"={{$json.__action.params.url}}", method:"={{$json.__action.params.method || 'POST'}}",
-        jsonParameters:true, sendBody:true, bodyParametersJson:"={{$json.__action.params.body || {}}}", options:{ fullResponse:true } }
+  // ===== Unified Runner (one node handles all action types) =====
+  function addUnifiedRunner(wf, x, y){
+    return addNode(wf, {
+      id: uid('code'), name: 'Run Action',
+      type: 'n8n-nodes-base.code', typeVersion: 2, position: pos(x, y),
+      parameters: { jsCode:
+`const a = $json.__action || {};
+const env = $json.env || {};
+async function run(){
+  switch (a.type) {
+    case 'http': {
+      const url = a.params?.url;
+      const method = a.params?.method || 'POST';
+      const body = a.params?.body || {};
+      if (!url) return { statusCode: 400, body:{ error:'missing url' } };
+      const res = await this.helpers.httpRequest({
+        url, method, json: true, body, resolveWithFullResponse: true,
+      });
+      return { statusCode: res.statusCode, body: res.body };
+    }
+    case 'send_whatsapp': {
+      // Replace with your WA sender if needed
+      return { statusCode: 200, body: { to:a.params?.to, text:a.params?.body || env.channel_bundle?.whatsapp?.body || 'Hi' } };
+    }
+    case 'place_call': {
+      return { statusCode: 200, body: { to:a.params?.to, script: a.params?.script || env.channel_bundle?.call?.script || 'Hello' } };
+    }
+    case 'wait': {
+      const ms = Math.max(0, (a.params?.seconds||30) * 1000);
+      await new Promise(r => setTimeout(r, ms));
+      return { statusCode: 200, body: { waitedMs: ms } };
+    }
+    case 'set':  return { statusCode: 200, body: { set: a.params || {} } };
+    case 'log':  return { statusCode: 200, body: { log: a.params || {} } };
+    case 'END':
+    default:     return { statusCode: 200, body: { noop:true } };
+  }
+}
+return run().then(r => [ { ...$json, ...r } ]);`
+      }
     });
   }
-  function addWhatsAppRunner(wf, x, y){
-    return addNode(wf, { id: uid('wa'), name:'WhatsApp',
-      type:'n8n-nodes-base.twilio', typeVersion:3, position:pos(x,y),
-      parameters:{ resource:'message', operation:'create',
-        from:"={{'whatsapp:' + ($json.__action.params.from || '+10000000002')}}",
-        to:"={{'whatsapp:' + $json.__action.params.to}}",
-        message:"={{$json.__action.params.body || $json.env?.channel_bundle?.whatsapp?.body || 'Hi'}}" },
-      credentials:{} });
-  }
-  function addCallRunner(wf, x, y){
-    return addHTTP(wf,'Call',
-      "={{$json.__action.params.webhook || '"+DEMO.callWebhook+"'}}",
-      "={{ { to:$json.__action.params.to, from:$json.__action.params.from, text: ($json.__action.params.script || $json.env?.channel_bundle?.call?.script || 'Hello') } }}",
-      x, y, 'POST');
-  }
-  function addWaitRunner(wf, x, y){
-    return addNode(wf, { id: uid('wait'), name:'Wait', type:'n8n-nodes-base.wait', typeVersion:1, position:pos(x,y),
-      parameters:{ amount:"={{$json.__action.params.seconds || 30}}", unit:'seconds' } });
-  }
-  function addSetRunner(wf, x, y){
-    return addNode(wf, { id: uid('set'), name:'Set Vars', type:'n8n-nodes-base.set', typeVersion:2, position:pos(x,y),
-      parameters:{ keepOnlySet:false, values:{ string:[ {name:'__set', value:"={{JSON.stringify($json.__action.params || {})}}"} ] }} });
-  }
-  function addLogRunner(wf, x, y){
-    return addNode(wf, { id: uid('code'), name:'Log', type:'n8n-nodes-base.code', typeVersion:2, position:pos(x,y),
+
+  // ===== Record node =====
+  function addRecordResult(wf, idx, lane, x, y){
+    return addNode(wf, { id: uid('code'), name:`[${lane.toUpperCase()} ${idx}] Record`,
+      type:'n8n-nodes-base.code', typeVersion:2, position:pos(x,y),
       parameters:{ jsCode:
 `const prev = $items(0,0)?.json || {};
-const log = Array.isArray(prev.__exec_log) ? prev.__exec_log : [];
-log.push({ at: Date.now(), action: $json.__action?.id, type:$json.__action?.type, params:$json.__action?.params });
-return [{ ...prev, __exec_log: log }];` }});
+const recs = Array.isArray(prev.__results) ? prev.__results : [];
+const status = $json.statusCode ?? 200;
+recs.push({ lane:'${lane}', i:${idx}, action: prev.__action?.id, type: prev.__action?.type, status });
+return [{ ...prev, __results: recs }];` }});
   }
 
-  // ===== Un slot d’action (Pick→Route→Runner→Record) =====
+  // ===== Compact action slot: Pick → END? → Run (unified) → Record =====
   function addPickAction(wf, idx, lane, x, y){
     return addNode(wf, {
       id: uid('code'), name: `[${lane.toUpperCase()} ${idx}] Pick`,
@@ -307,57 +326,25 @@ return [{ ...play, __lane: lane, __i:${idx}, __action: a }];`
       parameters:{ conditions:{ string:[{ value1:"={{$json.__action.type}}", operation:'equal', value2:'END' }] } }
     });
   }
-  function addRouteType(wf, x, y){
-    return addSwitch(wf,'Route by Type',"={{$json.__action.type}}",
-      [
-        {operation:'equal', value2:'http'},
-        {operation:'equal', value2:'send_whatsapp'},
-        {operation:'equal', value2:'place_call'},
-        {operation:'equal', value2:'wait'},
-        {operation:'equal', value2:'set'},
-        {operation:'equal', value2:'log'}
-      ],
-      x,y
-    );
-  }
-  function addRecordResult(wf, idx, lane, x, y){
-    return addNode(wf, { id: uid('code'), name:`[${lane.toUpperCase()} ${idx}] Record`,
-      type:'n8n-nodes-base.code', typeVersion:2, position:pos(x,y),
-      parameters:{ jsCode:
-`const prev = $items(0,0)?.json || {};
-const recs = Array.isArray(prev.__results) ? prev.__results : [];
-const status = $json.statusCode ?? 200;
-recs.push({ lane:'${lane}', i:${idx}, action: prev.__action?.id, type: prev.__action?.type, status });
-return [{ ...prev, __results: recs }];` }});
-  }
 
   function addActionSlot(wf, idx, lane, x, baseY){
     const y = baseY + (L.lanesY[lane]||0);
+    const pick  = addPickAction(wf, idx, lane, x, y);
+    const ifEnd = addIfEnd(wf, x+200, y);            connect(wf, pick, ifEnd);
 
-    const pick = addPickAction(wf, idx, lane, x, y);
-    const ifEnd = addIfEnd(wf, x+220, y);                 connect(wf, pick, ifEnd);
+    const run   = addUnifiedRunner(wf, x+420, y);    connect(wf, ifEnd, run, 1);  // false branch = not END
+    const rec   = addRecordResult(wf, idx, lane, x+660, y); connect(wf, run, rec);
 
-    const route = addRouteType(wf, x+460, y);             connect(wf, ifEnd, route, 1);
-
-    const rHttp = addHttpRunner(wf, x+720, y-140);        connect(wf, route, rHttp, 0);
-    const rWa   = addWhatsAppRunner(wf, x+720, y-20);     connect(wf, route, rWa,   1);
-    const rCall = addCallRunner(wf, x+720, y+100);        connect(wf, route, rCall, 2);
-    const rWait = addWaitRunner(wf, x+720, y+220);        connect(wf, route, rWait, 3);
-    const rSet  = addSetRunner(wf, x+720, y+340);         connect(wf, route, rSet,  4);
-    const rLog  = addLogRunner(wf, x+720, y+460);         connect(wf, route, rLog,  5);
-
-    const rec   = addRecordResult(wf, idx, lane, x+980, y); [rHttp, rWa, rCall, rWait, rSet, rLog].forEach(n => connect(wf, n, rec));
-
-    const done  = addSet(wf, `[${lane.toUpperCase()} ${idx}] END`, { [`__end_${lane}_${idx}`]:"={{true}}" }, x+460, y-140);
+    const done  = addSet(wf, `[${lane.toUpperCase()} ${idx}] END`, { [`__end_${lane}_${idx}`]:"={{true}}" }, x+420, y-120);
     connect(wf, ifEnd, done, 0);
 
     return { enter: pick, tail: rec, done };
   }
 
-  // Construit une voie visuelle (YES/NO/MAYBE) de N steps
-  function addLane(wf, execOut, lane, x, baseY, steps=6){
-    // normalise env sur la lane
-    const normalize = addNode(wf, { id: uid('set'), name:`Normalize (${lane})`, type:'n8n-nodes-base.set', typeVersion:2, position:pos(x-220, baseY+(L.lanesY[lane]||0)),
+  // ===== Build a lane (YES / MAYBE / NO) of N steps =====
+  function addLane(wf, execOut, lane, x, baseY, steps=4){
+    const normalize = addNode(wf, { id: uid('set'), name:`Normalize (${lane})`,
+      type:'n8n-nodes-base.set', typeVersion:2, position:pos(x-200, baseY+(L.lanesY[lane]||0)),
       parameters:{ keepOnlySet:false, values:{ string:[ { name:'env', value:"={{$json.env || {}}}" } ] }}});
     connect(wf, execOut, normalize);
 
@@ -376,7 +363,7 @@ return [{ ...prev, __results: recs }];` }});
     return done;
   }
 
-  // ===== Build principal =====
+  // ===== Build main workflow =====
   function buildWorkflowJSON(scenario, industry, opts = {}){
     const title = `${scenario?.scenario_id||'Scenario'} — ${scenario?.name||''}`.trim();
     const wf = baseWorkflow(title);
@@ -404,7 +391,7 @@ return [{ ...prev, __results: recs }];` }});
     const team = makeTeam();
     const { outNodes } = addTeamChain(wf, team, init, L.start.x + 3*L.stepX, L.start.y, scenario, industry);
 
-    // Fan-in
+    // Fan-in all validators
     const fanIn = addFanInAgents(wf, ['preflight','research','planner','orchestrator','composer','qa'], L.start.x + 5*L.stepX + 40, L.start.y - 160);
     if (outNodes.preflight) connect(wf, outNodes.preflight.out, fanIn);
     if (outNodes.research)  connect(wf, outNodes.research.out,  fanIn);
@@ -413,45 +400,46 @@ return [{ ...prev, __results: recs }];` }});
     if (outNodes.composer)  connect(wf, outNodes.composer.out,  fanIn);
     if (outNodes.qa)        connect(wf, outNodes.qa.out,        fanIn);
 
-    // Execution Agent (3 hypothèses)
+    // Execution Agent
     const exec = addExecutionAgent(wf, L.start.x + 6*L.stepX + 40, L.start.y - 160);
     connect(wf, fanIn, exec.in);
 
-    // Switch par hypothesis yes/no/maybe
+    // Route by hypothesis
     const hypSwitch = addSwitch(wf, 'Route by Hypothesis', "={{$json.hypothesis}}",
       [
-        {operation:'equal', value2:'yes'},
-        {operation:'equal', value2:'maybe'},
-        {operation:'equal', value2:'no'}
+        { operation:'equal', value2:'yes' },
+        { operation:'equal', value2:'maybe' },
+        { operation:'equal', value2:'no' }
       ],
-      L.start.x + 6*L.stepX + 360, L.start.y - 160
+      L.start.x + 6*L.stepX + 320, L.start.y - 160
     );
     connect(wf, exec.out, hypSwitch);
 
-    // Trois voies visuelles (YES / MAYBE / NO), 6 actions chacune
-    const baseX = L.start.x + 7*L.stepX + 40;
-    const baseY = L.start.y - 60;
+    // Lanes (YES / MAYBE / NO)
+    const baseX = L.start.x + 7*L.stepX;
+    const baseY = L.start.y - 40;
+    const stepsPerLane = opts.maxActionsPerLane || 4;
 
-    const laneYesDone   = addLane(wf, exec.out, 'yes',   baseX, baseY, opts.maxActionsPerLane || 6);
-    const laneMaybeDone = addLane(wf, exec.out, 'maybe', baseX, baseY, opts.maxActionsPerLane || 6);
-    const laneNoDone    = addLane(wf, exec.out, 'no',    baseX, baseY, opts.maxActionsPerLane || 6);
+    const laneYesDone   = addLane(wf, exec.out, 'yes',   baseX, baseY, stepsPerLane);
+    const laneMaybeDone = addLane(wf, exec.out, 'maybe', baseX, baseY, stepsPerLane);
+    const laneNoDone    = addLane(wf, exec.out, 'no',    baseX, baseY, stepsPerLane);
 
     connect(wf, hypSwitch, laneYesDone,   0);
     connect(wf, hypSwitch, laneMaybeDone, 1);
     connect(wf, hypSwitch, laneNoDone,    2);
 
-    // Post-exec & petite zone d’erreur
-    const stage = addSet(wf, 'Post-Execution Stage', { '__stage':'={{"post-exec"}}' }, L.start.x + 2*L.stepX, L.start.y + 240);
+    // Post-exec & lightweight error lane
+    const stage = addSet(wf, 'Post-Execution Stage', { '__stage':'={{"post-exec"}}' }, L.start.x + 2*L.stepX, L.start.y + 220);
     connect(wf, laneYesDone, stage); connect(wf, laneMaybeDone, stage); connect(wf, laneNoDone, stage);
 
-    addHeader(wf, 'ERROR AREA', L.start.x + 3*L.stepX, L.start.y + 420);
-    const ops = addHTTP(wf, 'Notify · Ops', `={{'${DEMO.opsAlert}'}}`, '={{$json}}', L.start.x + 4*L.stepX, L.start.y + 480);
+    addHeader(wf, 'ERROR AREA', L.start.x + 3*L.stepX, L.start.y + 400);
+    const ops = addHTTP(wf, 'Notify · Ops', `={{'${DEMO.opsAlert}'}}`, '={{$json}}', L.start.x + 4*L.stepX, L.start.y + 460);
     connect(wf, stage, ops);
 
-    // Notes
+    // Design notes
     wf.staticData.__design = {
       layout:{ stepX:L.stepX, grid:GRID, footprint:FOOT, antiOverlap:'block' },
-      notes:'Digital team → Execution (hypothesis yes/maybe/no) → visual lanes (node-per-action).'
+      notes:'Digital team → Execution (yes/maybe/no) → compact visual lanes (Pick → END? → Run → Record).'
     };
     return wf;
   }

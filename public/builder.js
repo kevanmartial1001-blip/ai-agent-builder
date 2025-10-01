@@ -69,7 +69,7 @@
 "json.PlanGraph={ trigger:{kind:'manual'}, branches:[ {key:'yes',title:'Has upcoming appointment',steps:yes}, {key:'no',title:'Needs reschedule',steps:no} ] };\n"+
 "return [{ json: json }];";
 
-  // Toolsmith Agent — resolve abstract tools → base URLs, headers (can extend per tenant)
+  // Toolsmith Agent — resolve abstract tools → base URLs, headers
   var FC_TOOLSMITH =
 "var json=(items[0]&&items[0].json)||{}; json.ToolMap={\n"+
 "  TWILIO:function(j){ return { url:(j.twilio_base||'')+'/messages', method:'POST', headers:{'Content-Type':'application/json'} } },\n"+
@@ -77,13 +77,13 @@
 "  CRM:function(j){ return { url:(j.crm_base||'')+'/records',          method:'POST', headers:{'Content-Type':'application/json'} } }\n"+
 "}; return [{ json: json }];";
 
-  // Guardrails Agent — normalize tone, opt-out, compliance flags
+  // Policy Agent — tone/opt-out/compliance flags
   var FC_POLICY =
 "var json=(items[0]&&items[0].json)||{}; var g=(json.ContextSpec&&json.ContextSpec.guardrails)||[];\n"+
 "json.Policy={ tone: (g.join('|').indexOf('friendly')>-1)?'friendly-professional':'neutral', optout:'Reply STOP to opt out.', pii:'no PHI' };\n"+
 "return [{ json: json }];";
 
-  // Router (YES by default; you can switch to data-driven later)
+  // Router (YES by default; make data-driven later if you want)
   var FC_PICK_BRANCH =
 "var json=(items[0]&&items[0].json)||{}; var pg=json.PlanGraph||{branches:[]};\n"+
 "var yes=(pg.branches||[]).filter(function(b){return b&&b.key==='yes';})[0]||{steps:[]};\n"+
@@ -280,14 +280,14 @@
     }
 
     // YES lane (top)
-    var YES_Y=Y0-GAP;
+    var YES_Y=Y0+(-220);
     var enterYes=nFunction('Enter YES ['+scenTag+']',"var j=(items[0]&&items[0].json)||{}; j.branch='yes'; return [{ json:j }];", X0+SPAN*8, YES_Y); addNode(wf, enterYes); connect(wf, n5.name, enterYes, 0);
     var yes1=addStepTeam('YES', X0+SPAN*9,  YES_Y, 1, 'Confirm appointment'); connect(wf, enterYes, yes1);
     var yes2=addStepTeam('YES', X0+SPAN*15, YES_Y, 2, 'Check confirmation');  connect(wf, yes1, yes2);
     var yes3=addStepTeam('YES', X0+SPAN*21, YES_Y, 3, 'Gentle wait');         connect(wf, yes2, yes3);
 
     // NO lane (bottom)
-    var NO_Y=Y0+GAP;
+    var NO_Y=Y0+220;
     var enterNo=nFunction('Enter NO ['+scenTag+']',"var j=(items[0]&&items[0].json)||{}; j.branch='no'; return [{ json:j }];", X0+SPAN*8, NO_Y); addNode(wf, enterNo); connect(wf, n5.name, enterNo, 1);
     var no1=addStepTeam('NO', X0+SPAN*9,  NO_Y, 1, 'Offer slots'); connect(wf, enterNo, no1);
     var no2=addStepTeam('NO', X0+SPAN*15, NO_Y, 2, 'Capture slot'); connect(wf, no1, no2);

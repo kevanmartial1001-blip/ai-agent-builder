@@ -1,6 +1,6 @@
 // public/builder.js
-// AI-Factory builder: contracts-first (ContextSpec → PlanGraph → Action), core nodes only.
-// Function v1 compliant: read items[0].json; return [{ json: ... }]. No custom nodes, no emojis.
+// AI-Factory builder (functional): Contracts-first + per-step prompts + tool execution.
+// Core nodes only. Function v1 style. Demo/Prod + LLM toggle, Twilio/Calendar/CRM via httpRequest v4.
 
 (function () {
   'use strict';
@@ -21,7 +21,7 @@
     wf.connections[fromName].main[idx].push({ node: toName, type: 'main', index: 0 });
   }
 
-  // -------- Node factories (typeVersion = 1; httpRequest uses v4) --------
+  // -------- Node factories --------
   function nManual(x, y) {
     return { id:'n_'+Math.random().toString(36).slice(2,10), name:'Manual Trigger',
       type:'n8n-nodes-base.manualTrigger', typeVersion:1, position:[x,y], parameters:{} };
@@ -45,10 +45,29 @@
       type:'n8n-nodes-base.if', typeVersion:1, position:[x,y],
       parameters:{ conditions:{ boolean:[ { value1: exprAsBoolean === true, value2: true } ] } } };
   }
+  function nHttp(name, x, y, urlExpr, methodExpr, bodyJsonExpr, headersJsonExpr) {
+    // v4 httpRequest; json parameters; expressions kept simple (read from json in a Function before this node)
+    return {
+      id:'n_'+Math.random().toString(36).slice(2,10),
+      name:name,
+      type:'n8n-nodes-base.httpRequest',
+      typeVersion:4,
+      position:[x,y],
+      parameters:{
+        url: urlExpr || '={{$json.__http.url}}',
+        method: methodExpr || '={{$json.__http.method}}',
+        sendBody: true,
+        jsonParameters: true,
+        options: { fullResponse: false },
+        bodyParametersJson: bodyJsonExpr || '={{$json.__http.body}}',
+        headerParametersJson: headersJsonExpr || '={{$json.__http.headers}}'
+      }
+    };
+  }
 
   // -------- Function code blocks (Function v1 style) --------
 
-  // 1) ContextSpec (rules-normalized from ScenarioInput)
+  // 1) ContextSpec
   var FC_CONTEXT =
 "var json = (items[0] && items[0].json) || {};\n" +
 "var scen = {\n" +
@@ -64,12 +83,10 @@
 "var ch = ['whatsapp','sms','email','call'];\n" +
 "if (/email/i.test(scen.best)) ch = ['email','whatsapp','sms','call'];\n" +
 "if (/wa|whatsapp/i.test(scen.best)) ch = ['whatsapp','sms','email','call'];\n" +
-"var guard = ['no PHI','respect opt-out','tone: professional/friendly'];\n" +
-"if (/phi|hipaa/i.test(scen.risk)) guard = ['no PHI','respect opt-out','tone: professional/friendly'];\n" +
 "json.ContextSpec = {\n" +
 "  intent: (scen.roi ? 'Goal: ' + scen.roi : 'Automate: ' + (scen.name || scen.id)),\n" +
 "  industry_pack: [scen.industry || 'generic'].concat(scen.tags.slice(0,2)),\n" +
-"  guardrails: guard,\n" +
+"  guardrails: ['no PHI','respect opt-out','tone: professional/friendly'],\n" +
 "  channels_ranked: ch,\n" +
 "  entities: ['user','appointment','location','agent'],\n" +
 "  kpis: ['reschedule_rate','time_to_reschedule','no_show_rate']\n" +
@@ -83,14 +100,14 @@
 "var ctx = json.ContextSpec || {};\n" +
 "var waFirst = Array.isArray(ctx.channels_ranked) && ctx.channels_ranked[0] === 'whatsapp';\n" +
 "var yesSteps = [\n" +
-"  { id:'s1', type:'send_message', channel: waFirst?'whatsapp':'sms', tool:'Twilio', params:{ body_tmpl:'confirm' } },\n" +
+"  { id:'s1', type:'send_message', channel: waFirst?'whatsapp':'sms', tool:'TWILIO',  params:{ body_tmpl:'confirm' } },\n" +
 "  { id:'s2', type:'check_data',   channel:'none',   tool:'',        params:{ field:'confirm_received' } },\n" +
 "  { id:'s3', type:'wait',         channel:'none',   tool:'',        params:{ seconds: 1 } }\n" +
 "];\n" +
 "var noSteps = [\n" +
-"  { id:'s1', type:'send_message', channel: waFirst?'whatsapp':'sms', tool:'Twilio',  params:{ body_tmpl:'offer_slots' } },\n" +
+"  { id:'s1', type:'send_message', channel: waFirst?'whatsapp':'sms', tool:'TWILIO',   params:{ body_tmpl:'offer_slots' } },\n" +
 "  { id:'s2', type:'check_data',   channel:'none',   tool:'',         params:{ field:'slot_choice' } },\n" +
-"  { id:'s3', type:'http',         channel:'none',   tool:'CALENDAR', params:{ url:'{{calendar_base}}/book', method:'POST', body:{} } }\n" +
+"  { id:'s3', type:'http',         channel:'none',   tool:'CALENDAR', params:{ method:'POST', body:{} } }\n" +
 "];\n" +
 "json.PlanGraph = {\n" +
 "  trigger: { kind:'manual' },\n" +
@@ -101,7 +118,7 @@
 "};\n" +
 "return [{ json: json }];";
 
-  // 3) Extract branch objects and set demo YES route
+  // 3) Extract branches; default to YES
   var FC_PICK_BRANCH =
 "var json = (items[0] && items[0].json) || {};\n" +
 "var pg = json.PlanGraph || { branches: [] };\n" +
@@ -109,7 +126,7 @@
 "var no  = (pg.branches || []).filter(function(b){ return b && b.key==='no';  })[0] || { steps: [] };\n" +
 "json.yesBranch = yes;\n" +
 "json.noBranch  = no;\n" +
-"json.routeYes  = true; // demo default\n" +
+"json.routeYes  = true;\n" +
 "return [{ json: json }];";
 
   // 4) Step Draft (i = 1..3)
@@ -117,29 +134,81 @@
     return ""
 + "var json = (items[0] && items[0].json) || {};\n"
 + "var branch = json." + (branchKey === 'yes' ? "yesBranch" : "noBranch") + " || { steps: [] };\n"
-+ "var s = (branch.steps || [])[ " + (i - 1) + " ] || { id:'s" + i + "', type:'send_message', channel:'whatsapp', tool:'Twilio', params:{ body_tmpl:'generic' } };\n"
-+ "json.Action = {\n"
-+ "  id: s.id || 's" + i + "',\n"
-+ "  title: '" + fallbackTitle.replace(/'/g, "\\'") + "',\n"
-+ "  type: s.type || 'send_message',\n"
-+ "  channel: s.channel || 'none',\n"
-+ "  tool: s.tool || '',\n"
-+ "  params: (typeof s.params==='object' && s.params) ? s.params : {}\n"
-+ "};\n"
++ "var s = (branch.steps || [])[ " + (i - 1) + " ] || { id:'s" + i + "', type:'send_message', channel:'whatsapp', tool:'TWILIO', params:{ body_tmpl:'generic' } };\n"
++ "json.Action = { id: s.id || 's" + i + "', title: '" + fallbackTitle.replace(/'/g, "\\'") + "', type: s.type||'send_message', channel: s.channel||'none', tool: s.tool||'', params: (typeof s.params==='object'&&s.params)||{} };\n"
 + "return [{ json: json }];";
   }
 
-  // 5) Step Agent (rules-only enrichment from ContextSpec)
+  // 5) Build Prompt for LLM (per-step). If llm.enabled=false, we’ll skip LLM and use rules.
+  var FC_BUILD_PROMPT =
+"var json = (items[0] && items[0].json) || {};\n" +
+"var a = json.Action || {};\n" +
+"var ctx = json.ContextSpec || {};\n" +
+"var scen = { id: json['scenario.id']||'', name: json['scenario.name']||'', industry: json['industry.id']||'' };\n" +
+"// Simple instruction for conversational, human tone output.\n" +
+"var system = 'You are a senior automation copywriter. Return strict JSON: {\"message\": \"...\"}. Keep it natural, friendly, concise.';\n" +
+"var user = {\n" +
+"  goal: ctx.intent || '',\n" +
+"  guardrails: ctx.guardrails || [],\n" +
+"  channel: a.channel || 'whatsapp',\n" +
+"  template: a.params && a.params.body_tmpl || 'generic',\n" +
+"  scenario: scen\n" +
+"};\n" +
+"json.__llm_req = {\n" +
+"  system: system,\n" +
+"  user: user\n" +
+"};\n" +
+"return [{ json: json }];";
+
+  // 6) Prepare HTTP call to LLM (OpenAI-compatible body). Uses init llm fields.
+  var FC_LLM_HTTP_PREP =
+"var json = (items[0] && items[0].json) || {};\n" +
+"var base = json.llm_base || '';\n" +
+"var key  = json.llm_api_key || '';\n" +
+"var model= json.llm_model || 'gpt-4o-mini';\n" +
+"var r = json.__llm_req || { system:'', user:{} };\n" +
+"var body = {\n" +
+"  model: model,\n" +
+"  messages: [\n" +
+"    { role:'system', content: r.system || '' },\n" +
+"    { role:'user',   content: JSON.stringify(r.user || {}) }\n" +
+"  ],\n" +
+"  response_format: { type: 'json_object' },\n" +
+"  temperature: 0.2\n" +
+"};\n" +
+"json.__http = {\n" +
+"  url: base ? (base + '/chat/completions') : 'https://api.openai.com/v1/chat/completions',\n" +
+"  method: 'POST',\n" +
+"  headers: key ? { 'Authorization':'Bearer ' + key, 'Content-Type':'application/json' } : { 'Content-Type':'application/json' },\n" +
+"  body: body\n" +
+"};\n" +
+"return [{ json: json }];";
+
+  // 7) Parse LLM response JSON content -> Outbox.message (strict)
+  var FC_LLM_PARSE =
+"var json = (items[0] && items[0].json) || {};\n" +
+"var resp = (items[0] && items[0].json && items[0].json.data) || (json.data) || {};\n" +
+"// n8n httpRequest by default returns the parsed body into items[0].json\n" +
+"var content = '';\n" +
+"try {\n" +
+"  var c = resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;\n" +
+"  content = typeof c === 'string' ? c : '';\n" +
+"} catch (e) { content = ''; }\n" +
+"var msg = '';\n" +
+"try { var obj = JSON.parse(content); msg = safe(obj.message || ''); } catch(e){ msg = ''; }\n" +
+"var existing = json.Outbox && json.Outbox.text || '';\n" +
+"json.Outbox = { text: msg || existing }; // fallback to previous rules text if LLM failed\n" +
+"return [{ json: json }];";
+
+  // 8) Rule Step-Agent (enrich + natural default message)
   var FC_STEP_AGENT_RULES =
 "var json = (items[0] && items[0].json) || {};\n" +
-"var a = json.Action || { id:'s', type:'send_message', channel:'whatsapp', tool:'Twilio', params:{} };\n" +
+"var a = json.Action || { id:'s', type:'send_message', channel:'whatsapp', tool:'TWILIO', params:{} };\n" +
 "var ctx = json.ContextSpec || {};\n" +
 "var scenId = json['scenario.id'] || '';\n" +
 "var scenNm = json['scenario.name'] || '';\n" +
 "var title = (a.title || 'Step') + ' — ' + (scenId ? (scenId + ': ') : '') + (scenNm || '');\n" +
-"// choose top channel from ContextSpec when Action lacks channel\n" +
 "if (!a.channel && Array.isArray(ctx.channels_ranked) && ctx.channels_ranked.length) a.channel = ctx.channels_ranked[0];\n" +
-"// enrich message templates (human tone)\n" +
 "var outboxText = '';\n" +
 "if (a.type==='send_message') {\n" +
 "  if (a.params && a.params.body_tmpl==='confirm') outboxText = 'Quick check: can you confirm your appointment? Just reply yes if it still works for you.';\n" +
@@ -148,11 +217,11 @@
 "    outboxText = 'No worries — which time suits you best: ' + slots.join(', ') + ' ?';\n" +
 "  } else outboxText = 'Hi there — happy to help. Let me know what works for you.';\n" +
 "}\n" +
-"json.Action = { id:a.id, title:title, type:a.type, channel:a.channel||'none', tool:a.tool||'', params:a.params||{} };\n" +
+"json.Action = { id:a.id, title:title, type:a.type, channel:a.channel||'none', tool:String(a.tool||'') , params:a.params||{} };\n" +
 "json.Outbox = { text: outboxText };\n" +
 "return [{ json: json }];";
 
-  // 6) Validate Action contract (fill defaults)
+  // 9) Validate Action
   var FC_VALIDATE_ACTION =
 "var json = (items[0] && items[0].json) || {};\n" +
 "var a = json.Action || {};\n" +
@@ -166,45 +235,57 @@
 "json.Action = a;\n" +
 "return [{ json: json }];";
 
-  // 7) Run (demo/prod; with tool resolver for http)
-  var FC_RUNNER =
-"function wait(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }\n" +
+  // 10) Prepare HTTP for tools (TWILIO/CALENDAR/CRM) when prod
+  var FC_TOOL_HTTP_PREP =
 "var json = (items[0] && items[0].json) || {};\n" +
 "var a = json.Action || {};\n" +
 "var mode = json.mode || 'demo';\n" +
-"var bases = {\n" +
-"  twilio_base: json.twilio_base || '',\n" +
-"  calendar_base: json.calendar_base || '',\n" +
-"  crm_base: json.crm_base || ''\n" +
-"};\n" +
-"function toolToHttp(tool, params){\n" +
-"  var t = String(tool||'').toUpperCase();\n" +
-"  if (t==='CALENDAR') return { url: (bases.calendar_base||'') + '/book', method:(params && params.method)||'POST', body:(params && params.body)||{} };\n" +
-"  if (t==='CRM')      return { url: (bases.crm_base||'') + '/records', method:(params && params.method)||'POST', body:(params && params.body)||{} };\n" +
-"  if (t==='TWILIO')   return { url: (bases.twilio_base||'') + '/messages', method:'POST', body:{ text: (json.Outbox && json.Outbox.text) || '' } };\n" +
-"  return { url: (params && params.url) || '', method: (params && params.method) || 'POST', body: (params && params.body) || {} };\n" +
+"var bases = { twilio: json.twilio_base||'', calendar: json.calendar_base||'', crm: json.crm_base||'' };\n" +
+"var result = { url:'', method:'POST', headers:{'Content-Type':'application/json'}, body:{} };\n" +
+"if (mode==='prod'){\n" +
+"  var t = String(a.tool||'').toUpperCase();\n" +
+"  if (t==='TWILIO'){\n" +
+"    result.url = bases.twilio ? (bases.twilio + '/messages') : '';\n" +
+"    result.body = { to: json['demo.to'] || '', from: json['demo.waFrom'] || '', channel: a.channel, text: (json.Outbox && json.Outbox.text) || '' };\n" +
+"  } else if (t==='CALENDAR'){\n" +
+"    result.url = bases.calendar ? (bases.calendar + '/book') : '';\n" +
+"    result.body = a.params && a.params.body ? a.params.body : { slot: (json.slot_choice||'') };\n" +
+"  } else if (t==='CRM'){\n" +
+"    result.url = bases.crm ? (bases.crm + '/records') : '';\n" +
+"    result.body = { scenario: json['scenario.id']||'', event: a.title, payload: a.params||{} };\n" +
+"  } else {\n" +
+"    // generic http\n" +
+"    result.url = (a.params && a.params.url) || '';\n" +
+"    result.method = (a.params && a.params.method) || 'POST';\n" +
+"    result.body = (a.params && a.params.body) || {};\n" +
+"  }\n" +
 "}\n" +
+"json.__http = result;\n" +
+"return [{ json: json }];";
+
+  // 11) Run (simulate demo; http in prod is done by httpRequest node placed next)
+  var FC_RUNNER =
+"var json = (items[0] && items[0].json) || {};\n" +
+"var a = json.Action || {};\n" +
+"var mode = json.mode || 'demo';\n" +
+"function wait(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }\n" +
 "async function exec(){\n" +
 "  var t = String(a.type || '').toLowerCase();\n" +
+"  if (mode==='prod' && (t==='send_message' || t==='http')){\n" +
+"    // In prod, httpRequest node right after this will run; we just pass through\n" +
+"    return { ok:true, deferred_http:true };\n" +
+"  }\n" +
 "  if (t==='send_message'){\n" +
-"    if (mode==='prod'){\n" +
-"      var req = toolToHttp(a.tool, a.params);\n" +
-"      // In prod you can replace with httpRequest node; here we simulate the result to keep imports universal.\n" +
-"      return { ok:true, simulated:false, request:req, sent:{ channel:a.channel, text:(json.Outbox&&json.Outbox.text)||'' } };\n" +
-"    }\n" +
 "    return { ok:true, simulated:true, sent:{ channel:a.channel, text:(json.Outbox&&json.Outbox.text)||'' } };\n" +
 "  }\n" +
 "  if (t==='check_data')  return { ok:true, check:a.params||{} };\n" +
-"  if (t==='http'){\n" +
-"    var req2 = toolToHttp(a.tool, a.params);\n" +
-"    return { ok:true, simulated:(mode!=='prod'), request:req2 };\n" +
-"  }\n" +
 "  if (t==='wait')        { await wait((a.params && a.params.seconds ? a.params.seconds : 1)*200); return { ok:true, waited:a.params ? a.params.seconds || 1 : 1 }; }\n" +
+"  if (t==='http')        return { ok:true, simulated:true, request: json.__http||{} };\n" +
 "  return { ok:true, noop:true };\n" +
 "}\n" +
 "return exec().then(function(r){ json.exec = r; return [{ json: json }]; });";
 
-  // 8) Record
+  // 12) Record
   function FC_REC(label) {
     var L = label.replace(/'/g, "\\'");
     return ""
@@ -215,7 +296,7 @@
 + "return [{ json: json }];";
   }
 
-  // -------- Builder --------
+  // ===== Build =====
   function buildWorkflowJSON(scenario, industry) {
     var scenId  = safe(scenario && scenario.scenario_id);
     var scenNm  = safe(scenario && scenario.name);
@@ -236,28 +317,35 @@
     // Layout
     var X0 = -860, Y0 = 240;
     var SPAN = 280;
-    var LANE_GAP = 180;
+    var LANE_GAP = 220;
 
     // Backbone
     var n0 = nManual(X0, Y0); addNode(wf, n0);
 
-    // Init: all scenario fields + mode + tool bases + demo seeds
+    // Init: scenario + flags + tool bases + demo seeds + LLM config
     var n1 = nSet('Init', {
       'scenario.id':   scenId,
       'scenario.name': scenNm,
       'industry.id':   safe(industry && industry.industry_id),
-      'scenario.triggers':        safe(scenario && scenario.triggers),
-      'scenario.best_reply_shapes': safe(scenario && scenario.best_reply_shapes),
-      'scenario.risk_notes':      safe(scenario && scenario.risk_notes),
-      'scenario.roi_hypothesis':  safe(scenario && scenario.roi_hypothesis),
-      'scenario.tags':            Array.isArray(scenario && scenario.tags) ? scenario.tags.join(',') : safe(scenario && scenario.tags),
 
-      // Demo vs Prod
-      'mode': 'demo',
-      // Tool bases (prod: replace with real)
-      'twilio_base':   'https://demo.twilio.local',
-      'calendar_base': 'https://demo.calendar.local',
-      'crm_base':      'https://demo.crm.local',
+      'scenario.triggers':         safe(scenario && scenario.triggers),
+      'scenario.best_reply_shapes':safe(scenario && scenario.best_reply_shapes),
+      'scenario.risk_notes':       safe(scenario && scenario.risk_notes),
+      'scenario.roi_hypothesis':   safe(scenario && scenario.roi_hypothesis),
+      'scenario.tags':             Array.isArray(scenario && scenario.tags) ? scenario.tags.join(',') : safe(scenario && scenario.tags),
+
+      // Modes
+      'mode':          'demo',             // set to 'prod' to call real tools
+      'llm.enabled':   'false',            // 'true' to call LLM via HTTP
+      'llm_base':      'https://api.openai.com/v1',
+      'llm_model':     'gpt-4o-mini',
+      'llm_api_key':   '',                 // fill in n8n env/cred at runtime
+
+      // Tool bases (prod)
+      'twilio_base':   'https://api.twilio.com',   // or your gateway
+      'calendar_base': 'https://calendar.example.com',
+      'crm_base':      'https://crm.example.com',
+
       // Demo seeds
       'demo.to':       '+34613030526',
       'demo.emailTo':  'kevanm.spain@gmail.com',
@@ -271,99 +359,87 @@
     var n3 = nFunction('PlanGraph ['+scenTag+']',    FC_PLANNER, X0 + SPAN * 3, Y0); addNode(wf, n3); connect(wf, n2.name, n3.name);
     var n4 = nFunction('Pick Branch ['+scenTag+']',  FC_PICK_BRANCH, X0 + SPAN * 4, Y0); addNode(wf, n4); connect(wf, n3.name, n4.name);
 
-    // IF (static YES for demo; flip later by changing param or node)
+    // IF
     var n5 = nIf('Route Branch ['+scenTag+']', true, X0 + SPAN * 5, Y0); addNode(wf, n5); connect(wf, n4.name, n5.name);
 
-    // ===== YES lane =====
+    // Helper: add a Step Macro (LLM optional)
+    function addStepMacro(prefix, baseX, yRow, stepIdx, draftTitle){
+      var sDraft = nFunction(prefix+' Step '+stepIdx+' Draft ['+scenTag+']', FC_STEP_DRAFT(stepIdx, draftTitle, (prefix==='YES'?'yes':'no')), baseX, yRow); addNode(wf, sDraft);
+
+      // Build prompt from Action+Context
+      var buildPrompt = nFunction(prefix+' Step '+stepIdx+' Build Prompt ['+scenTag+']', FC_BUILD_PROMPT, baseX+SPAN, yRow); addNode(wf, buildPrompt);
+      connect(wf, sDraft, buildPrompt);
+
+      // Decide LLM usage (IF on llm.enabled)
+      var ifLLM = nIf(prefix+' Step '+stepIdx+' Use LLM? ['+scenTag+']', false, baseX + SPAN*2, yRow); addNode(wf, ifLLM);
+      connect(wf, buildPrompt, ifLLM);
+
+      // True path (index 0): LLM flow
+      var prepLLM = nFunction(prefix+' Step '+stepIdx+' LLM HTTP Prep ['+scenTag+']', FC_LLM_HTTP_PREP, baseX + SPAN*3, yRow); addNode(wf, prepLLM);
+      connect(wf, ifLLM, prepLLM, 0);
+
+      var callLLM = nHttp(prefix+' Step '+stepIdx+' LLM HTTP', baseX + SPAN*4, yRow); addNode(wf, callLLM);
+      connect(wf, prepLLM, callLLM);
+
+      var parseLLM = nFunction(prefix+' Step '+stepIdx+' LLM Parse ['+scenTag+']', FC_LLM_PARSE, baseX + SPAN*5, yRow); addNode(wf, parseLLM);
+      connect(wf, callLLM.name, parseLLM);
+
+      // False path (index 1): Rules agent
+      var rulesAgent = nFunction(prefix+' Step '+stepIdx+' Rules Agent ['+scenTag+']', FC_STEP_AGENT_RULES, baseX + SPAN*3, yRow+120); addNode(wf, rulesAgent);
+      connect(wf, ifLLM, rulesAgent, 1);
+
+      // Merge (both go to Validate)
+      var validate = nFunction(prefix+' Step '+stepIdx+' Validate ['+scenTag+']', FC_VALIDATE_ACTION, baseX + SPAN*6, yRow); addNode(wf, validate);
+      connect(wf, parseLLM, validate);
+      connect(wf, rulesAgent, validate);
+
+      // Prepare tool HTTP (prod), then run
+      var prepTool = nFunction(prefix+' Step '+stepIdx+' Tool HTTP Prep ['+scenTag+']', FC_TOOL_HTTP_PREP, baseX + SPAN*7, yRow); addNode(wf, prepTool);
+      connect(wf, validate, prepTool);
+
+      var run = nFunction(prefix+' Step '+stepIdx+' Run ['+scenTag+']', FC_RUNNER, baseX + SPAN*8, yRow); addNode(wf, run);
+      connect(wf, prepTool, run);
+
+      // httpRequest (only meaningful in prod for send_message/http)
+      var execHttp = nHttp(prefix+' Step '+stepIdx+' Execute HTTP', baseX + SPAN*9, yRow); addNode(wf, execHttp);
+      connect(wf, run, execHttp);
+
+      // Record
+      var rec = nFunction(prefix+' Step '+stepIdx+' Record ['+scenTag+']', FC_REC(prefix+' Step '+stepIdx), baseX + SPAN*10, yRow); addNode(wf, rec);
+      connect(wf, execHttp, rec);
+
+      return rec;
+    }
+
+    // YES lane
     var YES_Y = Y0 - LANE_GAP;
     var enterYes = nFunction('Enter YES ['+scenTag+']',
-"var json = (items[0] && items[0].json) || {};\n" +
-"json.branch = 'yes';\n" +
-"return [{ json: json }];",
+"var json = (items[0] && items[0].json) || {};\njson.branch='yes'; return [{ json: json }];",
       X0 + SPAN * 6, YES_Y
     ); addNode(wf, enterYes); connect(wf, n5.name, enterYes.name, 0);
 
-    // YES steps 1..3
-    var yesS1Draft = nFunction('YES Step 1 Draft ['+scenTag+']', FC_STEP_DRAFT(1, 'Confirm appointment', 'yes'), X0 + SPAN * 7, YES_Y); addNode(wf, yesS1Draft);
-    var yesS1Agent = nFunction('YES Step 1 Agent ['+scenTag+']', FC_STEP_AGENT_RULES, X0 + SPAN * 8, YES_Y); addNode(wf, yesS1Agent);
-    var yesS1Val   = nFunction('YES Step 1 Validate ['+scenTag+']', FC_VALIDATE_ACTION, X0 + SPAN * 9, YES_Y); addNode(wf, yesS1Val);
-    var yesS1Run   = nFunction('YES Step 1 Run ['+scenTag+']', FC_RUNNER, X0 + SPAN * 10, YES_Y); addNode(wf, yesS1Run);
-    var yesS1Rec   = nFunction('YES Step 1 Record ['+scenTag+']', FC_REC('YES Step 1'), X0 + SPAN * 11, YES_Y); addNode(wf, yesS1Rec);
+    var yes1 = addStepMacro('YES', X0 + SPAN * 7, YES_Y, 1, 'Confirm appointment');
+    connect(wf, enterYes.name, yes1);
+    var yes2 = addStepMacro('YES', X0 + SPAN * 13, YES_Y, 2, 'Check confirmation');
+    connect(wf, yes1, yes2);
+    var yes3 = addStepMacro('YES', X0 + SPAN * 19, YES_Y, 3, 'Gentle follow-up wait');
+    connect(wf, yes2, yes3);
 
-    connect(wf, enterYes.name, yesS1Draft.name);
-    connect(wf, yesS1Draft.name, yesS1Agent.name);
-    connect(wf, yesS1Agent.name, yesS1Val.name);
-    connect(wf, yesS1Val.name,   yesS1Run.name);
-    connect(wf, yesS1Run.name,   yesS1Rec.name);
-
-    var yesS2Draft = nFunction('YES Step 2 Draft ['+scenTag+']', FC_STEP_DRAFT(2, 'Check confirmation', 'yes'), X0 + SPAN * 12, YES_Y); addNode(wf, yesS2Draft);
-    var yesS2Agent = nFunction('YES Step 2 Agent ['+scenTag+']', FC_STEP_AGENT_RULES, X0 + SPAN * 13, YES_Y); addNode(wf, yesS2Agent);
-    var yesS2Val   = nFunction('YES Step 2 Validate ['+scenTag+']', FC_VALIDATE_ACTION, X0 + SPAN * 14, YES_Y); addNode(wf, yesS2Val);
-    var yesS2Run   = nFunction('YES Step 2 Run ['+scenTag+']', FC_RUNNER, X0 + SPAN * 15, YES_Y); addNode(wf, yesS2Run);
-    var yesS2Rec   = nFunction('YES Step 2 Record ['+scenTag+']', FC_REC('YES Step 2'), X0 + SPAN * 16, YES_Y); addNode(wf, yesS2Rec);
-
-    connect(wf, yesS1Rec.name, yesS2Draft.name);
-    connect(wf, yesS2Draft.name, yesS2Agent.name);
-    connect(wf, yesS2Agent.name, yesS2Val.name);
-    connect(wf, yesS2Val.name,   yesS2Run.name);
-    connect(wf, yesS2Run.name,   yesS2Rec.name);
-
-    var yesS3Draft = nFunction('YES Step 3 Draft ['+scenTag+']', FC_STEP_DRAFT(3, 'Gentle follow-up wait', 'yes'), X0 + SPAN * 17, YES_Y); addNode(wf, yesS3Draft);
-    var yesS3Agent = nFunction('YES Step 3 Agent ['+scenTag+']', FC_STEP_AGENT_RULES, X0 + SPAN * 18, YES_Y); addNode(wf, yesS3Agent);
-    var yesS3Val   = nFunction('YES Step 3 Validate ['+scenTag+']', FC_VALIDATE_ACTION, X0 + SPAN * 19, YES_Y); addNode(wf, yesS3Val);
-    var yesS3Run   = nFunction('YES Step 3 Run ['+scenTag+']', FC_RUNNER, X0 + SPAN * 20, YES_Y); addNode(wf, yesS3Run);
-    var yesS3Rec   = nFunction('YES Step 3 Record ['+scenTag+']', FC_REC('YES Step 3'), X0 + SPAN * 21, YES_Y); addNode(wf, yesS3Rec);
-
-    connect(wf, yesS2Rec.name,  yesS3Draft.name);
-    connect(wf, yesS3Draft.name, yesS3Agent.name);
-    connect(wf, yesS3Agent.name, yesS3Val.name);
-    connect(wf, yesS3Val.name,   yesS3Run.name);
-    connect(wf, yesS3Run.name,   yesS3Rec.name);
-
-    // ===== NO lane =====
+    // NO lane
     var NO_Y = Y0 + LANE_GAP;
     var enterNo = nFunction('Enter NO ['+scenTag+']',
-"var json = (items[0] && items[0].json) || {};\n" +
-"json.branch = 'no';\n" +
-"return [{ json: json }];",
+"var json = (items[0] && items[0].json) || {};\njson.branch='no'; return [{ json: json }];",
       X0 + SPAN * 6, NO_Y
     ); addNode(wf, enterNo); connect(wf, n5.name, enterNo.name, 1);
 
-    var noS1Draft = nFunction('NO Step 1 Draft ['+scenTag+']', FC_STEP_DRAFT(1, 'Offer reschedule slots', 'no'), X0 + SPAN * 7, NO_Y); addNode(wf, noS1Draft);
-    var noS1Agent = nFunction('NO Step 1 Agent ['+scenTag+']', FC_STEP_AGENT_RULES, X0 + SPAN * 8, NO_Y); addNode(wf, noS1Agent);
-    var noS1Val   = nFunction('NO Step 1 Validate ['+scenTag+']', FC_VALIDATE_ACTION, X0 + SPAN * 9, NO_Y); addNode(wf, noS1Val);
-    var noS1Run   = nFunction('NO Step 1 Run ['+scenTag+']', FC_RUNNER, X0 + SPAN * 10, NO_Y); addNode(wf, noS1Run);
-    var noS1Rec   = nFunction('NO Step 1 Record ['+scenTag+']', FC_REC('NO Step 1'), X0 + SPAN * 11, NO_Y); addNode(wf, noS1Rec);
+    var no1 = addStepMacro('NO', X0 + SPAN * 7, NO_Y, 1, 'Offer reschedule slots');
+    connect(wf, enterNo.name, no1);
+    var no2 = addStepMacro('NO', X0 + SPAN * 13, NO_Y, 2, 'Capture slot choice');
+    connect(wf, no1, no2);
+    var no3 = addStepMacro('NO', X0 + SPAN * 19, NO_Y, 3, 'Book via calendar API');
+    connect(wf, no2, no3);
 
-    connect(wf, enterNo.name,  noS1Draft.name);
-    connect(wf, noS1Draft.name, noS1Agent.name);
-    connect(wf, noS1Agent.name, noS1Val.name);
-    connect(wf, noS1Val.name,   noS1Run.name);
-    connect(wf, noS1Run.name,   noS1Rec.name);
-
-    var noS2Draft = nFunction('NO Step 2 Draft ['+scenTag+']', FC_STEP_DRAFT(2, 'Capture slot choice', 'no'), X0 + SPAN * 12, NO_Y); addNode(wf, noS2Draft);
-    var noS2Agent = nFunction('NO Step 2 Agent ['+scenTag+']', FC_STEP_AGENT_RULES, X0 + SPAN * 13, NO_Y); addNode(wf, noS2Agent);
-    var noS2Val   = nFunction('NO Step 2 Validate ['+scenTag+']', FC_VALIDATE_ACTION, X0 + SPAN * 14, NO_Y); addNode(wf, noS2Val);
-    var noS2Run   = nFunction('NO Step 2 Run ['+scenTag+']', FC_RUNNER, X0 + SPAN * 15, NO_Y); addNode(wf, noS2Run);
-    var noS2Rec   = nFunction('NO Step 2 Record ['+scenTag+']', FC_REC('NO Step 2'), X0 + SPAN * 16, NO_Y); addNode(wf, noS2Rec);
-
-    connect(wf, noS1Rec.name,  noS2Draft.name);
-    connect(wf, noS2Draft.name, noS2Agent.name);
-    connect(wf, noS2Agent.name, noS2Val.name);
-    connect(wf, noS2Val.name,   noS2Run.name);
-    connect(wf, noS2Run.name,   noS2Rec.name);
-
-    var noS3Draft = nFunction('NO Step 3 Draft ['+scenTag+']', FC_STEP_DRAFT(3, 'Book via calendar API', 'no'), X0 + SPAN * 17, NO_Y); addNode(wf, noS3Draft);
-    var noS3Agent = nFunction('NO Step 3 Agent ['+scenTag+']', FC_STEP_AGENT_RULES, X0 + SPAN * 18, NO_Y); addNode(wf, noS3Agent);
-    var noS3Val   = nFunction('NO Step 3 Validate ['+scenTag+']', FC_VALIDATE_ACTION, X0 + SPAN * 19, NO_Y); addNode(wf, noS3Val);
-    var noS3Run   = nFunction('NO Step 3 Run ['+scenTag+']', FC_RUNNER, X0 + SPAN * 20, NO_Y); addNode(wf, noS3Run);
-    var noS3Rec   = nFunction('NO Step 3 Record ['+scenTag+']', FC_REC('NO Step 3'), X0 + SPAN * 21, NO_Y); addNode(wf, noS3Rec);
-
-    connect(wf, noS2Rec.name,  noS3Draft.name);
-    connect(wf, noS3Draft.name, noS3Agent.name);
-    connect(wf, noS3Agent.name, noS3Val.name);
-    connect(wf, noS3Val.name,   noS3Run.name);
-    connect(wf, noS3Run.name,   noS3Rec.name);
+    // Finish (optional summary node can be added here)
 
     wf.staticData.__design = {
       contracts: {
@@ -371,10 +447,11 @@
         PlanGraph: { trigger:'object', branches:'array<key,title,steps[]>' },
         Action: { id:'string', title:'string', type:'string', channel:'string', tool:'string', params:'object' }
       },
+      flags: ['mode demo|prod', 'llm.enabled true|false'],
       notes: [
-        'Contracts-first: ContextSpec → PlanGraph → Action. Core nodes only.',
-        'Execution macro per step: Draft → Step Agent (rules) → Validate → Run → Record.',
-        'Demo vs Prod via json.mode. Replace tool bases to go prod; runner already resolves tools.'
+        'Per-step LLM: set llm.enabled=true and llm_api_key/llm_base in Init.',
+        'Prod tools: set mode=prod and fill twilio_base/calendar_base/crm_base; httpRequest nodes execute.',
+        'Demo mode: all side effects simulated; http nodes still receive well-formed __http payloads.'
       ]
     };
     return wf;
